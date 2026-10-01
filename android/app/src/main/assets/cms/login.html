@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>CMS Login</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .login-container {
+      background: white;
+      border-radius: 16px;
+      padding: 40px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      max-width: 400px;
+      width: 100%;
+    }
+    .login-header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    .login-header h1 {
+      color: #333;
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+    .login-header p {
+      color: #666;
+      font-size: 14px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    .form-group label {
+      display: block;
+      color: #555;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+      transition: border-color 0.3s;
+    }
+    .form-group input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .form-group input:disabled {
+      background-color: #f5f5f5;
+      color: #999;
+    }
+    .form-group .hint {
+      font-size: 12px;
+      color: #888;
+      margin-top: 6px;
+    }
+    .login-btn {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .login-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+    }
+    .login-btn:active {
+      transform: translateY(0);
+    }
+    .login-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .error-message {
+      background-color: #fee;
+      color: #c33;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      display: none;
+    }
+    .error-message.show {
+      display: block;
+    }
+    .loading {
+      display: none;
+      text-align: center;
+      margin-top: 20px;
+    }
+    .loading.show {
+      display: block;
+    }
+    .loading-spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-header">
+      <h1>Signage CMS Login</h1>
+      <p>Enter your device credentials to access CMS</p>
+    </div>
+
+    <div id="errorMessage" class="error-message"></div>
+
+    <form id="loginForm">
+      <div class="form-group">
+        <label for="deviceId">Device ID</label>
+        <input 
+          type="text" 
+          id="deviceId" 
+          name="deviceId" 
+          readonly 
+          placeholder="Loading device ID..."
+        />
+        <div class="hint">This is your TV's unique Device ID</div>
+      </div>
+
+      <div class="form-group">
+        <label for="password">Password (Last 5 digits)</label>
+        <input 
+          type="password" 
+          id="password" 
+          name="password" 
+          placeholder="Enter last 5 digits of Device ID"
+          maxlength="5"
+          autocomplete="current-password"
+          required
+        />
+        <div class="hint">Enter the last 5 characters of your Device ID</div>
+      </div>
+
+      <button type="submit" class="login-btn" id="loginBtn">Unlock CMS</button>
+    </form>
+
+    <div class="loading" id="loading">
+      <div class="loading-spinner"></div>
+    </div>
+  </div>
+
+  <script src="login.js?v=20260101-1"></script>
+</body>
+</html>

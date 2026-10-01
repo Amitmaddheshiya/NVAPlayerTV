@@ -98,11 +98,15 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
             }
 
             String uri = session.getUri();
+            if (uri == null || uri.isEmpty() || "/".equals(uri)) {
+                // Check if user is authenticated for root route
+                if (!isCmsAuthed(session)) {
+                    return serveAsset("cms/login.html", "text/html; charset=utf-8");
+                }
+                return serveAsset("cms/index.html", "text/html; charset=utf-8");
+            }
             if (requiresCmsAuth(uri, session.getMethod()) && !isCmsAuthed(session)) {
                 return errorJson(Response.Status.UNAUTHORIZED, "unauthorized", null);
-            }
-            if (uri == null || uri.isEmpty() || "/".equals(uri)) {
-                return serveAsset("cms/index.html", "text/html; charset=utf-8");
             }
             if ("/style.css".equals(uri)) {
                 return serveAsset("cms/style.css", "text/css; charset=utf-8");
@@ -118,6 +122,9 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
             }
             if ("/nvlogo.png".equals(uri)) {
                 return serveAsset("cms/nvlogo.png", "image/png");
+            }
+            if ("/login.js".equals(uri)) {
+                return serveAsset("cms/login.js", "application/javascript; charset=utf-8");
             }
             if ("/ping".equals(uri)) {
                 JSONObject payload = new JSONObject();
@@ -437,7 +444,7 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
     private boolean requiresCmsAuth(String uri, Method method) {
         String value = String.valueOf(uri == null ? "" : uri);
         if (value.isEmpty() || "/".equals(value)) return false;
-        if ("/style.css".equals(value) || "/app.js".equals(value) || "/enterprise.js".equals(value) || "/app-v2.js".equals(value) || "/nvlogo.png".equals(value)) {
+        if ("/style.css".equals(value) || "/app.js".equals(value) || "/enterprise.js".equals(value) || "/app-v2.js".equals(value) || "/nvlogo.png".equals(value) || "/login.js".equals(value) || "/login.html".equals(value)) {
             return false;
         }
         if ("/ping".equals(value) || "/network-state".equals(value) || "/status".equals(value) || "/devices".equals(value) || "/devices/refresh".equals(value) || "/device-status".equals(value)) {
@@ -510,10 +517,32 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
 
     private Response handleAuthLogin(IHTTPSession session) throws Exception {
         JSONObject body = readJsonBody(session);
-        String password = body.optString("password", "").trim();
-        if (!EmbeddedCmsRuntime.getCmsPassword(context).equals(password)) {
-          return errorJson(Response.Status.UNAUTHORIZED, "invalid-password", null);
+        String inputDeviceId = body.optString("deviceId", "").trim();
+        String inputPassword = body.optString("password", "").trim();
+        
+        // Get actual device ID
+        String actualDeviceId = EmbeddedCmsRuntime.getDeviceId(context);
+        
+        // Validate device ID
+        if (actualDeviceId == null || actualDeviceId.isEmpty()) {
+            return errorJson(Response.Status.INTERNAL_ERROR, "device-id-not-available", null);
         }
+        
+        if (!inputDeviceId.equals(actualDeviceId)) {
+            return errorJson(Response.Status.UNAUTHORIZED, "invalid-device-id", null);
+        }
+        
+        // Extract last 5 digits from actual device ID
+        String lastFiveDigits = actualDeviceId.length() >= 5 
+            ? actualDeviceId.substring(actualDeviceId.length() - 5) 
+            : actualDeviceId;
+        
+        // Validate password (must match last 5 digits)
+        if (!inputPassword.equals(lastFiveDigits)) {
+            return errorJson(Response.Status.UNAUTHORIZED, "invalid-password", null);
+        }
+        
+        // Create session
         String token = UUID.randomUUID().toString();
         ACTIVE_SESSIONS.put(token, System.currentTimeMillis() + SESSION_TTL_MS);
         JSONObject out = new JSONObject();
