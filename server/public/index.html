@@ -256,7 +256,7 @@
               <label>After End Time Show</label>
               <select id="scheduleFallbackMode">
                 <option value="black">Black Screen</option>
-                <option value="message">Custom Message</option>
+                <option value="message" selected>Custom Message</option>
                 <option value="image">Website URL</option>
               </select>
 
@@ -466,6 +466,7 @@
             <button class="btn primary" type="button" onclick="window.enterpriseSendPresetAction?.('auto-start-on')">Auto Start ON</button>
             <button class="btn warning" type="button" onclick="window.enterpriseSendPresetAction?.('auto-start-off')">Auto Start OFF</button>
             <button class="btn warning" type="button" onclick="window.enterpriseSendPresetAction?.('restart-app')">Restart App</button>
+            <button class="btn danger" type="button" onclick="clearServerData()">Clear Server Data</button>
             <button class="btn warning" type="button" onclick="window.enterpriseSendPresetAction?.('clear-cache')">Clear Cache</button>
             <button class="btn danger" type="button" onclick="window.enterpriseSendPresetAction?.('deep-clear-data')">Deep Clear Data</button>
             <button class="btn danger" type="button" onclick="window.enterpriseSendPresetAction?.('reboot')">Reboot Device</button>

@@ -3204,12 +3204,40 @@ async function clearDeviceData() {
   showNotice("success", "Command Sent", "Clear data command has been sent.");
 }
 
+async function clearServerData() {
+  const confirmMsg =
+    "Are you sure? This will clean up all server-side data including chunk manifests, incoming directories, device configs, and upload queue. This will reset the CMS server to a clean state.";
+
+  if (!(await showConfirmDialog("Clear Server Data", confirmMsg, "Yes, Clear", "Cancel"))) return;
+
+  try {
+    const res = await fetch("/api/cleanup/server-data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const data = await res.json();
+
+    if (data.ok) {
+      showNotice(
+        "success",
+        "Server Data Cleared",
+        `Server data cleaned successfully. ${data.deletedCount || 0} items deleted.`,
+        5000
+      );
+    } else {
+      showNotice("error", "Cleanup Failed", data.error || "Failed to clean server data.", 5000);
+    }
+  } catch (error) {
+    showNotice("error", "Cleanup Failed", String(error?.message || "Unable to clean server data."), 5000);
+  }
+}
+
 async function clearDeviceCache() {
   const deviceId = document.getElementById("deviceSelect").value;
   const confirmMsg =
     deviceId === "all"
-      ? "Clear cache on ALL connected devices?"
-      : `Clear cache on device ${deviceId}?`;
+      ? "Clear cache and local config on ALL connected devices? This will reset device settings."
+      : `Clear cache and local config on device ${deviceId}? This will reset device settings.`;
 
   if (!(await showConfirmDialog("Clear Device Cache", confirmMsg, "Yes, Clear", "Cancel"))) return;
 
@@ -3220,7 +3248,7 @@ async function clearDeviceCache() {
   });
   const data = await res.json();
   if (data?.success) {
-    showNotice("success", "Command Sent", "Clear cache command has been sent.");
+    showNotice("success", "Command Sent", "Clear cache and local config command has been sent.");
   } else {
     showNotice("error", "Command Failed", "Device not connected.");
   }

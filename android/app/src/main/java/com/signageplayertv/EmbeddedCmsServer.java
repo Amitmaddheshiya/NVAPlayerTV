@@ -29,6 +29,7 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -241,6 +242,9 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
             if ("/config/clear-cache".equals(uri) && Method.POST.equals(session.getMethod())) {
                 return handleClearCache();
             }
+            if ("/api/cleanup/server-data".equals(uri) && Method.POST.equals(session.getMethod())) {
+                return handleCleanupServerData();
+            }
             if ("/config/clear-device".equals(uri) && Method.POST.equals(session.getMethod())) {
                 return handleClearDevice();
             }
@@ -399,10 +403,20 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
                 deleteRecursively(child);
             }
         }
+        // Clear device local config storage
+        File configDir = new File(context.getFilesDir(), CONFIG_FILE_NAME);
+        if (configDir.exists()) {
+            deleteRecursively(configDir);
+        }
+        // Clear CMS data directory (local server data)
+        File cmsDataDir = new File(context.getFilesDir(), "cms_data");
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            deleteRecursively(cmsDataDir);
+        }
         EmbeddedCmsRuntime.emitEvent("cache-cleared", EmbeddedCmsRuntime.buildSelfStatus(context));
         JSONObject out = new JSONObject();
         out.put("success", true);
-        out.put("message", "Device cache cleared.");
+        out.put("message", "Device cache and local config cleared.");
         return json(out);
     }
 
@@ -411,15 +425,153 @@ public final class EmbeddedCmsServer extends NanoHTTPD {
         // app-data reset. Keep the saved player configuration, setup state and
         // system-granted permissions intact; only remove CMS-uploaded content.
         deleteRecursively(new File(context.getFilesDir(), MEDIA_ROOT_DIR));
-        
+
         // Emit event to clear video cache and playback state in React Native
         JSONObject command = new JSONObject();
         command.put("action", "clear-cache-and-playback");
         EmbeddedCmsRuntime.emitEvent("device-command", command);
-        
+
         JSONObject out = new JSONObject();
         out.put("success", true);
         out.put("message", "Uploaded CMS media, video cache, and playback state cleared. Saved settings and permissions were kept.");
+        return json(out);
+    }
+
+    private Response handleCleanupServerData() throws Exception {
+        File cmsDataDir = new File(context.getFilesDir(), "cms_data");
+        int deletedCount = 0;
+
+        // 1. Delete chunk manifest directories
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File uploadsDir = new File(cmsDataDir, "uploads");
+            if (uploadsDir.exists() && uploadsDir.isDirectory()) {
+                File[] deviceDirs = uploadsDir.listFiles();
+                if (deviceDirs != null) {
+                    for (File deviceDir : deviceDirs) {
+                        if (deviceDir.isDirectory()) {
+                            File[] sections = deviceDir.listFiles();
+                            if (sections != null) {
+                                for (File section : sections) {
+                                    if (section.isDirectory() && section.getName().contains("__chunk_")) {
+                                        deleteRecursively(section);
+                                        deletedCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Delete incoming directories
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File uploadsDir = new File(cmsDataDir, "uploads");
+            if (uploadsDir.exists() && uploadsDir.isDirectory()) {
+                File[] deviceDirs = uploadsDir.listFiles();
+                if (deviceDirs != null) {
+                    for (File deviceDir : deviceDirs) {
+                        if (deviceDir.isDirectory()) {
+                            File[] sections = deviceDir.listFiles();
+                            if (sections != null) {
+                                for (File section : sections) {
+                                    if (section.isDirectory() && section.getName().contains("__incoming")) {
+                                        deleteRecursively(section);
+                                        deletedCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Delete enterprise spool directories
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File uploadsDir = new File(cmsDataDir, "uploads");
+            if (uploadsDir.exists() && uploadsDir.isDirectory()) {
+                File[] entries = uploadsDir.listFiles();
+                if (entries != null) {
+                    for (File entry : entries) {
+                        if (entry.isDirectory() && entry.getName().startsWith("_enterprise_spool_")) {
+                            deleteRecursively(entry);
+                            deletedCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Reset device configs to default
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File configDir = new File(cmsDataDir, "data/configs");
+            if (configDir.exists() && configDir.isDirectory()) {
+                File defaultConfig = new File(configDir, "default.json");
+                if (defaultConfig.exists()) {
+                    try {
+                        String defaultContent = readTextFile(defaultConfig);
+                        File[] configFiles = configDir.listFiles();
+                        if (configFiles != null) {
+                            for (File configFile : configFiles) {
+                                if (configFile.isFile() && configFile.getName().endsWith(".json") && !configFile.getName().equals("default.json")) {
+                                    try {
+                                        writeTextFile(configFile, defaultContent);
+                                        deletedCount++;
+                                    } catch (Exception e) {
+                                        // Skip failed files
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Skip if default config read fails
+                    }
+                }
+            }
+        }
+
+        // 5. Clear playback timeline
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File timelineFile = new File(cmsDataDir, "data/playback-timeline.json");
+            if (timelineFile.exists()) {
+                try {
+                    writeTextFile(timelineFile, "{\"global\":{\"sections\":{}},\"devices\":{}}");
+                    deletedCount++;
+                } catch (Exception e) {
+                    // Skip if failed
+                }
+            }
+        }
+
+        // 6. Clear upload queue (keep settings)
+        if (cmsDataDir.exists() && cmsDataDir.isDirectory()) {
+            File queueFile = new File(cmsDataDir, "data/upload-queue.json");
+            if (queueFile.exists()) {
+                try {
+                    String queueContent = readTextFile(queueFile);
+                    // Parse and keep only settings
+                    JSONObject queueJson = new JSONObject(queueContent);
+                    JSONObject settings = queueJson.optJSONObject("settings");
+                    JSONObject cleanQueue = new JSONObject();
+                    cleanQueue.put("settings", settings != null ? settings : new JSONObject());
+                    cleanQueue.put("paused", false);
+                    cleanQueue.put("jobs", new JSONArray());
+                    cleanQueue.put("history", new JSONArray());
+                    cleanQueue.put("logs", new JSONArray());
+                    cleanQueue.put("updatedAt", new Date().toString());
+                    writeTextFile(queueFile, cleanQueue.toString());
+                    deletedCount++;
+                } catch (Exception e) {
+                    // Skip if failed
+                }
+            }
+        }
+
+        JSONObject out = new JSONObject();
+        out.put("ok", true);
+        out.put("message", "Server data cleaned successfully");
+        out.put("deletedCount", deletedCount);
         return json(out);
     }
 

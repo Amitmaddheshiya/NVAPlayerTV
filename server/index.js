@@ -660,6 +660,143 @@ app.post("/api/backup/restore", requireCmsAuth, (req, res) => {
   });
 });
 
+// Cleanup server data endpoint
+app.post("/api/cleanup/server-data", requireCmsAuth, (req, res) => {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+
+    const basePath = process.pkg
+      ? (global.runtimeBasePath || path.dirname(process.execPath))
+      : path.join(__dirname, "..");
+
+    const uploadsBase = path.join(basePath, "uploads");
+    const configDir = path.join(basePath, "data", "configs");
+    const dataDir = path.join(basePath, "data");
+
+    let deletedCount = 0;
+
+    // 1. Delete chunk manifest directories
+    if (fs.existsSync(uploadsBase)) {
+      const deviceDirs = fs.readdirSync(uploadsBase, { withFileTypes: true });
+      for (const deviceDir of deviceDirs) {
+        if (!deviceDir.isDirectory()) continue;
+        const devicePath = path.join(uploadsBase, deviceDir.name);
+        const sections = fs.readdirSync(devicePath, { withFileTypes: true });
+        for (const section of sections) {
+          if (!section.isDirectory()) continue;
+          if (section.name.includes("__chunk_")) {
+            const chunkPath = path.join(devicePath, section.name);
+            try {
+              fs.rmSync(chunkPath, { recursive: true, force: true });
+              deletedCount++;
+            } catch (e) {
+              console.log("Failed to delete chunk dir:", chunkPath, e.message);
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Delete incoming directories
+    if (fs.existsSync(uploadsBase)) {
+      const deviceDirs = fs.readdirSync(uploadsBase, { withFileTypes: true });
+      for (const deviceDir of deviceDirs) {
+        if (!deviceDir.isDirectory()) continue;
+        const devicePath = path.join(uploadsBase, deviceDir.name);
+        const sections = fs.readdirSync(devicePath, { withFileTypes: true });
+        for (const section of sections) {
+          if (!section.isDirectory()) continue;
+          if (section.name.includes("__incoming")) {
+            const incomingPath = path.join(devicePath, section.name);
+            try {
+              fs.rmSync(incomingPath, { recursive: true, force: true });
+              deletedCount++;
+            } catch (e) {
+              console.log("Failed to delete incoming dir:", incomingPath, e.message);
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Delete enterprise spool directories
+    if (fs.existsSync(uploadsBase)) {
+      const entries = fs.readdirSync(uploadsBase, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith("_enterprise_spool_")) {
+          const spoolPath = path.join(uploadsBase, entry.name);
+          try {
+            fs.rmSync(spoolPath, { recursive: true, force: true });
+            deletedCount++;
+          } catch (e) {
+            console.log("Failed to delete spool dir:", spoolPath, e.message);
+          }
+        }
+      }
+    }
+
+    // 4. Reset device configs to default
+    if (fs.existsSync(configDir)) {
+      const defaultConfigPath = path.join(configDir, "default.json");
+      if (fs.existsSync(defaultConfigPath)) {
+        const defaultConfig = JSON.parse(fs.readFileSync(defaultConfigPath, "utf8"));
+        const configFiles = fs.readdirSync(configDir);
+        for (const file of configFiles) {
+          if (file === "default.json") continue;
+          if (!file.endsWith(".json")) continue;
+          const deviceConfigPath = path.join(configDir, file);
+          try {
+            fs.writeFileSync(deviceConfigPath, JSON.stringify(defaultConfig, null, 2));
+            deletedCount++;
+          } catch (e) {
+            console.log("Failed to reset config:", deviceConfigPath, e.message);
+          }
+        }
+      }
+    }
+
+    // 5. Clear playback timeline
+    const timelinePath = path.join(dataDir, "playback-timeline.json");
+    if (fs.existsSync(timelinePath)) {
+      try {
+        fs.writeFileSync(timelinePath, JSON.stringify({ global: { sections: {} }, devices: {} }, null, 2));
+        deletedCount++;
+      } catch (e) {
+        console.log("Failed to clear timeline:", timelinePath, e.message);
+      }
+    }
+
+    // 6. Clear upload queue
+    const queuePath = path.join(dataDir, "upload-queue.json");
+    if (fs.existsSync(queuePath)) {
+      try {
+        const uploadQueue = require("./services/uploadQueue");
+        const state = uploadQueue.getQueueSnapshot();
+        // Clear jobs and history but keep settings
+        uploadQueue.updateSettings(state.settings);
+        deletedCount++;
+      } catch (e) {
+        console.log("Failed to clear queue:", queuePath, e.message);
+      }
+    }
+
+    console.log("Server data cleanup completed. Items deleted:", deletedCount);
+    return res.json({
+      ok: true,
+      message: "Server data cleaned successfully",
+      deletedCount,
+    });
+  } catch (error) {
+    console.error("Server data cleanup failed:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Cleanup failed: " + String(error.message || "Unknown error"),
+    });
+  }
+});
+
 // Get active local IP
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
