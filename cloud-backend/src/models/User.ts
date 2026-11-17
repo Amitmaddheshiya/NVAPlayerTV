@@ -1,0 +1,40 @@
+import mongoose, { Document, Schema } from 'mongoose';
+
+export interface IUser extends Document {
+  email: string;
+  password: string;
+  role: 'admin' | 'user';
+  phone?: string;
+  businessName?: string;
+  assignedDevices: string[];
+  storageUsed: number;
+  monthlyUploadLimit: number;
+  currentMonthUpload: number;
+  uploadUsageMonth?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const UserSchema = new Schema<IUser>(
+  {
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true },
+    role: { type: String, enum: ['admin', 'user'], default: 'user' },
+    phone: { type: String, trim: true },
+    businessName: { type: String, trim: true },
+    assignedDevices: [{ type: String }],
+    storageUsed: { type: Number, default: 0, min: 0 },
+    monthlyUploadLimit: { type: Number, default: 10, min: 0 },
+    currentMonthUpload: { type: Number, default: 0, min: 0 },
+    uploadUsageMonth: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+
+UserSchema.index({ role: 1 });
+UserSchema.index({ role: 1, createdAt: -1 }); // Compound index for filtering by role and sorting by creation
+UserSchema.index({ assignedDevices: 1 });
+UserSchema.index({ createdAt: -1 });
+// email:1 index is automatically created by unique: true, no need for explicit index
+
+export default mongoose.model<IUser>('User', UserSchema);

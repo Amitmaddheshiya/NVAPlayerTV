@@ -17,6 +17,7 @@ type Props = {
   videoFade: Animated.Value;
   videoReloadToken: number;
   effectiveVideoUri: string;
+  videoPosterUri?: string;
   resumePositionMs: number;
   mediaResizeMode: any;
   videoVolume: number;
@@ -49,7 +50,8 @@ type Props = {
   onRenderError: () => void;
   onPdfLoadEnd: (slot: "a" | "b") => void;
   onPdfError: () => void;
-  onImageLoadEnd: (slot: "a" | "b") => void;
+  onImageLoadEnd: (slot: "a" | "b", uri?: string) => void;
+  onImageLoadError: (slot: "a" | "b", uri: string) => void;
 };
 
 export default function SlideRendererMediaStage(props: Props) {
@@ -67,6 +69,7 @@ export default function SlideRendererMediaStage(props: Props) {
     videoFade,
     videoReloadToken,
     effectiveVideoUri,
+    videoPosterUri,
     resumePositionMs,
     mediaResizeMode,
     videoVolume,
@@ -100,6 +103,7 @@ export default function SlideRendererMediaStage(props: Props) {
     onPdfLoadEnd,
     onPdfError,
     onImageLoadEnd,
+    onImageLoadError,
   } = props;
 
   if (showProcessingOverlay) {
@@ -143,7 +147,7 @@ export default function SlideRendererMediaStage(props: Props) {
             onReady={onVideoReady}
             onProgress={onVideoProgress}
             onBuffering={onVideoBuffering}
-            onError={onRenderError}
+            onError={() => onImageLoadError(nextImageSlot, nextImageUri)}
           />
         </Animated.View>
         {showBufferIndicator && videoBuffering && !isMarkedCached ? (
@@ -269,10 +273,20 @@ export default function SlideRendererMediaStage(props: Props) {
             ]}
             resizeMode={mediaResizeMode}
             fadeDuration={0}
-            onLoad={() => onImageLoadEnd(nextImageSlot)}
+            onLoad={() => onImageLoadEnd(nextImageSlot, nextImageUri)}
             onError={onRenderError}
           />
         </Animated.View>
+        {videoPosterUri ? (
+          <View pointerEvents="none" style={[styles.media, { position: "absolute", left: 0, top: 0, zIndex: 2 }]}>
+            <Image
+              source={{ uri: videoPosterUri }}
+              style={styles.media}
+              resizeMode={mediaResizeMode}
+              fadeDuration={0}
+            />
+          </View>
+        ) : null}
       </View>
     );
   }
@@ -289,8 +303,8 @@ export default function SlideRendererMediaStage(props: Props) {
           ]}
           resizeMode={mediaResizeMode}
           fadeDuration={0}
-          onLoad={() => onImageLoadEnd("a")}
-          onError={onRenderError}
+          onLoad={() => onImageLoadEnd("a", imageSlotUrls.a)}
+          onError={() => onImageLoadError("a", imageSlotUrls.a)}
         />
       ) : null}
       {imageSlotUrls.b ? (
@@ -303,8 +317,8 @@ export default function SlideRendererMediaStage(props: Props) {
           ]}
           resizeMode={mediaResizeMode}
           fadeDuration={0}
-          onLoad={() => onImageLoadEnd("b")}
-          onError={onRenderError}
+          onLoad={() => onImageLoadEnd("b", imageSlotUrls.b)}
+          onError={() => onImageLoadError("b", imageSlotUrls.b)}
         />
       ) : null}
     </View>

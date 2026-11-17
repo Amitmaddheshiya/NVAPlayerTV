@@ -210,8 +210,8 @@
             <label>Layout</label>
             <select id="layout">
               <option value="fullscreen">Fullscreen</option>
-              <option value="grid2">Grid (2 Split)</option>
-              <option value="grid3">Grid (3 Split)</option>
+              <option value="split">Grid (2 Split)</option>
+              <option value="grid">Grid (3 Split)</option>
             </select>
             <label>Screen Orientation</label>
             <select id="orientation">
@@ -624,6 +624,18 @@
         content.style.display = "block";
         icon.textContent = "▲";
         refreshFileManager();
+      } else {
+        content.style.display = "none";
+        icon.textContent = "▼";
+      }
+    }
+
+    function toggleCloudSettings() {
+      const content = document.getElementById("cloudSettingsContent");
+      const icon = document.getElementById("cloudSettingsToggleIcon");
+      if (content.style.display === "none") {
+        content.style.display = "block";
+        icon.textContent = "▲";
       } else {
         content.style.display = "none";
         icon.textContent = "▼";

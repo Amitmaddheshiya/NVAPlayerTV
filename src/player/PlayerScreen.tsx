@@ -48,7 +48,9 @@ export default function PlayerScreen({
   };
   const grid3Layout = config?.grid3Layout || "stack-v";
   const gridRatio = config?.gridRatio || "1:1:1";
+
   const renderGrid3 = () => {
+    
     if (grid3Layout === "stack-h") {
       const [a, b, c] = parseRatio(gridRatio, 3);
       return (
@@ -66,7 +68,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[1] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
           <View style={{ flex: b, marginHorizontal: GRID_GAP / 2 }}>
             <SlideRenderer
@@ -81,7 +83,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[2] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
           <View style={{ flex: c, marginLeft: GRID_GAP / 2 }}>
             <SlideRenderer
@@ -96,7 +98,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[3] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
         </View>
       );
@@ -120,7 +122,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[1] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
             </View>
             <View style={{ flex: 1, marginLeft: GRID_GAP / 2 }}>
               <SlideRenderer
@@ -135,7 +137,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[2] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
             </View>
           </View>
           <View style={{ flex: bottom }}>
@@ -151,7 +153,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[3] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
         </View>
       );
@@ -174,7 +176,7 @@ export default function PlayerScreen({
               processingCount={uploadCountsBySection?.[1] || null}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
           <View style={{ flex: bottom, flexDirection: "row", gap: GRID_GAP }}>
             <View style={{ flex: 1, marginRight: GRID_GAP / 2 }}>
@@ -283,7 +285,7 @@ export default function PlayerScreen({
               processingMessage={uploadProcessingBySection?.[1] || ""}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
           <View style={{ flex: right, marginTop: GRID_GAP / 2 }}>
             <SlideRenderer
@@ -297,7 +299,7 @@ export default function PlayerScreen({
               processingMessage={uploadProcessingBySection?.[2] || ""}
               onPlaybackChange={onPlaybackChange}
               onPlaybackError={onPlaybackError}
-            />
+              />
           </View>
         </View>
       );
@@ -450,8 +452,8 @@ export default function PlayerScreen({
             onPlaybackError={onPlaybackError}
           />
         )}
-        {config.layout === "grid2" && renderGrid2()}
-        {config.layout === "grid3" && renderGrid3()}
+        {config.layout === "split" && renderGrid2()}
+        {config.layout === "grid" && renderGrid3()}
       </View>
       {config.ticker?.text && config.ticker?.position !== "top" ? (
         <Ticker ticker={config.ticker} />

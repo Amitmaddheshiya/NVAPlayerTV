@@ -193,6 +193,14 @@ export function isUsbSourceItem(item: any) {
 }
 
 export function buildRemoteMediaUri(server: string, pathValue: string, versionHint?: string | number) {
+  // If pathValue is already a full HTTP URL, use it directly
+  if (/^https?:\/\//i.test(pathValue)) {
+    const base = normalizeMediaUri(pathValue);
+    if (!base) return "";
+    const stamp = String(versionHint || "").trim();
+    if (!stamp) return base;
+    return `${base}?v=${stamp}`;
+  }
   const base = normalizeMediaUri(`${String(server || "").trim()}${String(pathValue || "").trim()}`);
   if (!base) return "";
   const stamp = String(versionHint || "").trim();

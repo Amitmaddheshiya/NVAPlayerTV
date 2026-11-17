@@ -7,8 +7,10 @@ import {
   TouchableOpacity,
   useWindowDimensions,
   View,
+  Alert,
 } from "react-native";
 import { WebView } from "react-native-webview";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import CmsAccessCard from "./CmsAccessCard";
 import {
   getCmsAccessInfo,
@@ -17,6 +19,7 @@ import {
   startEmbeddedCmsServer,
   uploadPickedMediaFiles,
 } from "../services/embeddedCmsService";
+import { getAppMode } from "../services/setupService";
 
 type Props = {
   visible: boolean;
@@ -41,12 +44,27 @@ export default function AdminCmsPanel({
   const [cmsUrl, setCmsUrl] = useState("http://127.0.0.1:8080");
   const [backFocused, setBackFocused] = useState(false);
   const [webMountKey, setWebMountKey] = useState(0);
+  const [appMode, setAppMode] = useState<string | null>(null);
 
   useEffect(() => {
+    getAppMode().then((mode) => setAppMode(mode));
+  }, []);
+
+  useEffect(() => {
+    // Block CMS access when in cloud mode
+    if (appMode === 'cloudMode' && visible) {
+      Alert.alert(
+        'CMS Access Blocked',
+        'App is running in Cloud Mode. Embedded CMS is not available in Cloud Mode. Please use the cloud backend to manage content.',
+        [{ text: 'OK', onPress: onClose }]
+      );
+      return;
+    }
+
     startEmbeddedCmsServer();
     const info = getCmsAccessInfo();
     setCmsUrl(info.localUrl || "http://127.0.0.1:8080");
-  }, []);
+  }, [visible, appMode]);
 
   useEffect(() => {
     Animated.timing(slide, {
@@ -266,8 +284,9 @@ export default function AdminCmsPanel({
                 isCompactScreen ? styles.iconBtnCompact : null,
                 backFocused ? styles.iconBtnActive : null,
               ]}
-              focusable={false}
+              focusable
               accessible
+              hasTVPreferredFocus
             >
               <Text style={styles.iconBtnText}>X</Text>
             </TouchableOpacity>
@@ -290,6 +309,8 @@ export default function AdminCmsPanel({
             <CmsAccessCard
               compact
               preferredFocusTarget="saveName"
+              onOpenCms={() => onViewChange("cms")}
+              onOpenAdminCms={() => onViewChange("adminCms")}
             />
           </ScrollView>
         </>

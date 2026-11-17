@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { BackHandler, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { BackHandler, Pressable, StyleSheet, Text, TextInput, View, Alert } from "react-native";
 import { WebView } from "react-native-webview";
-import { getAdminCmsUrl, saveAdminCmsUrl } from "../services/setupService";
+import { getAdminCmsUrl, saveAdminCmsUrl, getAppMode } from "../services/setupService";
 import {
   getCmsAccessInfo,
   setAutoReopenEnabled,
@@ -90,8 +90,23 @@ export default function AdminOnlyScreen() {
   const [error, setError] = useState("");
   const [openFocused, setOpenFocused] = useState(false);
   const [backFocused, setBackFocused] = useState(false);
+  const [appMode, setAppMode] = useState<string | null>(null);
 
   useEffect(() => {
+    getAppMode().then((mode) => setAppMode(mode));
+  }, []);
+
+  useEffect(() => {
+    // Block CMS access when in cloud mode
+    if (appMode === 'cloudMode') {
+      Alert.alert(
+        'CMS Access Blocked',
+        'App is running in Cloud Mode. Admin Only mode is not available in Cloud Mode. Please use the cloud backend to manage content.',
+        [{ text: 'OK', onPress: () => BackHandler.exitApp() }]
+      );
+      return;
+    }
+
     getAdminCmsUrl().then((url) => setUrlInput(url)).catch(() => undefined);
     startEmbeddedCmsServer();
     const refreshDeviceUrl = () => {

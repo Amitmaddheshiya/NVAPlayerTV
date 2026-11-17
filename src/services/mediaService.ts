@@ -1,13 +1,31 @@
 import RNFS from "react-native-fs";
 import { NativeModules } from "react-native";
 import { getServer } from "./serverService";
+import cloudService from "./cloudService";
 
 const { DeviceIdModule } = NativeModules as any;
 
-const MEDIA_DIR = `${RNFS.DocumentDirectoryPath}/media`;
-const MEDIA_ROOT = `${MEDIA_DIR}/files`;
-const MANIFEST_PATH = `${MEDIA_DIR}/manifest.json`;
-const LIST_CACHE_PATH = `${MEDIA_DIR}/list-cache.json`;
+type MediaCacheMode = "lan" | "cloud";
+const MEDIA_ROOT_DIR = `${RNFS.DocumentDirectoryPath}/media`;
+const CACHE_PATHS: Record<MediaCacheMode, { dir: string; files: string; manifest: string; list: string }> = {
+  lan: {
+    dir: MEDIA_ROOT_DIR,
+    files: `${MEDIA_ROOT_DIR}/files`,
+    manifest: `${MEDIA_ROOT_DIR}/manifest.json`,
+    list: `${MEDIA_ROOT_DIR}/list-cache.json`,
+  },
+  cloud: {
+    dir: `${MEDIA_ROOT_DIR}/cloud`,
+    files: `${MEDIA_ROOT_DIR}/cloud/files`,
+    manifest: `${MEDIA_ROOT_DIR}/cloud/manifest.json`,
+    list: `${MEDIA_ROOT_DIR}/cloud/list-cache.json`,
+  },
+};
+let activeMediaCacheMode: MediaCacheMode = "lan";
+let MEDIA_DIR = CACHE_PATHS.lan.dir;
+let MEDIA_ROOT = CACHE_PATHS.lan.files;
+let MANIFEST_PATH = CACHE_PATHS.lan.manifest;
+let LIST_CACHE_PATH = CACHE_PATHS.lan.list;
 const MEDIA_FETCH_TIMEOUT_MS = 8000;
 const MEDIA_FETCH_BACKOFF_BASE_MS = 1500;
 const MEDIA_FETCH_BACKOFF_MAX_MS = 30000;
@@ -23,6 +41,7 @@ const DOWNLOAD_CONNECTION_TIMEOUT_MS = 30000;
 const DOWNLOAD_READ_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MIN_FREE_BYTES = 500 * 1024 * 1024;
 const VIDEO_FILE_RE = /\.(mp4|m4v|mov|mkv|webm)(\?.*)?$/i;
+const CLOUD_VIDEO_FILE_RE = /\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?.*)?$/i;
 const VIDEO_DOWNLOAD_CONCURRENCY = 2;
 const CACHE_SUMMARY_TTL_MS = 3000;
 const LOW_STORAGE_HARD_LIMIT_BYTES = 1200 * 1024 * 1024;
@@ -143,23 +162,83 @@ type ManifestEntry = {
 
 type ManifestMap = Record<string, ManifestEntry>;
 
-let memoryListCache: MediaItem[] = [];
-let memoryListCacheAtMs = 0;
-let inFlightListRefresh: Promise<MediaItem[]> | null = null;
+type ListCacheState = {
+  list: MediaItem[];
+  at: number;
+  inFlight: Promise<MediaItem[]> | null;
+  etag: string;
+  backoffFailCount: number;
+  backoffUntilMs: number;
+  lastBackoffLogAtMs: number;
+};
+const listCacheStates: Record<MediaCacheMode, ListCacheState> = {
+  lan: { list: [], at: 0, inFlight: null, etag: "", backoffFailCount: 0, backoffUntilMs: 0, lastBackoffLogAtMs: 0 },
+  cloud: { list: [], at: 0, inFlight: null, etag: "", backoffFailCount: 0, backoffUntilMs: 0, lastBackoffLogAtMs: 0 },
+};
 const inFlightDownloads = new Map<string, Promise<string | null>>();
-let lastListEtag = "";
+const manifestBaselines = new WeakMap<ManifestMap, ManifestMap>();
+const manifestFilePaths = new WeakMap<ManifestMap, string>();
+let manifestWriteQueue: Promise<void> = Promise.resolve();
 let prioritySection = 0;
 let nonPriorityThrottleMs = 0;
-let listBackoffFailCount = 0;
-let listBackoffUntilMs = 0;
-let lastBackoffLogAtMs = 0;
 const lastMediaLogAtBySection: Record<number, number> = {};
 const lastMediaLogKeyBySection: Record<number, string> = {};
 let cacheSummaryCache = { at: 0, total: 0, cached: 0, percent: 0 };
 let playbackOverride: PlaybackOverride | null = null;
 
-function getListBackoffDelayMs(): number {
-  const exp = Math.min(listBackoffFailCount, 6);
+function getListCacheState(mode: MediaCacheMode = activeMediaCacheMode): ListCacheState {
+  return listCacheStates[mode];
+}
+
+function applyMediaCacheMode(mode: MediaCacheMode) {
+  activeMediaCacheMode = mode;
+  MEDIA_DIR = CACHE_PATHS[mode].dir;
+  MEDIA_ROOT = CACHE_PATHS[mode].files;
+  MANIFEST_PATH = CACHE_PATHS[mode].manifest;
+  LIST_CACHE_PATH = CACHE_PATHS[mode].list;
+  for (const key of Object.keys(progressMap)) delete progressMap[key];
+  invalidateCacheSummary();
+}
+
+export async function setMediaCacheMode(mode: MediaCacheMode): Promise<void> {
+  if (activeMediaCacheMode !== mode) applyMediaCacheMode(mode);
+  await cloudService.initialize();
+  await ensureMediaDirs();
+  await migrateLegacyCloudCache();
+}
+
+export function getActiveMediaCachePaths() {
+  return { directory: MEDIA_DIR, files: MEDIA_ROOT, manifest: MANIFEST_PATH, list: LIST_CACHE_PATH };
+}
+
+export async function clearMediaCache(mode: MediaCacheMode = activeMediaCacheMode): Promise<void> {
+  const pendingDownloads = Array.from(inFlightDownloads.entries())
+    .filter(([key]) => key.startsWith(`${mode}|`))
+    .map(([, task]) => task);
+  await Promise.allSettled(pendingDownloads);
+  await manifestWriteQueue;
+
+  const paths = CACHE_PATHS[mode];
+  if (await RNFS.exists(paths.dir)) await RNFS.unlink(paths.dir);
+  await RNFS.mkdir(paths.dir);
+  await RNFS.mkdir(paths.files);
+
+  const state = getListCacheState(mode);
+  state.list = [];
+  state.at = 0;
+  state.inFlight = null;
+  state.etag = "";
+  state.backoffFailCount = 0;
+  state.backoffUntilMs = 0;
+  state.lastBackoffLogAtMs = 0;
+  if (mode === activeMediaCacheMode) {
+    for (const key of Object.keys(progressMap)) delete progressMap[key];
+    invalidateCacheSummary();
+  }
+}
+
+function getListBackoffDelayMs(state: ListCacheState): number {
+  const exp = Math.min(state.backoffFailCount, 6);
   const base = MEDIA_FETCH_BACKOFF_BASE_MS * Math.pow(2, exp);
   const jitter = Math.floor(Math.random() * 600);
   return Math.min(MEDIA_FETCH_BACKOFF_MAX_MS, base + jitter);
@@ -175,15 +254,18 @@ export function setNonPriorityThrottleMs(ms: number) {
   nonPriorityThrottleMs = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
 
-export async function resetMediaRuntimeState(options: { clearListCache?: boolean } = {}) {
-  playbackOverride = null;
-  memoryListCache = [];
-  memoryListCacheAtMs = 0;
-  inFlightListRefresh = null;
-  lastListEtag = "";
-  listBackoffFailCount = 0;
-  listBackoffUntilMs = 0;
-  lastBackoffLogAtMs = 0;
+export async function resetMediaRuntimeState(options: { clearListCache?: boolean; clearPlaybackOverride?: boolean } = {}) {
+  if (options.clearPlaybackOverride) {
+    playbackOverride = null;
+  }
+  const listState = getListCacheState();
+  listState.list = [];
+  listState.at = 0;
+  listState.inFlight = null;
+  listState.etag = "";
+  listState.backoffFailCount = 0;
+  listState.backoffUntilMs = 0;
+  listState.lastBackoffLogAtMs = 0;
   cacheSummaryCache = { at: 0, total: 0, cached: 0, percent: 0 };
   for (const key of Object.keys(progressMap)) {
     delete progressMap[key];
@@ -254,9 +336,11 @@ function safeName(value: string, fallback = "media"): string {
   return name || fallback;
 }
 
-async function ensureMediaDirs() {
-  await RNFS.mkdir(MEDIA_DIR);
-  await RNFS.mkdir(MEDIA_ROOT);
+async function ensureMediaDirs(mode: MediaCacheMode = activeMediaCacheMode) {
+  const mediaDir = CACHE_PATHS[mode].dir;
+  const mediaRoot = CACHE_PATHS[mode].files;
+  await RNFS.mkdir(mediaDir);
+  await RNFS.mkdir(mediaRoot);
 }
 
 async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
@@ -275,29 +359,101 @@ async function writeJsonFile(filePath: string, payload: any) {
   await RNFS.writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
 }
 
-async function readManifest(): Promise<ManifestMap> {
-  return readJsonFile<ManifestMap>(MANIFEST_PATH, {});
+async function readManifest(mode: MediaCacheMode = activeMediaCacheMode): Promise<ManifestMap> {
+  const manifestPath = CACHE_PATHS[mode].manifest;
+  const manifest = await readJsonFile<ManifestMap>(manifestPath, {});
+  manifestBaselines.set(manifest, JSON.parse(JSON.stringify(manifest)) as ManifestMap);
+  manifestFilePaths.set(manifest, manifestPath);
+  return manifest;
 }
 
 async function writeManifest(manifest: ManifestMap) {
-  await writeJsonFile(MANIFEST_PATH, manifest);
-  invalidateCacheSummary();
+  const manifestPath = manifestFilePaths.get(manifest) || MANIFEST_PATH;
+  const baseline = manifestBaselines.get(manifest) || {};
+  const snapshot = JSON.parse(JSON.stringify(manifest)) as ManifestMap;
+  const baselineSnapshot = JSON.parse(JSON.stringify(baseline)) as ManifestMap;
+  const writeTask = manifestWriteQueue.then(async () => {
+    const latest = await readJsonFile<ManifestMap>(manifestPath, {});
+    const merged: ManifestMap = { ...latest };
+    const keys = new Set([...Object.keys(baselineSnapshot), ...Object.keys(snapshot)]);
+    for (const key of keys) {
+      const before = baselineSnapshot[key];
+      const after = snapshot[key];
+      if (JSON.stringify(before) === JSON.stringify(after)) continue;
+      if (after === undefined) delete merged[key];
+      else merged[key] = after;
+    }
+    await writeJsonFile(manifestPath, merged);
+    manifestBaselines.set(manifest, JSON.parse(JSON.stringify(merged)) as ManifestMap);
+    manifestFilePaths.set(manifest, manifestPath);
+    invalidateCacheSummary();
+  });
+  manifestWriteQueue = writeTask.catch(() => undefined);
+  await writeTask;
 }
 
-async function readListCache(): Promise<MediaItem[]> {
-  const list = await readJsonFile<MediaItem[]>(LIST_CACHE_PATH, []);
+async function readListCache(mode: MediaCacheMode = activeMediaCacheMode): Promise<MediaItem[]> {
+  const listPath = CACHE_PATHS[mode].list;
+  const list = await readJsonFile<MediaItem[]>(listPath, []);
   return Array.isArray(list) ? list : [];
 }
 
-async function writeListCache(list: MediaItem[]) {
-  if (sameMediaList(memoryListCache, list)) {
-    memoryListCacheAtMs = Date.now();
+async function writeListCache(list: MediaItem[], mode: MediaCacheMode = activeMediaCacheMode) {
+  const listPath = CACHE_PATHS[mode].list;
+  const listState = getListCacheState(mode);
+  if (sameMediaList(listState.list, list)) {
+    listState.at = Date.now();
     return;
   }
-  await writeJsonFile(LIST_CACHE_PATH, list);
-  memoryListCache = list;
-  memoryListCacheAtMs = Date.now();
+  await writeJsonFile(listPath, list);
+  listState.list = list;
+  listState.at = Date.now();
   invalidateCacheSummary();
+}
+
+function isLegacyCloudUrl(value: string): boolean {
+  const apiUrl = cloudService.getApiUrl();
+  if (!apiUrl) return false;
+  try {
+    return new URL(value).origin === new URL(apiUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+async function migrateLegacyCloudCache(): Promise<void> {
+  const markerPath = `${CACHE_PATHS.cloud.dir}/.legacy-cache-migrated`;
+  if (await RNFS.exists(markerPath)) return;
+
+  const legacyManifest = await readJsonFile<ManifestMap>(CACHE_PATHS.lan.manifest, {});
+  const cloudManifest: ManifestMap = {};
+  for (const [url, entry] of Object.entries(legacyManifest)) {
+    if (!isLegacyCloudUrl(url) || !entry?.localPath || !(await fileExists(entry.localPath))) continue;
+    const fileName = String(entry.localPath).split(/[\\/]/).pop() || safeName(url);
+    const targetPath = `${CACHE_PATHS.cloud.files}/${fileName}`;
+    try {
+      if (!(await fileExists(targetPath))) await RNFS.copyFile(entry.localPath, targetPath);
+      cloudManifest[url] = { ...entry, localPath: targetPath };
+    } catch {
+      // A failed legacy copy is left in the old cache; normal sync can download it again.
+    }
+  }
+
+  const legacyList = await readJsonFile<MediaItem[]>(CACHE_PATHS.lan.list, []);
+  const cloudList: MediaItem[] = [];
+  for (const item of Array.isArray(legacyList) ? legacyList : []) {
+    const url = String(item?.url || "");
+    if (!isLegacyCloudUrl(url)) continue;
+    const entry = cloudManifest[url];
+    cloudList.push(entry
+      ? { ...item, localPath: entry.localPath, remoteUrl: localUri(entry.localPath) }
+      : item);
+  }
+
+  await writeJsonFile(CACHE_PATHS.cloud.manifest, cloudManifest);
+  await writeJsonFile(CACHE_PATHS.cloud.list, cloudList);
+  await writeJsonFile(CACHE_PATHS.lan.list, (Array.isArray(legacyList) ? legacyList : []).filter((item) => !isLegacyCloudUrl(String(item?.url || ""))));
+  await RNFS.writeFile(markerPath, String(Date.now()), "utf8");
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -322,10 +478,10 @@ function hashString(value: string): string {
   return Math.abs(hash).toString(36);
 }
 
-function localPathFor(remoteUrl: string, section: number, name: string): string {
+function localPathFor(remoteUrl: string, section: number, name: string, mediaRoot = MEDIA_ROOT): string {
   const encoded = hashString(remoteUrl);
   const fileName = safeName(`${section}_${encoded}_${name}`);
-  return `${MEDIA_ROOT}/${fileName}`;
+  return `${mediaRoot}/${fileName}`;
 }
 
 export function setPlaybackOverride(sourceId: string, items: MediaItem[]) {
@@ -343,15 +499,27 @@ export function setPlaybackOverride(sourceId: string, items: MediaItem[]) {
     items: safeItems,
     activatedAt: Date.now(),
   };
+  console.log('=== MEDIA SERVICE: Playback override set ===');
+  console.log('Source ID:', sourceId);
+  console.log('Items count:', safeItems.length);
+  console.log('Items:', safeItems);
 }
 
 export function clearPlaybackOverride(sourceId?: string) {
   if (!playbackOverride) return;
   if (sourceId && playbackOverride.sourceId !== sourceId) return;
+  console.log('=== MEDIA SERVICE: Playback override cleared ===');
+  console.log('Source ID:', sourceId);
   playbackOverride = null;
 }
 
 export function getPlaybackOverride() {
+  console.log('=== MEDIA SERVICE: getPlaybackOverride called ===');
+  console.log('Current override:', playbackOverride ? 'SET' : 'NULL');
+  if (playbackOverride) {
+    console.log('Override source ID:', playbackOverride.sourceId);
+    console.log('Override items count:', playbackOverride.items.length);
+  }
   return playbackOverride;
 }
 
@@ -402,11 +570,11 @@ function isVideoItem(item: MediaItem): boolean {
   const mime = String(item?.type || "").toLowerCase();
   if (mime.startsWith("video/")) return true;
   const name = String(item?.originalName || item?.name || item?.url || "");
-  return VIDEO_FILE_RE.test(name);
+  return (cloudService.isEnabled() ? CLOUD_VIDEO_FILE_RE : VIDEO_FILE_RE).test(name);
 }
 
-function getDownloadKey(item: MediaItem): string {
-  return `${String(item.url || "")}|${Number(item.size || 0)}|${Number(item.mtimeMs || 0)}`;
+function getDownloadKey(item: MediaItem, mode: MediaCacheMode): string {
+  return `${mode}|${String(item.url || "")}|${Number(item.size || 0)}|${Number(item.mtimeMs || 0)}`;
 }
 
 function isExpectedValue(value: number): boolean {
@@ -475,13 +643,15 @@ async function isManifestEntryUsable(
 async function downloadIfNeeded(
   server: string,
   item: MediaItem,
-  manifest: ManifestMap
+  manifest: ManifestMap,
+  mode: MediaCacheMode
 ): Promise<string | null> {
   const remotePath = String(item.url || "");
   if (!remotePath) return null;
-  const remoteUrl = `${server}${remotePath}`;
+  const remoteUrl = /^https?:\/\//i.test(remotePath) ? remotePath : `${server}${remotePath}`;
   const sourceName = String(item.originalName || item.name || "media.bin");
   const section = Number(item.section || 1);
+  const mediaRoot = CACHE_PATHS[mode].files;
   const expectedSize = Number(item.size || 0);
   const expectedMtime = Number(item.mtimeMs || 0);
   const expectedHash = String(item.hash || "").trim();
@@ -492,7 +662,7 @@ async function downloadIfNeeded(
     return entry!.localPath;
   }
 
-  const targetPath = localPathFor(remoteUrl, section, sourceName);
+  const targetPath = localPathFor(remoteUrl, section, sourceName, mediaRoot);
   const tempPath = tempDownloadPathFor(targetPath);
   emitProgress(remotePath, {
     total: expectedSize || 0,
@@ -550,9 +720,13 @@ async function downloadIfNeeded(
       } catch {
         // clean partial files before retrying
       }
+      const cloudDeviceToken = cloudService.isEnabled() ? await cloudService.ensureDeviceAuthToken() : '';
+      if (cloudService.isEnabled() && !cloudDeviceToken) throw new Error('cloud-device-auth-required');
+      const downloadUrl = `${remoteUrl}${remoteUrl.includes('?') ? '&' : '?'}ts=${Date.now()}`;
       const download = RNFS.downloadFile({
-        fromUrl: `${remoteUrl}?ts=${Date.now()}`,
+        fromUrl: downloadUrl,
         toFile: tempPath,
+        headers: cloudDeviceToken ? { Authorization: `Bearer ${cloudDeviceToken}` } : undefined,
         background: false,
         discretionary: false,
         connectionTimeout: DOWNLOAD_CONNECTION_TIMEOUT_MS,
@@ -646,15 +820,16 @@ async function downloadIfNeeded(
 async function downloadIfNeededDeduped(
   server: string,
   item: MediaItem,
-  manifest: ManifestMap
+  manifest: ManifestMap,
+  mode: MediaCacheMode = activeMediaCacheMode
 ): Promise<string | null> {
-  const key = getDownloadKey(item);
+  const key = getDownloadKey(item, mode);
   const existing = inFlightDownloads.get(key);
   if (existing) return existing;
 
   const task = (async () => {
     try {
-      return await downloadIfNeeded(server, item, manifest);
+      return await downloadIfNeeded(server, item, manifest, mode);
     } finally {
       inFlightDownloads.delete(key);
     }
@@ -712,11 +887,11 @@ async function removeStaleFiles(
   }
 }
 
-async function applyManifestToCachedList(list: MediaItem[]): Promise<MediaItem[]> {
+async function applyManifestToCachedList(list: MediaItem[], mode: MediaCacheMode = activeMediaCacheMode): Promise<MediaItem[]> {
   if (!Array.isArray(list) || !list.length) return [];
   try {
-    await ensureMediaDirs();
-    const manifest = await readManifest();
+    await ensureMediaDirs(mode);
+    const manifest = await readManifest(mode);
     let changed = false;
 
     const mapped = await Promise.all(
@@ -736,7 +911,7 @@ async function applyManifestToCachedList(list: MediaItem[]): Promise<MediaItem[]
     );
 
     if (changed) {
-      await writeListCache(mapped);
+      await writeListCache(mapped, mode);
       return mapped;
     }
 
@@ -781,10 +956,12 @@ async function runTasksWithConcurrency(
 async function mapServerListToPlayable(
   serverList: MediaItem[],
   server: string,
-  options: { awaitDownloads?: boolean; pruneStaleNow?: boolean } = {}
+  options: { awaitDownloads?: boolean; pruneStaleNow?: boolean } = {},
+  mode: MediaCacheMode = activeMediaCacheMode
 ): Promise<MediaItem[]> {
-  await ensureMediaDirs();
-  const manifest = await readManifest();
+  await ensureMediaDirs(mode);
+  const manifest = await readManifest(mode);
+  const listState = getListCacheState(mode);
   const activeUrls = new Set<string>();
   const uniqueByUrl = new Map<string, MediaItem>();
 
@@ -822,14 +999,14 @@ async function mapServerListToPlayable(
     if (shouldCacheItem(item)) {
       const sizeBytes = Number(item?.size || 0);
       if (options.awaitDownloads && sizeBytes > 0 && sizeBytes <= SMALL_FILE_AWAIT_BYTES) {
-        const localPathValue = await downloadIfNeededDeduped(server, item, manifest);
+        const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
         if (localPathValue) {
           resolvedByUrl[path] = localPathValue;
           continue;
         }
       }
       const task = async () => {
-        const localPathValue = await downloadIfNeededDeduped(server, item, manifest);
+        const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
         if (localPathValue) {
           resolvedByUrl[path] = localPathValue;
         }
@@ -861,17 +1038,17 @@ async function mapServerListToPlayable(
     }
     return {
       ...item,
-      remoteUrl: `${server}${path}`,
+      remoteUrl: /^https?:\/\//i.test(path) ? path : `${server}${path}`,
     };
   });
 
   await removeStaleFiles(manifest, activeUrls, { immediate: !!options.pruneStaleNow });
   clearProgressForMissingPaths(activeUrls);
   await writeManifest(manifest);
-  if (!sameMediaList(memoryListCache, mapped)) {
-    await writeListCache(mapped);
+  if (!sameMediaList(listState.list, mapped)) {
+    await writeListCache(mapped, mode);
   } else {
-    memoryListCacheAtMs = Date.now();
+    listState.at = Date.now();
   }
 
   if (
@@ -901,7 +1078,7 @@ async function mapServerListToPlayable(
       }
       return {
         ...item,
-        remoteUrl: `${server}${path}`,
+        remoteUrl: /^https?:\/\//i.test(path) ? path : `${server}${path}`,
       };
     });
 
@@ -948,11 +1125,11 @@ async function mapServerListToPlayable(
     }
     const refreshed = buildRefreshed();
     await writeManifest(manifest);
-    if (sameMediaList(memoryListCache, refreshed)) {
-      memoryListCacheAtMs = Date.now();
-      return memoryListCache;
+    if (sameMediaList(listState.list, refreshed)) {
+      listState.at = Date.now();
+      return listState.list;
     }
-    await writeListCache(refreshed);
+    await writeListCache(refreshed, mode);
     return refreshed;
   }
 
@@ -997,10 +1174,10 @@ async function mapServerListToPlayable(
           .then(async () => {
             const refreshed = buildRefreshed();
             await writeManifest(manifest);
-            if (!sameMediaList(memoryListCache, refreshed)) {
-              await writeListCache(refreshed);
+            if (!sameMediaList(listState.list, refreshed)) {
+              await writeListCache(refreshed, mode);
             } else {
-              memoryListCacheAtMs = Date.now();
+              listState.at = Date.now();
             }
           })
           .catch(() => {
@@ -1010,10 +1187,10 @@ async function mapServerListToPlayable(
     }
     const refreshed = buildRefreshed();
     await writeManifest(manifest);
-    if (!sameMediaList(memoryListCache, refreshed)) {
-      await writeListCache(refreshed);
+    if (!sameMediaList(listState.list, refreshed)) {
+      await writeListCache(refreshed, mode);
     } else {
-      memoryListCacheAtMs = Date.now();
+      listState.at = Date.now();
     }
   };
 
@@ -1053,37 +1230,40 @@ function normalizeMediaList(list: MediaItem[]): MediaItem[] {
   return result;
 }
 
-async function fetchServerMediaList(server: string): Promise<MediaItem[]> {
+async function fetchServerMediaList(server: string, mode: MediaCacheMode = activeMediaCacheMode): Promise<MediaItem[]> {
+  const listState = getListCacheState(mode);
   const deviceId = await DeviceIdModule.getDeviceId();
   const headers: Record<string, string> = {};
-  if (lastListEtag) headers["If-None-Match"] = lastListEtag;
+  if (listState.etag) headers["If-None-Match"] = listState.etag;
   const res = await fetchWithTimeout(
     `${server}/media-list?deviceId=${deviceId}&ts=${Date.now()}`,
     MEDIA_FETCH_TIMEOUT_MS,
     headers
   );
   if (res.status === 304) {
-    if (memoryListCache.length) return memoryListCache;
-    const cached = normalizeMediaList(sanitizeCachedList(await readListCache()));
+    if (listState.list.length) return listState.list;
+    const cached = normalizeMediaList(sanitizeCachedList(await readListCache(mode)));
     return cached;
   }
   if (!res.ok) {
     throw new Error(`media-http-${res.status}`);
   }
   const etag = res.headers?.get?.("ETag");
-  if (etag) lastListEtag = etag;
+  if (etag) listState.etag = etag;
   const list = await res.json();
   if (!Array.isArray(list)) return [];
   return normalizeMediaList(list);
 }
 
 async function loadCachedPlayableList(): Promise<MediaItem[]> {
-  if (memoryListCache.length) return memoryListCache;
+  const mode = activeMediaCacheMode;
+  const listState = getListCacheState(mode);
+  if (listState.list.length) return listState.list;
   try {
-    const cached = normalizeMediaList(sanitizeCachedList(await readListCache()));
-    const mapped = await applyManifestToCachedList(cached);
-    memoryListCache = mapped;
-    memoryListCacheAtMs = Date.now();
+    const cached = normalizeMediaList(sanitizeCachedList(await readListCache(mode)));
+    const mapped = await applyManifestToCachedList(cached, mode);
+    listState.list = mapped;
+    listState.at = Date.now();
     return mapped;
   } catch (e) {
     console.log("Load cached playable list failed", e);
@@ -1101,27 +1281,29 @@ async function refreshPlayableList(
   } = {}
 ): Promise<MediaItem[]> {
   const now = Date.now();
+  const mode = activeMediaCacheMode;
+  const listState = getListCacheState(mode);
   const server = getServer();
   if (!server) {
     return loadCachedPlayableList();
   }
 
-  const ageMs = now - memoryListCacheAtMs;
-  if (!options.force && memoryListCache.length && ageMs < LIST_REFRESH_MIN_INTERVAL_MS) {
-    return memoryListCache;
+  const ageMs = now - listState.at;
+  if (!options.force && listState.list.length && ageMs < LIST_REFRESH_MIN_INTERVAL_MS) {
+    return listState.list;
   }
 
-  if ((!options.force || !options.forceHard) && listBackoffUntilMs && now < listBackoffUntilMs) {
+  if ((!options.force || !options.forceHard) && listState.backoffUntilMs && now < listState.backoffUntilMs) {
     return loadCachedPlayableList();
   }
 
-  if (inFlightListRefresh) return inFlightListRefresh;
+  if (listState.inFlight) return listState.inFlight;
 
-  inFlightListRefresh = (async () => {
+  listState.inFlight = (async () => {
     try {
-      const list = await fetchServerMediaList(server);
-      listBackoffFailCount = 0;
-      listBackoffUntilMs = 0;
+      const list = await fetchServerMediaList(server, mode);
+      listState.backoffFailCount = 0;
+      listState.backoffUntilMs = 0;
       const totalBytes = list.reduce((sum, item) => sum + Number(item?.size || 0), 0);
       const smallLimit = Number(options.blockUntilCachedSmallBytes || 0);
       const awaitDownloads =
@@ -1130,12 +1312,12 @@ async function refreshPlayableList(
       return mapServerListToPlayable(list, server, {
         awaitDownloads,
         pruneStaleNow: !!options.pruneStaleNow,
-      });
+      }, mode);
     } catch (e) {
-      listBackoffFailCount += 1;
-      listBackoffUntilMs = Date.now() + getListBackoffDelayMs();
-      if (Date.now() - lastBackoffLogAtMs > 5000) {
-        lastBackoffLogAtMs = Date.now();
+      listState.backoffFailCount += 1;
+      listState.backoffUntilMs = Date.now() + getListBackoffDelayMs(listState);
+      if (Date.now() - listState.lastBackoffLogAtMs > 5000) {
+        listState.lastBackoffLogAtMs = Date.now();
         console.log("Media list fetch failed, backing off", e);
       }
       return loadCachedPlayableList();
@@ -1143,9 +1325,9 @@ async function refreshPlayableList(
   })();
 
   try {
-    return await inFlightListRefresh;
+    return await listState.inFlight;
   } finally {
-    inFlightListRefresh = null;
+    listState.inFlight = null;
   }
 }
 
@@ -1182,10 +1364,17 @@ export async function getMediaFiles(sectionIndex = 0, playlistNames?: string[]) 
       : sectionItems;
   };
 
+  console.log('=== MEDIA SERVICE: getMediaFiles called for section ===', sectionNo);
+  console.log('Playback override variable:', playbackOverride ? 'SET' : 'NULL');
   if (playbackOverride) {
-    return playbackOverride.items.filter(
+    console.log('=== MEDIA SERVICE: Using playback override for section ===', sectionNo);
+    console.log('Override source ID:', playbackOverride.sourceId);
+    console.log('Override items count:', playbackOverride.items.length);
+    const filtered = playbackOverride.items.filter(
       (item) => Math.max(1, Number(item?.section || 1)) === sectionNo
     );
+    console.log('Filtered items for section:', filtered.length);
+    return await resolveCachedMediaItems(filtered);
   }
 
   try {
@@ -1243,6 +1432,27 @@ export async function getMediaFiles(sectionIndex = 0, playlistNames?: string[]) 
   return filtered;
 }
 
+export async function resolveCachedMediaItems(items: MediaItem[]): Promise<MediaItem[]> {
+  if (!Array.isArray(items) || items.length === 0) return items || [];
+  const mode = activeMediaCacheMode;
+  try {
+    const manifest = await readManifest(mode);
+    return await Promise.all(items.map(async (item) => {
+      const key = String(item?.url || "");
+      const entry = key ? manifest[key] : null;
+      const usable = entry?.localPath && await isManifestEntryUsable(
+        entry,
+        Number(item.size || 0),
+        Number(item.mtimeMs || 0),
+        String(item.hash || "")
+      );
+      return usable ? { ...item, localPath: entry.localPath, remoteUrl: localUri(entry.localPath) } : item;
+    }));
+  } catch {
+    return items;
+  }
+}
+
 export async function hasCachedMedia(): Promise<boolean> {
   try {
     const list = await readListCache();
@@ -1291,19 +1501,20 @@ export async function pruneCacheIfLow(minFreeBytes = DEFAULT_MIN_FREE_BYTES) {
 
 export async function prefetchMediaItems(items: MediaItem[]) {
   try {
-    const server = getServer();
+    const mode = activeMediaCacheMode;
+    const server = mode === "cloud" ? cloudService.getApiUrl() : getServer();
     if (!server) return;
     if (!Array.isArray(items) || !items.length) return;
 
-    await ensureMediaDirs();
-    const manifest = await readManifest();
+    await ensureMediaDirs(mode);
+    const manifest = await readManifest(mode);
     const videoTasks: Array<() => Promise<void>> = [];
     const otherTasks: Array<() => Promise<void>> = [];
 
     for (const item of items) {
       if (!shouldCacheItem(item)) continue;
       const task = async () => {
-        const localPathValue = await downloadIfNeededDeduped(server, item, manifest);
+        const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
         if (localPathValue) {
           // manifest is updated inside downloadIfNeededDeduped/downloadIfNeeded
         }
@@ -1330,6 +1541,7 @@ export async function prefetchMediaItems(items: MediaItem[]) {
 
 export async function getCacheSummary() {
   try {
+    const mode = activeMediaCacheMode;
     const now = Date.now();
     if (now - cacheSummaryCache.at < CACHE_SUMMARY_TTL_MS) {
       return {
@@ -1338,12 +1550,12 @@ export async function getCacheSummary() {
         percent: cacheSummaryCache.percent,
       };
     }
-    const list = await readListCache();
+    const list = await readListCache(mode);
     if (!Array.isArray(list) || !list.length) {
       cacheSummaryCache = { at: now, total: 0, cached: 0, percent: 0 };
       return { total: 0, cached: 0, percent: 0 };
     }
-    const manifest = await readManifest();
+    const manifest = await readManifest(mode);
     let cached = 0;
     for (const item of list) {
       const path = String(item?.url || "");

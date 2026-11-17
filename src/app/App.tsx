@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useState, useRef } from 'react';
 import {
   Animated,
   AppState,
@@ -12,6 +12,7 @@ import {
   Text,
   TextInput,
   View,
+  Alert,
 } from "react-native";
 import Immersive from "react-native-immersive";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -22,7 +23,11 @@ import AdminOnlyScreen from "../admin/AdminOnlyScreen";
 import AdminCmsPanel from "../admin/AdminCmsPanel";
 import UsbSettingsPanel from "../admin/UsbSettingsPanel";
 import PlayerScreen from "../player/PlayerScreen";
+import CloudPlayerScreen from "../player/CloudPlayerScreen";
 import SetupScreen from "../setup/SetupScreen";
+import ModeSelectionScreen from "../setup/ModeSelectionScreen";
+import DeviceActivationScreen, { isDeviceActivated, setDeviceActivated } from "../setup/DeviceActivationScreen";
+import { UpdatePopup } from "../components/UpdatePopup";
 import { loadConfig } from "../services/configService";
 import { writeConfig } from "../utils/fileSystem";
 import { resolveScheduledConfig } from "../services/scheduleService";
@@ -40,14 +45,19 @@ import {
 import {
   getCacheSummary,
   clearPlaybackOverride,
+  setPlaybackOverride,
   hasCachedMedia,
   pruneCacheIfLow,
   resetMediaRuntimeState,
   setDownloadConcurrencyOverride,
   setNonPriorityThrottleMs,
   setPrioritySection,
+  setMediaCacheMode,
+  getActiveMediaCachePaths,
+  clearMediaCache,
   syncMedia,
 } from "../services/mediaService";
+import { DEFAULT_TEST_CLOUD_API_URL } from "../services/cloudRuntimeConfig";
 import { PlaybackController } from "../services/playbackController";
 import { findCMS, getServer, restoreServerFromStorage } from "../services/serverService";
 import { SourceManager, type SourceSnapshot } from "../services/sourceManager";
@@ -69,6 +79,11 @@ import {
   openNextMissingSpecialPermission,
 } from "../services/storagePermissionService";
 import { getAppMode, saveAppMode, type AppMode } from "../services/setupService";
+import cloudService from "../services/cloudService";
+import socketService from "../services/socketService";
+import offlineService from "../services/offlineService";
+import mediaCacheService from "../services/mediaCacheService";
+import eventEmitter from "../utils/EventEmitter";
 
 let socket: Socket | null = null;
 const USE_EMBEDDED_CMS = true;
@@ -206,6 +221,43 @@ async function unlinkPathIfExists(targetPath: string) {
   }
 }
 
+function addCloudDeviceAccess(value: string, deviceId: string, deviceToken = ''): string {
+  const url = String(value || '');
+  if (!deviceId || !url.includes('/api/media/file/')) return url;
+  const [base, query = ''] = url.split('?');
+  const params = new URLSearchParams(query);
+  params.set('deviceId', deviceId);
+  if (deviceToken) params.set('deviceToken', deviceToken);
+  else params.delete('deviceToken');
+  return `${base}?${params.toString()}`;
+}
+
+function decorateCloudConfigForPlayback(source: any, deviceId: string, deviceToken = '') {
+  return {
+    ...source,
+    clock: source?.widgets?.clock ?? source?.clock,
+    weather: source?.widgets?.weather ?? source?.weather,
+    sections: Array.isArray(source?.sections)
+      ? source.sections.map((section: any) => {
+          const mediaUrls = Array.isArray(section?.mediaUrls) ? section.mediaUrls : [];
+          const sourceItems = Array.isArray(section?.mediaItems) ? section.mediaItems : [];
+          return {
+            ...section,
+            mediaUrls: mediaUrls.map((url: string) => addCloudDeviceAccess(url, deviceId)),
+            mediaItems: mediaUrls.map((url: string) => {
+              const metadata = sourceItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url || '').split('?')[0]);
+              return {
+                ...metadata,
+                url,
+                streamUrl: addCloudDeviceAccess(url, deviceId, deviceToken),
+              };
+            }),
+          };
+        })
+      : source?.sections,
+  };
+}
+
 const PRESERVED_ASYNC_KEYS = new Set([
   "license_key_v1",
   "license_device_id_v1",
@@ -222,6 +274,7 @@ export default function App() {
   const [appMode, setAppMode] = useState<AppMode | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showUsbSettings, setShowUsbSettings] = useState(false);
+  const [showModeSelection, setShowModeSelection] = useState(false);
   const [adminInitialView, setAdminInitialView] = useState<"access" | "cms" | "adminCms">("access");
   const [ready, setReady] = useState(false);
   const [config, setConfig] = useState<any>(null);
@@ -234,9 +287,18 @@ export default function App() {
   const [connectStatusText, setConnectStatusText] = useState(
     "Auto reconnect active"
   );
+  const [updatePopup, setUpdatePopup] = useState<{
+    visible: boolean;
+    latestVersion: string;
+    apkUrl: string;
+  }>({ visible: false, latestVersion: '', apkUrl: '' });
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
   const spinValue = useRef(new Animated.Value(0)).current;
   const pulseValue = useRef(new Animated.Value(0)).current;
   const deviceIdRef = useRef("unknown");
+  const lastAppliedCloudConfigRef = useRef<{ version: number; signature: string } | null>(null);
+  const [deviceActivated, setDeviceActivatedState] = useState<boolean | null>(null);
   const [licenseReady, setLicenseReady] = useState(false);
   const [licensed, setLicensed] = useState(false);
   const [licenseDeviceId, setLicenseDeviceId] = useState("");
@@ -377,6 +439,166 @@ export default function App() {
   }, [cmsOnlyPlayback]);
 
   useEffect(() => {
+    // Set up event listeners for socket events
+    const setupEventListeners = () => {
+      console.log('=== APP: Setting up config:update event listener ===');
+      eventEmitter.on('config:update', async (incomingConfig: any) => {
+        if (!incomingConfig || typeof incomingConfig !== 'object') return;
+        if (await getAppMode() !== 'cloudMode') return;
+        const incomingVersion = Number(incomingConfig.configVersion || 0);
+        const sourceConfig = incomingConfig.config && typeof incomingConfig.config === 'object'
+          ? incomingConfig.config
+          : incomingConfig;
+        if (!sourceConfig || typeof sourceConfig !== 'object') return;
+        const deviceId = cloudService.getDeviceId();
+        const streamToken = await AsyncStorage.getItem('@signage_device_token') || '';
+        const config = decorateCloudConfigForPlayback(sourceConfig, deviceId, streamToken);
+        const serializedConfig = JSON.stringify(config);
+        const lastApplied = lastAppliedCloudConfigRef.current;
+        if (lastApplied && incomingVersion > 0 && incomingVersion < lastApplied.version) return;
+        if (
+          lastApplied?.signature === serializedConfig &&
+          (incomingVersion === 0 || incomingVersion <= lastApplied.version)
+        ) return;
+        lastAppliedCloudConfigRef.current = {
+          version: Math.max(incomingVersion, lastApplied?.version || 0),
+          signature: serializedConfig,
+        };
+        const [storedConfig, storedVersionText] = await Promise.all([
+          AsyncStorage.getItem('@cloud_device_config'),
+          AsyncStorage.getItem('@cloud_config_version'),
+        ]);
+        const storedVersion = Number(storedVersionText || 0);
+        if (incomingVersion > 0 && incomingVersion < storedVersion) return;
+        let configChanged = true;
+        try {
+          configChanged = !storedConfig || JSON.stringify(JSON.parse(storedConfig)) !== serializedConfig;
+        } catch {
+          configChanged = true;
+        }
+        if (incomingVersion > 0) {
+          await AsyncStorage.setItem('@cloud_config_version', String(incomingVersion));
+        }
+        if (!configChanged) return;
+        const mediaItems: any[] = [];
+        if (config.sections && Array.isArray(config.sections)) {
+          config.sections.forEach((section: any, index: number) => {
+            if (section.contentType === 'multimedia' && section.mediaUrls) {
+              section.mediaUrls.forEach((url: string, urlIndex: number) => {
+                const metadata = Array.isArray(section.mediaItems)
+                  ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+                  : null;
+                mediaItems.push({
+                    ...metadata,
+                  url: url,
+                    remoteUrl: metadata?.streamUrl || url,
+                  name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
+                  originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
+                  type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
+                  size: Number(metadata?.size || 0),
+                  section: index + 1, // Preserve actual section number
+                });
+              });
+            }
+          });
+        }
+        // The saved Cloud configuration is authoritative even when it contains
+        // no media, so an empty selection must clear the previous playlist.
+        console.log(`Applying cloud config v${incomingVersion || 'legacy'} with ${mediaItems.length} media items`);
+        setPlaybackOverride('cloud-config', mediaItems);
+        if (mediaItems.length === 0) {
+          void clearMediaCache('cloud').catch((error) => console.warn('Cloud media cache cleanup failed:', error));
+          void mediaCacheService.clearCache();
+        }
+
+        // Save config to AsyncStorage for persistence
+        await AsyncStorage.setItem('@cloud_device_config', serializedConfig);
+
+        // Set cloud config flag to prevent embedded CMS from overwriting
+        await AsyncStorage.setItem('@cloud_config_active', 'true');
+
+        setConfig(config);
+        // Trigger media sync when config changes
+        setMediaVersion(prev => prev + 1);
+        // Also trigger source refresh to force player to reload media
+        sourceManagerRef.current?.onCmsUpdate();
+      });
+
+      // Handle device not registered event from cloud service
+      eventEmitter.on('device:not_registered', () => {
+        console.log('=== APP: Device not registered, showing activation screen ===');
+        setDeviceActivatedState(false);
+      });
+
+      eventEmitter.on('device:deactivated', async () => {
+        await setDeviceActivated(false);
+        setDeviceActivatedState(false);
+      });
+
+      eventEmitter.on('command:received', (command: string) => {
+        console.log('Command received in App:', command);
+        switch (command) {
+          case 'restart':
+            // Restart the app
+            console.log('Restarting app...');
+            break;
+          case 'sync':
+            // Trigger media sync
+            console.log('Triggering media sync...');
+            setMediaVersion(prev => prev + 1);
+            break;
+          case 'clear-cache':
+            // Clear media cache
+            console.log('Clearing cache...');
+            mediaCacheService.clearCache();
+            break;
+        }
+      });
+
+      eventEmitter.on('emergency:alert', (alert: any) => {
+        console.log('Emergency alert received in App:', alert);
+        setEmergencyAlert({
+          active: true,
+          type: alert.type || 'FIRE',
+          title: alert.title || 'EMERGENCY ALERT',
+          message: alert.message || 'PLEASE EVACUATE IMMEDIATELY!',
+          sound: alert.sound || false,
+        });
+      });
+    };
+
+    setupEventListeners();
+  }, []);
+
+  useEffect(() => {
+    if (appMode !== 'cloudMode' || deviceActivated !== true) return;
+    let active = true;
+
+    const connectCloud = async () => {
+      try {
+        await cloudService.initialize();
+        if (!active || !cloudService.isEnabled()) return;
+        const deviceToken = await cloudService.ensureDeviceAuthToken();
+        if (!active || !deviceToken) return;
+        socketService.connect();
+        offlineService.initialize();
+        // Reconcile the TV with its latest backend config after process restart.
+        cloudService.startHeartbeat();
+      } catch (error) {
+        console.error('Failed to initialize cloud services:', error);
+      }
+    };
+
+    connectCloud();
+    return () => {
+      active = false;
+      cloudService.cleanup();
+      socketService.disconnect();
+      offlineService.cleanup();
+    };
+  }, [appMode, deviceActivated]);
+
+  useEffect(() => {
     let mounted = true;
     getAppMode()
       .then((mode) => {
@@ -391,9 +613,189 @@ export default function App() {
     return () => { mounted = false; };
   }, []);
 
-  const selectAppMode = async (mode: AppMode) => {
+  // Check device activation for cloud mode
+  useEffect(() => {
+    if (appMode !== 'cloudMode') {
+      setDeviceActivatedState(null);
+      return;
+    }
+
+    let checkInProgress = false;
+    const checkActivation = async () => {
+      if (checkInProgress) return;
+      checkInProgress = true;
+      try {
+        const deviceId = (NativeModules as any)?.DeviceIdModule?.getDeviceId?.();
+        if (!deviceId) {
+          setDeviceActivatedState(false);
+          return;
+        }
+
+        const apiUrl = String(await AsyncStorage.getItem('@signage_cloud_api_url') || DEFAULT_TEST_CLOUD_API_URL).replace(/\/+$/, '');
+        const [cachedToken, cachedExpiryText] = await Promise.all([
+          AsyncStorage.getItem('@signage_device_token'),
+          AsyncStorage.getItem('@signage_device_token_expiry'),
+        ]);
+        const requestToken = !cachedToken || Number(cachedExpiryText || 0) <= Date.now() + 5 * 60 * 1000;
+
+        // Check cloud API first (most authoritative)
+        const response = await fetch(`${apiUrl}/api/devices/${deviceId}/activation?issueToken=${requestToken}`);
+        if (!response.ok) throw new Error(`activation-http-${response.status}`);
+        const data = await response.json();
+
+        console.log('=== Activation check response:', data);
+
+        if (data.activated) {
+          if (data.deviceToken) {
+            const [currentToken, currentExpiryText] = await Promise.all([
+              AsyncStorage.getItem('@signage_device_token'),
+              AsyncStorage.getItem('@signage_device_token_expiry'),
+            ]);
+            const currentExpiry = Number(currentExpiryText || 0);
+            // Avoid replacing the player URL token on every activation poll.
+            // Refresh shortly before expiry so long-running Cloud video streams
+            // keep working without restarting playback every few seconds.
+            if (!currentToken || currentExpiry <= Date.now() + 5 * 60 * 1000) {
+              await AsyncStorage.setItem('@signage_device_token', data.deviceToken);
+              await AsyncStorage.setItem('@signage_device_token_expiry', String(Date.now() + Number(data.deviceTokenExpiresIn || 3600) * 1000));
+              const savedConfig = await AsyncStorage.getItem('@cloud_device_config');
+              if (savedConfig) {
+                try {
+                  const deviceConfig = JSON.parse(savedConfig);
+                  const refreshedConfig = decorateCloudConfigForPlayback(deviceConfig, deviceId, data.deviceToken);
+                  await AsyncStorage.setItem('@cloud_device_config', JSON.stringify(refreshedConfig));
+                  setConfig(refreshedConfig);
+                  setMediaVersion((version) => version + 1);
+                } catch {
+                  // The next config synchronization will repair malformed cached data.
+                }
+              }
+            }
+          }
+          // Device is activated in cloud - save to local storage
+          await setDeviceActivated(true);
+          setDeviceActivatedState(true);
+          console.log('=== Device activated, setting state to true ===');
+        } else {
+          await AsyncStorage.removeItem('@signage_device_token');
+          await AsyncStorage.removeItem('@signage_device_token_expiry');
+          // Device not activated in cloud (admin may have deleted it) - clear local storage
+          await setDeviceActivated(false);
+          setDeviceActivatedState(false);
+          console.log('=== Device not activated, setting state to false ===');
+        }
+      } catch (error) {
+        console.error('Failed to check device activation from cloud:', error);
+        // If cloud check fails, fall back to local storage (offline mode)
+        const locallyActivated = await isDeviceActivated();
+        setDeviceActivatedState(locallyActivated);
+      } finally {
+        checkInProgress = false;
+      }
+    };
+
+    // Check immediately
+    checkActivation();
+
+    // The activation screen has no authenticated socket, so poll it quickly
+    // after an admin activates the device. Active players normally get a
+    // socket event for deactivation and keep a short polling fallback.
+    const interval = setInterval(checkActivation, deviceActivated ? 60000 : 5000);
+
+    return () => clearInterval(interval);
+  }, [appMode, deviceActivated]);
+
+  // APK Update Check
+  useEffect(() => {
+    if (appMode !== 'cloudMode') return;
+
+    const checkForUpdates = async () => {
+      try {
+        const cloudService = (await import('../services/cloudService')).default;
+        const updateInfo = await cloudService.checkForUpdate();
+
+        if (updateInfo && updateInfo.hasUpdate && updateInfo.apkUrl) {
+          console.log('=== Update available ===', updateInfo);
+          setUpdatePopup({
+            visible: true,
+            latestVersion: updateInfo.latestVersion,
+            apkUrl: updateInfo.apkUrl,
+          });
+        }
+      } catch (error) {
+        console.error('Failed to check for updates:', error);
+      }
+    };
+
+    // Check immediately on mount
+    checkForUpdates();
+
+    // Check every 5 minutes
+    const interval = setInterval(checkForUpdates, 5 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [appMode]);
+
+  const handleUpdate = async () => {
+    if (!updatePopup.apkUrl) return;
+
+    setDownloading(true);
+    setDownloadProgress(0);
+
+    try {
+      const apkPath = `${RNFS.DownloadDirectoryPath}/update.apk`;
+      const downloadOptions = {
+        fromUrl: updatePopup.apkUrl,
+        toFile: apkPath,
+        progress: (res: any) => {
+          const progress = (res.bytesWritten / res.contentLength) * 100;
+          setDownloadProgress(progress);
+        },
+        progressDivider: 1,
+      };
+
+      await RNFS.downloadFile(downloadOptions).promise;
+
+      console.log('=== APK downloaded successfully ===');
+
+      // Install the APK
+      const { InstallApk } = NativeModules;
+      if (InstallApk) {
+        await InstallApk.install(apkPath);
+        console.log('=== APK installation started ===');
+      } else {
+        Alert.alert('Error', 'Install module not available');
+      }
+    } catch (error) {
+      console.error('Failed to download/install APK:', error);
+      Alert.alert('Error', 'Failed to download update. Please try again.');
+      setDownloading(false);
+    }
+  };
+
+  const handleCancelUpdate = () => {
+    setUpdatePopup({ visible: false, latestVersion: '', apkUrl: '' });
+    setDownloading(false);
+    setDownloadProgress(0);
+  };
+
+  const selectAppMode = async (mode: AppMode, isManualChange = true) => {
     await saveAppMode(mode);
+    await setMediaCacheMode(mode === 'cloudMode' ? 'cloud' : 'lan');
+    if (mode === 'cloudMode') await cloudService.initialize();
     setAppMode(mode);
+    setConfig(null);
+    if (mode !== 'cloudMode') {
+      clearPlaybackOverride('cloud-config');
+    }
+    // Reload the configuration belonging to the newly selected mode immediately.
+    // loadConfig selects the cloud snapshot only in cloudMode and the LAN config otherwise.
+    await loadConfig(setConfig);
+    setMediaVersion((version) => version + 1);
+    // Track manual mode changes to prevent cloud from overriding
+    if (isManualChange) {
+      AsyncStorage.setItem('@manual_mode_change', 'true');
+    }
   };
 
   const openAdminPanel = (view: "access" | "cms" | "adminCms", options: { openedByBack?: boolean } = {}) => {
@@ -420,27 +822,19 @@ export default function App() {
     }
 
     if (showAdmin) {
-      if (
-        adminOpenedByBackRef.current &&
-        lastTvBackPressAtRef.current > 0 &&
-        now - lastTvBackPressAtRef.current <= TV_BACK_DOUBLE_PRESS_MS
-      ) {
-        openAdminPanel("access", { openedByBack: true });
-        return true;
-      }
       closeAdminPanel();
       return true;
     }
 
-    if (now - lastTvBackPressAtRef.current <= TV_BACK_DOUBLE_PRESS_MS) {
-      openAdminPanel("access", { openedByBack: true });
+    if (showModeSelection) {
+      setShowModeSelection(false);
       return true;
     }
 
-    lastTvBackPressAtRef.current = now;
-    openAdminPanel("access", { openedByBack: true });
+    // Show mode selection screen on back button press
+    setShowModeSelection(true);
     return true;
-  }, [showAdmin, showUsbSettings]);
+  }, [showAdmin, showUsbSettings, showModeSelection]);
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", handleTvBackAction);
@@ -471,7 +865,15 @@ export default function App() {
       // Do not open USB/Storage settings while the activation screen is being
       // completed. Some TV remotes emit a directional event immediately after
       // OK/Center, which previously opened this panel just after activation.
-      if (licensed && eventType === "down" && !showAdmin && !showUsbSettings) {
+      // Only open USB settings when on PlayerScreen (tvMode)
+      // Accept multiple event types for OK button (center, enter, select, ok)
+      // USB settings is a local feature, so license check not required for LAN mode
+      const isOkButton = eventType === "center" || eventType === "enter" || eventType === "select" || eventType === "ok";
+      // Log all events in tvMode to debug
+      if (appMode === "tvMode" && !showAdmin && !showUsbSettings) {
+        console.log("TV Remote Event:", { eventType, keyAction, isOkButton });
+      }
+      if (appMode === "tvMode" && isOkButton && !showAdmin && !showUsbSettings) {
         setShowUsbSettings(true);
         return;
       }
@@ -481,7 +883,7 @@ export default function App() {
     return () => {
       sub.remove();
     };
-  }, [handleTvBackAction, licensed, showAdmin, showUsbSettings]);
+  }, [handleTvBackAction, licensed, showAdmin, showUsbSettings, appMode]);
 
   useEffect(() => {
     offlineNoticeRef.current = offlineNotice;
@@ -658,7 +1060,7 @@ export default function App() {
 
   async function clearRuntimeCacheOnly() {
     clearNativeVideoCache();
-    const mediaPath = `${RNFS.DocumentDirectoryPath}/media`;
+    const mediaPath = getActiveMediaCachePaths().directory;
     const cachePath = RNFS.CachesDirectoryPath;
     if (await RNFS.exists(mediaPath)) {
       await RNFS.unlink(mediaPath);
@@ -731,7 +1133,7 @@ export default function App() {
 
   async function clearRuntimeDeepData() {
     clearNativeVideoCache();
-    await resetMediaRuntimeState({ clearListCache: true });
+    await resetMediaRuntimeState({ clearListCache: true, clearPlaybackOverride: true });
     await clearUsbPlaybackCache();
     await clearPersistedPlaybackState();
     resetRuntimePlaybackSnapshots();
@@ -780,7 +1182,7 @@ export default function App() {
    */
   async function clearRuntimeUploadedMedia() {
     playbackControllerRef.current.stopInstantStream();
-    await resetMediaRuntimeState({ clearListCache: true });
+    await resetMediaRuntimeState({ clearListCache: true, clearPlaybackOverride: true });
     resetRuntimePlaybackSnapshots();
     setSectionPlaybackTimeline({});
     setUploadProcessingBySection({});
@@ -836,9 +1238,9 @@ export default function App() {
 
   async function clearOldCachedMediaExceptActive() {
     try {
-      const mediaPath = `${RNFS.DocumentDirectoryPath}/media`;
-      const manifestPath = `${mediaPath}/manifest.json`;
-      const listPath = `${mediaPath}/list-cache.json`;
+      const cachePaths = getActiveMediaCachePaths();
+      const manifestPath = cachePaths.manifest;
+      const listPath = cachePaths.list;
       const keepSet = new Set<string>();
 
       if (await RNFS.exists(listPath)) {
@@ -873,7 +1275,7 @@ export default function App() {
         }
       }
 
-      const filesRoot = `${mediaPath}/files`;
+      const filesRoot = cachePaths.files;
       if (!(await RNFS.exists(filesRoot))) return;
       const entries = await RNFS.readDir(filesRoot);
       let removedCount = 0;
@@ -2004,6 +2406,61 @@ export default function App() {
       if (initInProgress) return;
       initInProgress = true;
       try {
+        // Check for cloud config first before embedded CMS
+        const persistedMode = await getAppMode();
+        await setMediaCacheMode(persistedMode === 'cloudMode' ? 'cloud' : 'lan');
+        if (persistedMode === 'cloudMode') {
+          console.log('=== INIT: Cloud config is active, loading from AsyncStorage ===');
+          const cloudConfigStr = await AsyncStorage.getItem('@cloud_device_config');
+          if (cloudConfigStr) {
+            const cloudConfig = JSON.parse(cloudConfigStr);
+            if (cloudConfig && typeof cloudConfig === "object") {
+              console.log('=== INIT: Loaded cloud config from storage ===');
+              const deviceId = cloudService.getDeviceId();
+              const streamToken = await AsyncStorage.getItem('@signage_device_token') || '';
+              const activeCloudConfig = decorateCloudConfigForPlayback(cloudConfig, deviceId, streamToken);
+              setConfig(activeCloudConfig);
+              setSectionPlaybackTimeline(normalizePlaybackTimeline(cloudConfig?.playbackTimeline));
+              lastConfigSyncAtRef.current = new Date().toISOString();
+
+              // Set playback override from cloud config sections
+              if (activeCloudConfig.sections && Array.isArray(activeCloudConfig.sections)) {
+                console.log('=== INIT: Setting playback override from cloud config ===');
+                const mediaItems: any[] = [];
+                activeCloudConfig.sections.forEach((section: any, sectionIndex: number) => {
+                  if (section.contentType === 'multimedia' && section.mediaUrls) {
+                    section.mediaUrls.forEach((url: string, index: number) => {
+                      const metadata = Array.isArray(section.mediaItems)
+                        ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+                        : null;
+                      mediaItems.push({
+                        ...metadata,
+                        url,
+                        remoteUrl: metadata?.streamUrl || url,
+                        name: metadata?.name || url.split('/').pop() || `media_${index}`,
+                        originalName: metadata?.originalName || url.split('/').pop() || `media_${index}`,
+                        type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
+                        size: Number(metadata?.size || 0),
+                        section: sectionIndex + 1,
+                      });
+                    });
+                  }
+                });
+                console.log('=== INIT: Setting playback override with media items:', mediaItems.length);
+                setPlaybackOverride('cloud-config', mediaItems);
+              }
+
+              setReady(true);
+              setConnectTexts("Cloud config loaded. Player is ready.", "Ready");
+              return;
+            }
+          }
+          // Never fall through to the embedded/LAN config while Cloud mode is selected.
+          setReady(true);
+          setConnectTexts("Waiting for cloud configuration", "Cloud mode");
+          return;
+        }
+
         if (USE_EMBEDDED_CMS) {
           startEmbeddedCmsServer();
           await restoreServerFromStorage();
@@ -2516,6 +2973,71 @@ export default function App() {
     return <SetupScreen onSelectMode={selectAppMode} />;
   }
 
+  // Cloud mode - use CloudPlayerScreen (no embedded CMS, cloud only)
+  if (appMode === "cloudMode") {
+    // Show activation screen if device is not activated
+    if (deviceActivated === false) {
+      return <DeviceActivationScreen />;
+    }
+
+    // Show loading while checking activation
+    if (deviceActivated === null) {
+      return (
+        <View style={styles.connectRoot}>
+          <View style={styles.bgGlowTop} />
+          <View style={styles.bgGlowBottom} />
+          <View style={styles.connectCard}>
+            <Text style={styles.connectTitle}>Checking Device Activation</Text>
+            <Text style={styles.connectSubtitle}>Verifying device authorization...</Text>
+          </View>
+        </View>
+      );
+    }
+
+    return (
+      <PlayerErrorBoundary onError={(error) => reportRuntimeError(error.message, String(error))}>
+        <CloudPlayerScreen
+          config={config}
+          setConfig={setConfig}
+          mediaVersion={mediaVersion}
+          scheduleClockTick={scheduleClockTick}
+          emergencyAlert={emergencyAlert}
+          playerPaused={playerPaused}
+          setPlayerPaused={setPlayerPaused}
+          sourceSnapshot={sourceSnapshot}
+          cmsOnlyPlayback={true}
+          uploadProcessingBySection={uploadProcessingBySection}
+          uploadCountsBySection={uploadCountsBySection}
+          playlistSyncAt={playlistSyncAt}
+          contentResetVersion={contentResetVersion}
+          sectionMediaVersion={sectionMediaVersion}
+          sectionPlaybackTimeline={sectionPlaybackTimeline}
+          lastError={lastError}
+          setLastError={setLastError}
+          apkUpdateState={apkUpdateState}
+          setApkUpdateState={setApkUpdateState}
+          documentConversionState={documentConversionState}
+          setDocumentConversionState={setDocumentConversionState}
+          playbackControllerRef={playbackControllerRef}
+          sourceManagerRef={sourceManagerRef}
+          reportRuntimeError={reportRuntimeError}
+        />
+        {showModeSelection && appMode && (
+          <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>
+            <ModeSelectionScreen
+              currentMode={appMode}
+              onSwitchMode={async (mode) => {
+                await selectAppMode(mode, true);
+                setShowModeSelection(false);
+              }}
+              onClose={() => setShowModeSelection(false)}
+            />
+          </View>
+        )}
+      </PlayerErrorBoundary>
+    );
+  }
+
   if (!licenseReady) {
     return (
       <View style={styles.connectRoot}>
@@ -2529,7 +3051,8 @@ export default function App() {
     );
   }
 
-  if (!licensed) {
+  // Skip license page if already licensed OR in cloud mode (cloud mode doesn't need license)
+  if (!licensed && String(appMode) !== "cloudMode") {
     return (
       <View style={styles.connectRoot}>
         <View style={styles.bgGlowTop} />
@@ -2822,6 +3345,15 @@ export default function App() {
 
   return (
     <View style={{ flex: 1, backgroundColor: "#000" }}>
+      <UpdatePopup
+        visible={updatePopup.visible}
+        latestVersion={updatePopup.latestVersion}
+        apkUrl={updatePopup.apkUrl}
+        onUpdate={handleUpdate}
+        onCancel={handleCancelUpdate}
+        downloading={downloading}
+        downloadProgress={downloadProgress}
+      />
       <View
         style={{
           width: containerWidth,
@@ -2849,11 +3381,12 @@ export default function App() {
             onClearEmergencyAlert={() => setEmergencyAlert({ ...emergencyAlert, active: false })}
           />
         </PlayerErrorBoundary>
-        {sourceSnapshot.activeSource === "USB" && !showAdmin && !showUsbSettings ? (
+        {!showAdmin && !showUsbSettings ? (
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`${sourceSnapshot.usbSourceType === "tvad" ? "Storage" : "USB"} settings`}
-            focusable={false}
+            focusable={true}
+            hasTVPreferredFocus={true}
             onPress={() => setShowUsbSettings(true)}
             style={StyleSheet.absoluteFill}
           />
@@ -2952,6 +3485,18 @@ export default function App() {
 
         </View>
       ) : null}
+      {showModeSelection && appMode && (
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>
+          <ModeSelectionScreen
+            currentMode={appMode}
+            onSwitchMode={async (mode) => {
+              await selectAppMode(mode, true);
+              setShowModeSelection(false);
+            }}
+            onClose={() => setShowModeSelection(false)}
+          />
+        </View>
+      )}
     </View>
   );
 }

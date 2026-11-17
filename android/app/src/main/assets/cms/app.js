@@ -2124,8 +2124,8 @@ async function convertPptxFileToImages(file) {
 }
 
 function sectionCount(layout) {
-  if (layout === "grid2") return 2;
-  if (layout === "grid3") return 3;
+  if (layout === "split") return 2;
+  if (layout === "grid") return 3;
   return 1;
 }
 
@@ -2285,10 +2285,10 @@ function normalizeRatio(value, count) {
 }
 
 function ratioOptionsFor(layout, grid3Layout) {
-  if (layout === "grid2") return RATIO_PRESETS.grid2;
-  if (layout === "grid3" && grid3Layout === "stack-v") return RATIO_PRESETS.grid3StackV;
-  if (layout === "grid3" && grid3Layout === "stack-h") return RATIO_PRESETS.grid3StackH;
-  if (layout === "grid3") return RATIO_PRESETS.grid3TopBottom;
+  if (layout === "split") return RATIO_PRESETS.grid2;
+  if (layout === "grid" && grid3Layout === "stack-v") return RATIO_PRESETS.grid3StackV;
+  if (layout === "grid" && grid3Layout === "stack-h") return RATIO_PRESETS.grid3StackH;
+  if (layout === "grid") return RATIO_PRESETS.grid3TopBottom;
   return RATIO_PRESETS.fullscreen;
 }
 
@@ -2548,7 +2548,7 @@ function miniLayoutMarkup(layout, grid3Layout) {
     return `<div style="height:100%;display:grid;grid-template-columns:1fr"><div class="cell">1</div></div>`;
   }
 
-  if (layout === "grid2") {
+  if (layout === "split") {
     const [a, b] = normalizeRatio(selectedGridRatio, 2);
     if (grid3Layout === "stack-v") {
       return `
@@ -2612,7 +2612,7 @@ function liveLayoutMarkup(layout, grid3Layout) {
     `;
   }
 
-  if (layout === "grid2") {
+  if (layout === "split") {
     const [left, right] = normalizeRatio(selectedGridRatio, 2);
     if (grid3Layout === "stack-v") {
       return `
@@ -3057,24 +3057,24 @@ function renderGrid3LayoutOptions() {
 
   if (!box || !layoutSection) return;
 
-  if (layout !== "grid2" && layout !== "grid3") {
+  if (layout !== "split" && layout !== "grid") {
     layoutSection.classList.add("hidden");
     return;
   }
 
   layoutSection.classList.remove("hidden");
   if (title) {
-    title.textContent = layout === "grid2" ? "Grid 2 Layout Options" : "Grid 3 Layout Options";
+    title.textContent = layout === "split" ? "Grid 2 Layout Options" : "Grid 3 Layout Options";
   }
 
-  if (layout === "grid2") {
+  if (layout === "split") {
     const validIds = GRID2_LAYOUTS.map((item) => item.id);
     if (!validIds.includes(selectedGrid3Layout)) {
       selectedGrid3Layout = "stack-h";
     }
     box.innerHTML = GRID2_LAYOUTS.map((item) => {
       const active = item.id === selectedGrid3Layout ? "active" : "";
-      const mini = miniLayoutMarkup("grid2", item.id);
+      const mini = miniLayoutMarkup("split", item.id);
       return `
         <button class="layout-option ${active}" onclick="selectGrid3Layout('${item.id}')" type="button">
           <strong>${item.label}</strong>
@@ -3091,7 +3091,7 @@ function renderGrid3LayoutOptions() {
   }
   box.innerHTML = GRID3_LAYOUTS.map((item) => {
     const active = item.id === selectedGrid3Layout ? "active" : "";
-    const mini = miniLayoutMarkup("grid3", item.id);
+    const mini = miniLayoutMarkup("grid", item.id);
     return `
       <button class="layout-option ${active}" onclick="selectGrid3Layout('${item.id}')" type="button">
         <strong>${item.label}</strong>
@@ -3604,8 +3604,8 @@ function updateSectionVisibility() {
 
   s1.style.display = "block";
   s2.style.display = layout === "fullscreen" ? "none" : "block";
-  s3.style.display = layout === "grid3" ? "block" : "none";
-  grid3LayoutSection.classList.toggle("hidden", layout !== "grid3" && layout !== "grid2");
+  s3.style.display = layout === "grid" ? "block" : "none";
+  grid3LayoutSection.classList.toggle("hidden", layout !== "grid" && layout !== "split");
 
   // Ensure layout options normalize selectedGrid3Layout before preview render.
   renderGrid3LayoutOptions();

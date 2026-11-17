@@ -35,6 +35,7 @@ export default function CmsAccessCard({
   const [openFocused, setOpenFocused] = useState(false);
   const [openAdminFocused, setOpenAdminFocused] = useState(false);
   const [saveFocused, setSaveFocused] = useState(false);
+  const [nameInputFocused, setNameInputFocused] = useState(false);
   const accessUrl = info.publicUrl || info.localUrl;
   const displayIp =
     info.ipAddress ||
@@ -148,7 +149,9 @@ export default function CmsAccessCard({
             onChangeText={setNameInput}
             placeholder="Enter TV name"
             placeholderTextColor="rgba(209,223,236,0.42)"
-            style={styles.nameInput}
+            style={[styles.nameInput, nameInputFocused ? styles.nameInputFocused : null]}
+            onFocus={() => setNameInputFocused(true)}
+            onBlur={() => setNameInputFocused(false)}
           />
           <Pressable
             onPress={onSaveName}
@@ -316,6 +319,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     marginRight: 8,
+  },
+  nameInputFocused: {
+    borderColor: "#1d8fff",
+    borderWidth: 2,
+    backgroundColor: "#ffffff",
   },
   saveBtn: {
     backgroundColor: "#1d8fff",
