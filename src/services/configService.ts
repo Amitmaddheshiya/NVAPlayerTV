@@ -76,9 +76,7 @@ export async function loadConfig(setConfig: Function) {
             : Array.isArray(storedConfig.mediaUrls) ? storedConfig.mediaUrls : [];
           setCloudConfigMediaUrls(savedMediaUrls);
           const deviceId = cloudService.getDeviceId();
-          const deviceToken = await AsyncStorage.getItem('@signage_device_token') || '';
-          const withDeviceAccess = (value: string, includeToken = false) =>
-            addCloudDeviceAccess(value, deviceId, includeToken ? deviceToken : '');
+          const withDeviceAccess = (value: string) => addCloudDeviceAccess(value, deviceId);
           const cloudConfig = {
             ...storedConfig,
             clock: storedConfig.widgets?.clock ?? storedConfig.clock,
@@ -97,7 +95,7 @@ export async function loadConfig(setConfig: Function) {
                         return {
                           ...metadata,
                           url,
-                          streamUrl: withDeviceAccess(url, true),
+                          streamUrl: undefined,
                         };
                       })
                     : section?.mediaItems,
@@ -119,7 +117,8 @@ export async function loadConfig(setConfig: Function) {
                   mediaItems.push({
                     ...metadata,
                     url,
-                    remoteUrl: metadata?.streamUrl || withDeviceAccess(url, true),
+                    streamUrl: undefined,
+                    remoteUrl: withDeviceAccess(url),
                     name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
                     originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
                     type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),

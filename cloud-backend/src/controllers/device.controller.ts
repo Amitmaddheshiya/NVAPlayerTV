@@ -297,21 +297,62 @@ export const reportCloudSyncStatus = async (req: AuthRequest, res: Response): Pr
     }
     const mediaTotal = Math.max(0, Math.trunc(Number(req.body?.mediaTotal || 0)));
     const mediaCached = Math.max(0, Math.min(mediaTotal, Math.trunc(Number(req.body?.mediaCached || 0))));
+    const currentSnapshot = await Device.findOne({
+      deviceId,
+      activated: true,
+      'cacheInfo.configVersion': configVersion,
+    }).select('health.cloudSync config.sections').lean();
+    if (!currentSnapshot) {
+      const current = await Device.findOne({ deviceId }).select('cacheInfo.configVersion activated');
+      res.status(current?.activated ? 409 : 404).json({
+        error: current?.activated ? 'A newer config version is active' : 'Device not found or inactive',
+        configVersion: current?.cacheInfo?.configVersion || 0,
+      });
+      return;
+    }
+    const savedSync = (currentSnapshot as any).health?.cloudSync || {};
+    const currentConfigSections = Array.isArray((currentSnapshot as any).config?.sections)
+      ? (currentSnapshot as any).config.sections
+      : [];
+    const configuredMediaCount = currentConfigSections.reduce((total: number, section: any) =>
+      total + (section?.contentType === 'multimedia' && Array.isArray(section?.mediaUrls) ? section.mediaUrls.length : 0), 0);
+    const syncSnapshotIsCurrent = Number(savedSync.configVersion) === configVersion;
+    const expectedMediaTotal = Math.max(0, Math.trunc(Number(
+      syncSnapshotIsCurrent ? savedSync.mediaTotal ?? configuredMediaCount : configuredMediaCount
+    )));
+    const onlineOnlySections = syncSnapshotIsCurrent
+      ? Math.max(0, Math.trunc(Number(savedSync.onlineOnlySections || 0)))
+      : currentConfigSections.filter((section: any) =>
+          (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
+          (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
+        ).length;
+    if (mediaTotal !== expectedMediaTotal || (status === 'ready' && mediaCached !== mediaTotal)) {
+      res.status(400).json({ error: 'Sync status does not match the saved configuration media count' });
+      return;
+    }
     const cloudSync = {
       configVersion,
       status,
       mediaTotal,
       mediaCached,
+      onlineOnlySections,
       message: String(req.body?.message || '').slice(0, 500),
       updatedAt: new Date(),
     };
+    const syncFilter: Record<string, unknown> = { deviceId, activated: true, 'cacheInfo.configVersion': configVersion };
+    // A delayed progress packet must not downgrade a completed sync.
+    if (status !== 'ready') syncFilter['health.cloudSync.status'] = { $ne: 'ready' };
     const device = await Device.findOneAndUpdate(
-      { deviceId, activated: true, 'cacheInfo.configVersion': configVersion },
+      syncFilter,
       { $set: { 'health.cloudSync': cloudSync } },
       { new: true, projection: { health: 1, cacheInfo: 1 } }
     );
     if (!device) {
-      const current = await Device.findOne({ deviceId }).select('cacheInfo.configVersion activated');
+      const current = await Device.findOne({ deviceId }).select('cacheInfo.configVersion activated health.cloudSync');
+      if (current?.activated && Number(current.cacheInfo?.configVersion || 0) === configVersion && (current as any).health?.cloudSync?.status === 'ready') {
+        res.json({ success: true, cloudSync: (current as any).health.cloudSync });
+        return;
+      }
       res.status(current?.activated ? 409 : 404).json({
         error: current?.activated ? 'A newer config version is active' : 'Device not found or inactive',
         configVersion: current?.cacheInfo?.configVersion || 0,
@@ -466,6 +507,10 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       status: 'pending',
       mediaTotal: expectedMediaCount,
       mediaCached: 0,
+      onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
+        (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
+        (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
+      ).length,
       message: 'Waiting for device to download and apply this configuration',
       updatedAt: new Date(),
     });
@@ -804,6 +849,15 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         device.cacheInfo.lastSyncTime = new Date();
         device.cacheInfo.cachedMedia = [];
       }
+      device.set('health.cloudSync', {
+        configVersion: device.cacheInfo?.configVersion || 0,
+        status: 'pending',
+        mediaTotal: 0,
+        mediaCached: 0,
+        onlineOnlySections: 0,
+        message: 'Waiting for the device to apply its new assignment',
+        updatedAt: new Date(),
+      });
     }
 
     await device.save();

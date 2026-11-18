@@ -348,6 +348,10 @@ export const UserGroupConfigure = () => {
     const sync = device.health?.cloudSync;
     return sync?.status === 'ready' && sync.mediaCached === sync.mediaTotal;
   }).length;
+  const onlineOnlySections = (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
+    (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
+    (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
+  ).length;
   const syncState = syncedDevices.some((device) => device.health?.cloudSync?.status === 'failed')
     ? 'failed'
     : groupDevices.length > 0 && readyDeviceCount === groupDevices.length
@@ -403,6 +407,11 @@ export const UserGroupConfigure = () => {
                   {syncState === 'ready' ? 'Applied and cached' : syncState === 'failed' ? 'Some devices need attention' : 'Sync in progress'}
                   {' '}· cached {syncTotals.cached}/{syncTotals.total} file placements across {readyDeviceCount}/{groupDevices.length} devices
                 </span>
+                {onlineOnlySections > 0 && (
+                  <div className="mt-1 font-medium">
+                    {onlineOnlySections} web/YouTube section{onlineOnlySections === 1 ? '' : 's'} require internet and are not part of offline media cache.
+                  </div>
+                )}
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px]">
                   {groupDevices.map((device) => {
                     const sync = device.health?.cloudSync;

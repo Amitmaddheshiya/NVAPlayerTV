@@ -1,4 +1,5 @@
 import RNFS from "react-native-fs";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { NativeModules } from "react-native";
 import { getServer } from "./serverService";
 import cloudService from "./cloudService";
@@ -6,6 +7,7 @@ import cloudService from "./cloudService";
 const { DeviceIdModule } = NativeModules as any;
 
 type MediaCacheMode = "lan" | "cloud";
+export const CLOUD_ACTIVE_CACHE_GENERATION_KEY = "@cloud_active_cache_generation";
 const MEDIA_ROOT_DIR = `${RNFS.DocumentDirectoryPath}/media`;
 const CACHE_PATHS: Record<MediaCacheMode, { dir: string; files: string; manifest: string; list: string }> = {
   lan: {
@@ -22,6 +24,7 @@ const CACHE_PATHS: Record<MediaCacheMode, { dir: string; files: string; manifest
   },
 };
 let activeMediaCacheMode: MediaCacheMode = "lan";
+let activeCloudCacheGeneration = "legacy";
 let MEDIA_DIR = CACHE_PATHS.lan.dir;
 let MEDIA_ROOT = CACHE_PATHS.lan.files;
 let MANIFEST_PATH = CACHE_PATHS.lan.manifest;
@@ -188,6 +191,48 @@ let cacheSummaryCache = { at: 0, total: 0, cached: 0, percent: 0 };
 let playbackOverride: PlaybackOverride | null = null;
 let pinnedCloudConfigUrls = new Set<string>();
 
+function normalizeGeneration(value?: string | number | null): string {
+  const generation = String(value || "legacy").trim();
+  return /^[a-zA-Z0-9_-]{1,100}$/.test(generation) ? generation : "legacy";
+}
+
+function getCachePaths(mode: MediaCacheMode, generation?: string) {
+  if (mode !== "cloud") return CACHE_PATHS.lan;
+  const selected = normalizeGeneration(generation ?? activeCloudCacheGeneration);
+  if (selected === "legacy") return CACHE_PATHS.cloud;
+  const dir = `${CACHE_PATHS.cloud.dir}/generations/${selected}`;
+  return { dir, files: `${dir}/files`, manifest: `${dir}/manifest.json`, list: `${dir}/list-cache.json` };
+}
+
+/** Select the committed Cloud cache generation. Staging downloads never change this pointer. */
+export async function setCloudCacheGeneration(generation?: string | number | null): Promise<void> {
+  activeCloudCacheGeneration = normalizeGeneration(generation);
+  if (activeMediaCacheMode === "cloud") applyMediaCacheMode("cloud");
+  await ensureMediaDirs("cloud");
+}
+
+/** Keep the active generation and one rollback generation; remove older staged/orphan generations. */
+export async function pruneCloudCacheGenerations(keep: Array<string | number | null | undefined> = []): Promise<void> {
+  try {
+    const root = `${CACHE_PATHS.cloud.dir}/generations`;
+    const preserve = new Set([activeCloudCacheGeneration, ...keep.map(normalizeGeneration)]);
+    if (await RNFS.exists(root)) {
+      const entries = await RNFS.readDir(root);
+      for (const entry of entries) {
+        if (!entry.isDirectory() || preserve.has(entry.name)) continue;
+        await RNFS.unlink(entry.path);
+      }
+    }
+    if (activeCloudCacheGeneration !== "legacy" && !preserve.has("legacy")) {
+      for (const legacyPath of [CACHE_PATHS.cloud.files, CACHE_PATHS.cloud.manifest, CACHE_PATHS.cloud.list]) {
+        if (await RNFS.exists(legacyPath)) await RNFS.unlink(legacyPath);
+      }
+    }
+  } catch (error) {
+    console.warn("Cloud cache generation cleanup deferred", error);
+  }
+}
+
 function normalizeCacheUrl(value: string): string {
   return String(value || "").trim().split(/[?#]/, 1)[0];
 }
@@ -203,16 +248,24 @@ function getListCacheState(mode: MediaCacheMode = activeMediaCacheMode): ListCac
 
 function applyMediaCacheMode(mode: MediaCacheMode) {
   activeMediaCacheMode = mode;
-  MEDIA_DIR = CACHE_PATHS[mode].dir;
-  MEDIA_ROOT = CACHE_PATHS[mode].files;
-  MANIFEST_PATH = CACHE_PATHS[mode].manifest;
-  LIST_CACHE_PATH = CACHE_PATHS[mode].list;
+  const paths = getCachePaths(mode);
+  MEDIA_DIR = paths.dir;
+  MEDIA_ROOT = paths.files;
+  MANIFEST_PATH = paths.manifest;
+  LIST_CACHE_PATH = paths.list;
   for (const key of Object.keys(progressMap)) delete progressMap[key];
   invalidateCacheSummary();
 }
 
 export async function setMediaCacheMode(mode: MediaCacheMode): Promise<void> {
-  if (activeMediaCacheMode !== mode) applyMediaCacheMode(mode);
+  if (mode === "cloud") {
+    try {
+      activeCloudCacheGeneration = normalizeGeneration(await AsyncStorage.getItem(CLOUD_ACTIVE_CACHE_GENERATION_KEY));
+    } catch {
+      activeCloudCacheGeneration = "legacy";
+    }
+  }
+  applyMediaCacheMode(mode);
   await cloudService.initialize();
   await ensureMediaDirs();
   await migrateLegacyCloudCache();
@@ -239,7 +292,7 @@ export async function clearMediaCache(mode: MediaCacheMode = activeMediaCacheMod
   await Promise.allSettled(pendingDownloads);
   await manifestWriteQueue;
 
-  const paths = CACHE_PATHS[mode];
+  const paths = getCachePaths(mode);
   if (await RNFS.exists(paths.dir)) await RNFS.unlink(paths.dir);
   await RNFS.mkdir(paths.dir);
   await RNFS.mkdir(paths.files);
@@ -357,9 +410,10 @@ function safeName(value: string, fallback = "media"): string {
   return name || fallback;
 }
 
-async function ensureMediaDirs(mode: MediaCacheMode = activeMediaCacheMode) {
-  const mediaDir = CACHE_PATHS[mode].dir;
-  const mediaRoot = CACHE_PATHS[mode].files;
+async function ensureMediaDirs(mode: MediaCacheMode = activeMediaCacheMode, generation?: string) {
+  const paths = getCachePaths(mode, generation);
+  const mediaDir = paths.dir;
+  const mediaRoot = paths.files;
   await RNFS.mkdir(mediaDir);
   await RNFS.mkdir(mediaRoot);
 }
@@ -380,8 +434,8 @@ async function writeJsonFile(filePath: string, payload: any) {
   await RNFS.writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
 }
 
-async function readManifest(mode: MediaCacheMode = activeMediaCacheMode): Promise<ManifestMap> {
-  const manifestPath = CACHE_PATHS[mode].manifest;
+async function readManifest(mode: MediaCacheMode = activeMediaCacheMode, generation?: string): Promise<ManifestMap> {
+  const manifestPath = getCachePaths(mode, generation).manifest;
   const manifest = await readJsonFile<ManifestMap>(manifestPath, {});
   manifestBaselines.set(manifest, JSON.parse(JSON.stringify(manifest)) as ManifestMap);
   manifestFilePaths.set(manifest, manifestPath);
@@ -414,13 +468,13 @@ async function writeManifest(manifest: ManifestMap) {
 }
 
 async function readListCache(mode: MediaCacheMode = activeMediaCacheMode): Promise<MediaItem[]> {
-  const listPath = CACHE_PATHS[mode].list;
+  const listPath = getCachePaths(mode).list;
   const list = await readJsonFile<MediaItem[]>(listPath, []);
   return Array.isArray(list) ? list : [];
 }
 
 async function writeListCache(list: MediaItem[], mode: MediaCacheMode = activeMediaCacheMode) {
-  const listPath = CACHE_PATHS[mode].list;
+  const listPath = getCachePaths(mode).list;
   const listState = getListCacheState(mode);
   if (sameMediaList(listState.list, list)) {
     listState.at = Date.now();
@@ -668,14 +722,15 @@ async function downloadIfNeeded(
   server: string,
   item: MediaItem,
   manifest: ManifestMap,
-  mode: MediaCacheMode
+  mode: MediaCacheMode,
+  generation?: string
 ): Promise<string | null> {
   const remotePath = String(item.url || "");
   if (!remotePath) return null;
   const remoteUrl = /^https?:\/\//i.test(remotePath) ? remotePath : `${server}${remotePath}`;
   const sourceName = String(item.originalName || item.name || "media.bin");
   const section = Number(item.section || 1);
-  const mediaRoot = CACHE_PATHS[mode].files;
+  const mediaRoot = getCachePaths(mode, generation).files;
   const expectedSize = Number(item.size || 0);
   const expectedMtime = Number(item.mtimeMs || 0);
   const expectedHash = String(item.hash || "").trim();
@@ -850,15 +905,16 @@ async function downloadIfNeededDeduped(
   server: string,
   item: MediaItem,
   manifest: ManifestMap,
-  mode: MediaCacheMode = activeMediaCacheMode
+  mode: MediaCacheMode = activeMediaCacheMode,
+  generation?: string
 ): Promise<string | null> {
-  const key = getDownloadKey(item, mode);
+  const key = `${getDownloadKey(item, mode)}|${normalizeGeneration(generation ?? (mode === "cloud" ? activeCloudCacheGeneration : "legacy"))}`;
   const existing = inFlightDownloads.get(key);
   if (existing) return existing;
 
   const task = (async () => {
     try {
-      return await downloadIfNeeded(server, item, manifest, mode);
+      return await downloadIfNeeded(server, item, manifest, mode, generation);
     } finally {
       inFlightDownloads.delete(key);
     }
@@ -1405,7 +1461,12 @@ export async function getMediaFiles(sectionIndex = 0, playlistNames?: string[]) 
       (item) => Math.max(1, Number(item?.section || 1)) === sectionNo
     );
     console.log('Filtered items for section:', filtered.length);
-    return await resolveCachedMediaItems(filtered);
+    const resolved = await resolveCachedMediaItems(filtered);
+    // Cloud playlists are offline snapshots. Never hand an uncached remote URL
+    // to the cloud player as a streaming fallback.
+    return activeMediaCacheMode === "cloud"
+      ? resolved.filter((item) => !!item.localPath && /^file:\/\//i.test(String(item.remoteUrl || "")))
+      : resolved;
   }
 
   try {
@@ -1468,7 +1529,7 @@ export async function resolveCachedMediaItems(items: MediaItem[]): Promise<Media
   const mode = activeMediaCacheMode;
   try {
     const manifest = await readManifest(mode);
-    return await Promise.all(items.map(async (item) => {
+    const resolved = await Promise.all(items.map(async (item) => {
       const key = String(item?.url || "");
       const entry = key ? manifest[key] : null;
       const usable = entry?.localPath && await isManifestEntryUsable(
@@ -1479,8 +1540,14 @@ export async function resolveCachedMediaItems(items: MediaItem[]): Promise<Media
       );
       return usable ? { ...item, localPath: entry.localPath, remoteUrl: localUri(entry.localPath) } : item;
     }));
+    // Do not play a partial Cloud playlist or fall back to a remote URL. The
+    // player gets the complete ordered section only after every item is local.
+    if (mode === "cloud" && resolved.some((item) => !item.localPath || !/^file:\/\//i.test(String(item.remoteUrl || "")))) {
+      return [];
+    }
+    return resolved;
   } catch {
-    return items;
+    return mode === "cloud" ? [] : items;
   }
 }
 
@@ -1542,7 +1609,8 @@ export type MediaPrefetchResult = { total: number; cached: number; failed: numbe
 
 export async function prefetchMediaItems(
   items: MediaItem[],
-  onProgress?: (result: MediaPrefetchResult) => void | Promise<void>
+  onProgress?: (result: MediaPrefetchResult) => void | Promise<void>,
+  generation?: string
 ): Promise<MediaPrefetchResult> {
   const requestedItems = (Array.isArray(items) ? items : []).filter((item) => !!item?.url);
   const uniqueItems = Array.from(new Map(
@@ -1560,8 +1628,9 @@ export async function prefetchMediaItems(
     if (!uniqueItems.length) return result;
     if (!server) return { ...result, failed: result.total };
 
-    await ensureMediaDirs(mode);
-    const manifest = await readManifest(mode);
+    const safeGeneration = mode === "cloud" && generation ? normalizeGeneration(generation) : undefined;
+    await ensureMediaDirs(mode, safeGeneration);
+    const manifest = await readManifest(mode, safeGeneration);
     const videoTasks: Array<() => Promise<void>> = [];
     const otherTasks: Array<() => Promise<void>> = [];
 
@@ -1569,10 +1638,11 @@ export async function prefetchMediaItems(
       const task = async () => {
         const assignmentCount = assignmentsByUrl.get(String(item.url)) || 1;
         try {
-          if (!shouldCacheItem(item)) {
+          const requiresVerifiedGeneration = mode === "cloud" && !!safeGeneration;
+          if ((requiresVerifiedGeneration && Number(item.size || 0) <= 0) || !shouldCacheItem(item)) {
             result.failed += assignmentCount;
           } else {
-            const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
+            const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode, safeGeneration);
             if (localPathValue && await fileExists(localPathValue)) result.cached += assignmentCount;
             else result.failed += assignmentCount;
           }
@@ -1603,14 +1673,19 @@ export async function prefetchMediaItems(
 }
 
 /** Count playlist placements whose local files still pass the saved metadata checks. */
-export async function verifyCachedMediaItems(items: MediaItem[]): Promise<MediaPrefetchResult> {
+export async function verifyCachedMediaItems(items: MediaItem[], generation?: string): Promise<MediaPrefetchResult> {
   const requestedItems = (Array.isArray(items) ? items : []).filter((item) => !!item?.url);
   const result: MediaPrefetchResult = { total: requestedItems.length, cached: 0, failed: 0 };
   if (!requestedItems.length) return result;
 
   try {
-    const manifest = await readManifest(activeMediaCacheMode);
+    const safeGeneration = activeMediaCacheMode === "cloud" && generation ? normalizeGeneration(generation) : undefined;
+    const manifest = await readManifest(activeMediaCacheMode, safeGeneration);
     for (const item of requestedItems) {
+      if (activeMediaCacheMode === "cloud" && safeGeneration && Number(item.size || 0) <= 0) {
+        result.failed += 1;
+        continue;
+      }
       const entry = manifest[String(item.url || "")];
       if (await isManifestEntryUsable(
         entry,

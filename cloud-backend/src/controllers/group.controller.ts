@@ -246,10 +246,15 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const mediaPaths = (Array.isArray(submittedConfig.sections) ? submittedConfig.sections : [])
-      .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : [])
+    const submittedMediaUrls = (Array.isArray(submittedConfig.sections) ? submittedConfig.sections : [])
+      .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : []);
+    const mediaPaths = submittedMediaUrls
       .map((value: string) => getMediaPathFromUrl(value))
       .filter((path: string | null): path is string => !!path);
+    if (mediaPaths.length !== submittedMediaUrls.length) {
+      res.status(400).json({ error: 'Configuration contains an invalid media URL' });
+      return;
+    }
     const uniqueMediaPaths = [...new Set(mediaPaths)];
     const mediaDocs = uniqueMediaPaths.length
       ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size hash updatedAt createdAt uploadedBy').lean()
@@ -354,6 +359,10 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
         status: 'pending',
         mediaTotal: mediaPaths.length,
         mediaCached: 0,
+        onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
+          (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
+          (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
+        ).length,
         message: 'Waiting for device to download and apply this group configuration',
         updatedAt: new Date(),
       });
@@ -393,6 +402,12 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     const updateResults = await Promise.allSettled(updatePromises);
     const appliedDeviceIds = updateResults.flatMap((result, index) => result.status === 'fulfilled' ? [devices[index].deviceId] : []);
     const failedDeviceIds = updateResults.flatMap((result, index) => result.status === 'rejected' ? [devices[index].deviceId] : []);
+
+    try {
+      await cacheDelPattern('devices:*');
+    } catch (cacheError) {
+      console.error('Device cache invalidation failed after group config save:', cacheError);
+    }
 
     // Reconcile media assignment records for devices that actually saved.
     if (appliedDeviceIds.length > 0) {

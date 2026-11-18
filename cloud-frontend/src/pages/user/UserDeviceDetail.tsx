@@ -340,6 +340,7 @@ export const UserDeviceDetail = () => {
   const tickerFontSize = Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24));
   const cloudSync = device.health?.cloudSync;
   const cloudSyncReady = cloudSync?.status === 'ready' && cloudSync.mediaCached === cloudSync.mediaTotal;
+  const onlineOnlySections = Math.max(0, Number(cloudSync?.onlineOnlySections || 0));
   const dialogAppearance = dialog?.type === 'success'
     ? { Icon: CheckCircle2, iconClass: 'text-emerald-600 bg-emerald-50', titleClass: 'text-emerald-900', buttonClass: 'bg-emerald-600 hover:bg-emerald-700' }
     : dialog?.type === 'error'
@@ -396,6 +397,11 @@ export const UserDeviceDetail = () => {
                 ? device.health.cloudSync.message || `Cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files; previous playlist is still active`
                 : `Pending · cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files`}
             </span>
+            {onlineOnlySections > 0 && (
+              <span className="ml-2 font-medium">
+                {onlineOnlySections} web/YouTube section{onlineOnlySections === 1 ? '' : 's'} require internet and are not part of offline media cache.
+              </span>
+            )}
             {device.status !== 'online' && !cloudSyncReady && (
               <span className="ml-2">TV is offline; it will sync when it reconnects.</span>
             )}
