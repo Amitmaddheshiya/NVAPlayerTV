@@ -15,7 +15,7 @@ type Props = {
   mediaRotateLayerStyle: any;
   styles: any;
   videoFade: Animated.Value;
-  videoReloadToken: number;
+  videoInstanceKey: string;
   effectiveVideoUri: string;
   videoPosterUri?: string;
   resumePositionMs: number;
@@ -67,7 +67,7 @@ export default function SlideRendererMediaStage(props: Props) {
     mediaRotateLayerStyle,
     styles,
     videoFade,
-    videoReloadToken,
+    videoInstanceKey,
     effectiveVideoUri,
     videoPosterUri,
     resumePositionMs,
@@ -133,7 +133,7 @@ export default function SlideRendererMediaStage(props: Props) {
       <View style={mediaRotateLayerStyle}>
         <Animated.View style={[styles.media, styles.videoSurface, { opacity: videoFade }]}>
           <NativeVideoPlayer
-            key={`video-player-${videoReloadToken}`}
+            key={videoInstanceKey}
             src={effectiveVideoUri}
             style={styles.media}
             rotation={0}
@@ -147,7 +147,7 @@ export default function SlideRendererMediaStage(props: Props) {
             onReady={onVideoReady}
             onProgress={onVideoProgress}
             onBuffering={onVideoBuffering}
-            onError={() => onImageLoadError(nextImageSlot, nextImageUri)}
+            onError={onRenderError}
           />
         </Animated.View>
         {showBufferIndicator && videoBuffering && !isMarkedCached ? (

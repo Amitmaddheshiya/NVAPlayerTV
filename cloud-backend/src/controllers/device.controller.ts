@@ -233,6 +233,98 @@ export const heartbeat = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
+export const reportDeviceHealth = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const deviceId = req.params.id;
+    if (!req.deviceId || req.deviceId !== deviceId) {
+      res.status(403).json({ error: 'Device token does not match requested device' });
+      return;
+    }
+    const kind = String(req.body?.kind || 'snapshot');
+    if (!['snapshot', 'playback-error'].includes(kind)) {
+      res.status(400).json({ error: 'Unsupported health report type' });
+      return;
+    }
+
+    const timestamp = new Date();
+    const section = Math.max(0, Math.min(3, Math.trunc(Number(req.body?.section || 0))));
+    const report = {
+      kind,
+      at: timestamp,
+      section,
+      fileName: String(req.body?.fileName || '').slice(0, 200),
+      mediaType: String(req.body?.mediaType || '').slice(0, 64),
+      message: String(req.body?.message || '').slice(0, 500),
+    };
+    const update: Record<string, any> = {
+      $set: { 'health.lastReportAt': timestamp },
+    };
+    if (kind === 'playback-error') {
+      update.$set['health.lastError'] = report;
+      update.$inc = { 'health.playbackErrorCount': 1 };
+      update.$push = { 'health.recentErrors': { $each: [report], $slice: -20 } };
+    } else {
+      update.$set['health.lastSnapshot'] = report;
+    }
+    const device = await Device.findOneAndUpdate(
+      { deviceId, activated: true },
+      update,
+      { new: true, projection: { health: 1 } }
+    );
+    if (!device) {
+      res.status(404).json({ error: 'Device not found or inactive' });
+      return;
+    }
+    res.json({ success: true, health: device.health });
+  } catch (error) {
+    console.error('Device health report error:', error);
+    res.status(500).json({ error: 'Failed to store device health report' });
+  }
+};
+
+export const reportCloudSyncStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const deviceId = req.params.id;
+    if (!req.deviceId || req.deviceId !== deviceId) {
+      res.status(403).json({ error: 'Device token does not match requested device' });
+      return;
+    }
+    const configVersion = Math.max(0, Math.trunc(Number(req.body?.configVersion)));
+    const status = String(req.body?.status || '');
+    if (!Number.isFinite(configVersion) || !['pending', 'ready', 'failed'].includes(status)) {
+      res.status(400).json({ error: 'Invalid cloud sync status' });
+      return;
+    }
+    const mediaTotal = Math.max(0, Math.trunc(Number(req.body?.mediaTotal || 0)));
+    const mediaCached = Math.max(0, Math.min(mediaTotal, Math.trunc(Number(req.body?.mediaCached || 0))));
+    const cloudSync = {
+      configVersion,
+      status,
+      mediaTotal,
+      mediaCached,
+      message: String(req.body?.message || '').slice(0, 500),
+      updatedAt: new Date(),
+    };
+    const device = await Device.findOneAndUpdate(
+      { deviceId, activated: true, 'cacheInfo.configVersion': configVersion },
+      { $set: { 'health.cloudSync': cloudSync } },
+      { new: true, projection: { health: 1, cacheInfo: 1 } }
+    );
+    if (!device) {
+      const current = await Device.findOne({ deviceId }).select('cacheInfo.configVersion activated');
+      res.status(current?.activated ? 409 : 404).json({
+        error: current?.activated ? 'A newer config version is active' : 'Device not found or inactive',
+        configVersion: current?.cacheInfo?.configVersion || 0,
+      });
+      return;
+    }
+    res.json({ success: true, cloudSync: device.health?.cloudSync });
+  } catch (error) {
+    console.error('Cloud sync status report error:', error);
+    res.status(500).json({ error: 'Failed to store cloud sync status' });
+  }
+};
+
 export const updateConfig = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const deviceId = req.params.id;  // Route uses :id, not :deviceId
@@ -273,7 +365,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       .filter((path: string | null): path is string => !!path);
     const uniqueMediaPaths = [...new Set(configuredMediaUrls)];
     const configuredMedia = uniqueMediaPaths.length
-      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size updatedAt createdAt uploadedBy').lean()
+      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size hash updatedAt createdAt uploadedBy').lean()
       : [];
     if (configuredMedia.length !== uniqueMediaPaths.length) {
       res.status(400).json({ error: 'Configuration contains a media file that no longer exists' });
@@ -314,6 +406,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
                 originalName: media.originalName,
                 type: media.mimeType,
                 size: Number(media.size || 0),
+                hash: media.hash,
                 mtimeMs: Number(media.updatedAt?.getTime?.() || media.createdAt?.getTime?.() || 0),
               } : { url };
             });
@@ -365,6 +458,15 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     };
     device.cacheInfo.configVersion += 1;
     device.cacheInfo.lastSyncTime = new Date();
+    const expectedMediaCount = uniqueMediaPaths.length;
+    device.set('health.cloudSync', {
+      configVersion: device.cacheInfo.configVersion,
+      status: 'pending',
+      mediaTotal: expectedMediaCount,
+      mediaCached: 0,
+      message: 'Waiting for device to download and apply this configuration',
+      updatedAt: new Date(),
+    });
 
     // Update cached media tracking
     const cachedMediaArray: any[] = [];
@@ -406,7 +508,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     // Push the already-persisted config immediately. Media bookkeeping and
     // audit logging are secondary and should not make the TV wait to apply it.
     const io = getSocketInstance();
-    const room = io.sockets.adapter.rooms.get(deviceId);
+    const room = io.sockets.adapter.rooms.get(`device:${deviceId}`);
     const roomSize = room ? room.size : 0;
     console.log(`=== CONFIG UPDATE: Room ${deviceId} has ${roomSize} clients ===`);
     io.to(`device:${deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo.configVersion });

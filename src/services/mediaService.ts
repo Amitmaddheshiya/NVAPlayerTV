@@ -176,6 +176,7 @@ const listCacheStates: Record<MediaCacheMode, ListCacheState> = {
   cloud: { list: [], at: 0, inFlight: null, etag: "", backoffFailCount: 0, backoffUntilMs: 0, lastBackoffLogAtMs: 0 },
 };
 const inFlightDownloads = new Map<string, Promise<string | null>>();
+const activePlaybackUrls = new Map<string, string>();
 const manifestBaselines = new WeakMap<ManifestMap, ManifestMap>();
 const manifestFilePaths = new WeakMap<ManifestMap, string>();
 let manifestWriteQueue: Promise<void> = Promise.resolve();
@@ -205,6 +206,16 @@ export async function setMediaCacheMode(mode: MediaCacheMode): Promise<void> {
   await cloudService.initialize();
   await ensureMediaDirs();
   await migrateLegacyCloudCache();
+}
+
+/** Register the Cloud media item currently being rendered so low-space cache
+ * maintenance never unlinks a file underneath an active native player. */
+export function setActiveCloudPlaybackMedia(owner: string, mediaUrl?: string): void {
+  const safeOwner = String(owner || "").trim();
+  if (!safeOwner) return;
+  const safeUrl = String(mediaUrl || "").trim();
+  if (safeUrl) activePlaybackUrls.set(safeOwner, safeUrl);
+  else activePlaybackUrls.delete(safeOwner);
 }
 
 export function getActiveMediaCachePaths() {
@@ -581,11 +592,14 @@ function isExpectedValue(value: number): boolean {
   return Number.isFinite(value) && value > 0;
 }
 
-async function computeFileHash(path: string): Promise<string> {
+async function computeFileHash(path: string, expectedHash = ""): Promise<string> {
   try {
     const hashFn = (RNFS as any)?.hash;
     if (typeof hashFn === "function") {
-      const value = await hashFn(path, "sha1");
+      // Older local manifests may carry SHA-1 checksums. Cloud uploads now
+      // publish SHA-256, so select the algorithm from the checksum length.
+      const algorithm = /^[a-f0-9]{40}$/i.test(expectedHash) ? "sha1" : "sha256";
+      const value = await hashFn(path, algorithm);
       return String(value || "");
     }
   } catch {
@@ -608,7 +622,7 @@ async function isManifestEntryUsable(
   const hashExpected = String(expectedHash || "").trim();
   if (!sizeExpected && !mtimeExpected) {
     if (hashExpected) {
-      const actualHash = await computeFileHash(entry.localPath);
+      const actualHash = await computeFileHash(entry.localPath, hashExpected);
       if (!actualHash || actualHash !== hashExpected) return false;
       entry.hash = hashExpected;
     }
@@ -623,7 +637,7 @@ async function isManifestEntryUsable(
     const mtimeOk = !mtimeExpected || Number(entry.mtimeMs || 0) === expectedMtime;
     let hashOk = true;
     if (hashExpected) {
-      const actualHash = await computeFileHash(entry.localPath);
+      const actualHash = await computeFileHash(entry.localPath, hashExpected);
       hashOk = !!actualHash && actualHash === hashExpected;
     }
     if (sizeOk && mtimeOk && hashOk) {
@@ -677,7 +691,7 @@ async function downloadIfNeeded(
       const size = Number(stat?.size || 0);
       if (!expectedSize || size === expectedSize) {
         if (expectedHash) {
-          const actualHash = await computeFileHash(targetPath);
+          const actualHash = await computeFileHash(targetPath, expectedHash);
           if (!actualHash || actualHash !== expectedHash) {
             throw new Error("download-hash-mismatch");
           }
@@ -753,7 +767,7 @@ async function downloadIfNeeded(
       const finalStat = await RNFS.stat(tempPath);
       const finalSize = Number(finalStat?.size || 0);
       if (expectedHash) {
-        const actualHash = await computeFileHash(tempPath);
+        const actualHash = await computeFileHash(tempPath, expectedHash);
         if (!actualHash || actualHash !== expectedHash) {
           try {
             await RNFS.unlink(tempPath);
@@ -1470,7 +1484,10 @@ export async function pruneCacheIfLow(minFreeBytes = DEFAULT_MIN_FREE_BYTES) {
 
     await ensureMediaDirs();
     const manifest = await readManifest();
-    const entries = Object.values(manifest).filter((entry) => entry?.localPath);
+    const activeUrls = new Set(activePlaybackUrls.values());
+    const entries = Object.values(manifest).filter(
+      (entry) => entry?.localPath && !activeUrls.has(String(entry.url || ""))
+    );
     if (!entries.length) return false;
 
     const sorted = entries.sort(
@@ -1499,25 +1516,43 @@ export async function pruneCacheIfLow(minFreeBytes = DEFAULT_MIN_FREE_BYTES) {
   }
 }
 
-export async function prefetchMediaItems(items: MediaItem[]) {
+export type MediaPrefetchResult = { total: number; cached: number; failed: number };
+
+export async function prefetchMediaItems(
+  items: MediaItem[],
+  onProgress?: (result: MediaPrefetchResult) => void | Promise<void>
+): Promise<MediaPrefetchResult> {
+  const uniqueItems = Array.from(new Map(
+    (Array.isArray(items) ? items : [])
+      .filter((item) => !!item?.url)
+      .map((item) => [String(item.url), item])
+  ).values());
+  const result: MediaPrefetchResult = { total: uniqueItems.length, cached: 0, failed: 0 };
   try {
     const mode = activeMediaCacheMode;
     const server = mode === "cloud" ? cloudService.getApiUrl() : getServer();
-    if (!server) return;
-    if (!Array.isArray(items) || !items.length) return;
+    if (!uniqueItems.length) return result;
+    if (!server) return { ...result, failed: result.total };
 
     await ensureMediaDirs(mode);
     const manifest = await readManifest(mode);
     const videoTasks: Array<() => Promise<void>> = [];
     const otherTasks: Array<() => Promise<void>> = [];
 
-    for (const item of items) {
-      if (!shouldCacheItem(item)) continue;
+    for (const item of uniqueItems) {
       const task = async () => {
-        const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
-        if (localPathValue) {
-          // manifest is updated inside downloadIfNeededDeduped/downloadIfNeeded
+        try {
+          if (!shouldCacheItem(item)) {
+            result.failed += 1;
+          } else {
+            const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
+            if (localPathValue && await fileExists(localPathValue)) result.cached += 1;
+            else result.failed += 1;
+          }
+        } catch {
+          result.failed += 1;
         }
+        await onProgress?.({ ...result });
       };
       if (isVideoItem(item)) {
         videoTasks.push(task);
@@ -1534,8 +1569,9 @@ export async function prefetchMediaItems(items: MediaItem[]) {
     }
 
     await writeManifest(manifest);
+    return result;
   } catch {
-    // ignore prefetch errors
+    return { ...result, failed: Math.max(result.failed, result.total - result.cached) };
   }
 }
 

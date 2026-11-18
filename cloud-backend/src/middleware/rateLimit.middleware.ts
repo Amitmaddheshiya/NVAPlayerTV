@@ -21,7 +21,10 @@ export const rateLimit = (windowMs: number = env.RATE_LIMIT_WINDOW_MS, maxReques
       return next();
     }
     const activationMatch = pathname.match(/^\/devices\/([^/]+)\/activation$/);
-    const identity = activationMatch ? `device:${decodeURIComponent(activationMatch[1])}` : (req.ip || 'unknown');
+    const healthMatch = pathname.match(/^\/devices\/([^/]+)\/health$/);
+    const identity = activationMatch || healthMatch
+      ? `device:${decodeURIComponent((activationMatch || healthMatch)![1])}`
+      : (req.ip || 'unknown');
     const key = `${identity}:${pathname}`;
     const now = Date.now();
 

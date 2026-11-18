@@ -5,9 +5,40 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { setPlaybackOverride } from "./mediaService";
 import cloudService from "./cloudService";
 import { getAppMode } from "./setupService";
+import { addCloudDeviceAccess } from "./cloudMediaUrl";
 
 const { DeviceIdModule } = NativeModules;
 const CONFIG_FETCH_TIMEOUT_MS = 6000;
+
+export type CloudConfigSyncReport = {
+  configVersion: number;
+  status: "pending" | "ready" | "failed";
+  mediaTotal: number;
+  mediaCached: number;
+  message?: string;
+};
+
+export async function reportCloudConfigSync(report: CloudConfigSyncReport): Promise<boolean> {
+  try {
+    await cloudService.initialize();
+    const apiUrl = cloudService.getApiUrl();
+    const deviceId = cloudService.getDeviceId();
+    const token = await cloudService.ensureDeviceAuthToken();
+    if (!apiUrl || !deviceId || !token) return false;
+    const response = await fetch(`${apiUrl}/api/devices/${deviceId}/sync-status`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(report),
+    });
+    return response.ok;
+  } catch (error) {
+    console.warn("Cloud config sync status report failed", error);
+    return false;
+  }
+}
 
 function fetchWithTimeout(url: string, timeoutMs = CONFIG_FETCH_TIMEOUT_MS): Promise<Response> {
   return Promise.race([
@@ -33,19 +64,15 @@ export async function loadConfig(setConfig: Function) {
     if (appMode === "cloudMode") {
       console.log('Cloud config is active, skipping embedded CMS config load');
       // Load cloud config from AsyncStorage instead
-      const cloudConfigStr = await AsyncStorage.getItem('@cloud_device_config');
+      const cloudConfigStr = await AsyncStorage.getItem('@cloud_applied_config')
+        || await AsyncStorage.getItem('@cloud_device_config');
       if (cloudConfigStr) {
         const storedConfig = JSON.parse(cloudConfigStr);
         if (storedConfig && typeof storedConfig === "object") {
           const deviceId = cloudService.getDeviceId();
-          const withDeviceAccess = (value: string) => {
-            const url = String(value || '');
-            if (!deviceId || !url.includes('/api/media/file/')) return url;
-            const [base, query = ''] = url.split('?');
-            const params = new URLSearchParams(query);
-            params.set('deviceId', deviceId);
-            return `${base}?${params.toString()}`;
-          };
+          const deviceToken = await AsyncStorage.getItem('@signage_device_token') || '';
+          const withDeviceAccess = (value: string, includeToken = false) =>
+            addCloudDeviceAccess(value, deviceId, includeToken ? deviceToken : '');
           const cloudConfig = {
             ...storedConfig,
             clock: storedConfig.widgets?.clock ?? storedConfig.clock,
@@ -56,23 +83,29 @@ export async function loadConfig(setConfig: Function) {
                   mediaUrls: Array.isArray(section?.mediaUrls)
                     ? section.mediaUrls.map(withDeviceAccess)
                     : section?.mediaUrls,
+                  mediaItems: Array.isArray(section?.mediaUrls)
+                    ? section.mediaUrls.map((url: string) => {
+                        const metadata = Array.isArray(section?.mediaItems)
+                          ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url || '').split('?')[0])
+                          : null;
+                        return {
+                          ...metadata,
+                          url,
+                          streamUrl: withDeviceAccess(url, true),
+                        };
+                      })
+                    : section?.mediaItems,
                 }))
               : storedConfig.sections,
           };
           setConfig(cloudConfig);
 
           // Set playback override from cloud config sections (same logic as App.tsx)
-          console.log('=== CONFIG SERVICE: Checking cloud config for playback override ===');
-          console.log('Cloud config sections:', cloudConfig.sections);
-          console.log('Sections is array:', Array.isArray(cloudConfig.sections));
           if (cloudConfig.sections && Array.isArray(cloudConfig.sections)) {
-            console.log('=== CONFIG SERVICE: Setting playback override from saved cloud config ===');
-            console.log('Sections count:', cloudConfig.sections.length);
+            console.log('Restoring Cloud playback override; section count:', cloudConfig.sections.length);
             const mediaItems: any[] = [];
             cloudConfig.sections.forEach((section: any, index: number) => {
-              console.log(`Section ${index + 1}:`, JSON.stringify(section));
               if (section.contentType === 'multimedia' && section.mediaUrls) {
-                console.log(`Adding ${section.mediaUrls.length} media URLs from section ${index + 1}`);
                 section.mediaUrls.forEach((url: string, urlIndex: number) => {
                   const metadata = Array.isArray(section.mediaItems)
                     ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
@@ -80,7 +113,7 @@ export async function loadConfig(setConfig: Function) {
                   mediaItems.push({
                     ...metadata,
                     url,
-                    remoteUrl: url,
+                    remoteUrl: metadata?.streamUrl || withDeviceAccess(url, true),
                     name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
                     originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
                     type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
@@ -90,16 +123,15 @@ export async function loadConfig(setConfig: Function) {
                 });
               }
             });
-            console.log('Total media items found:', mediaItems.length);
             if (mediaItems.length > 0) {
-              console.log('Setting playback override from saved config with media items:', mediaItems.length);
+              console.log('Setting Cloud playback override; media count:', mediaItems.length);
               setPlaybackOverride('cloud-config', mediaItems);
             } else {
-              console.log('No media URLs found in saved cloud config sections');
+              console.log('No media URLs found in saved Cloud config sections');
               setPlaybackOverride('cloud-config', []);
             }
           } else {
-            console.log('Cloud config has no sections or sections is not an array');
+            console.log('Cloud config has no sections');
           }
 
           return cloudConfig;

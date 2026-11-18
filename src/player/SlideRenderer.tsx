@@ -11,6 +11,7 @@ import {
   getCacheProgress,
   subscribeCacheProgress,
   setDownloadConcurrencyOverride,
+  setActiveCloudPlaybackMedia,
   isMediaCacheEligible,
 } from "../services/mediaService";
 import { getServer } from "../services/serverService";
@@ -38,8 +39,22 @@ import {
 } from "./slideRendererUtils";
 
 const LARGE_VIDEO_STREAM_THRESHOLD_BYTES = 300 * 1024 * 1024;
+let cloudPlaybackPinSequence = 0;
 const HOLD_LARGE_VIDEO_UNTIL_CACHED = false;
 const VIDEO_PROGRESS_SAVE_INTERVAL_MS = 1000;
+
+function getUrlQueryValue(value: string, key: string): string {
+  const queryIndex = String(value || "").indexOf("?");
+  if (queryIndex < 0) return "";
+  const query = String(value).slice(queryIndex + 1).split("#")[0];
+  const found = query.split("&").find((part) => part.split("=")[0] === key);
+  if (!found) return "";
+  try {
+    return decodeURIComponent(found.slice(found.indexOf("=") + 1).replace(/\+/g, "%20"));
+  } catch {
+    return "";
+  }
+}
 
 function isCacheEligible(item: any) {
   return !!item && isMediaCacheEligible(item);
@@ -266,7 +281,8 @@ export default function SlideRenderer({
     const activeItem = filesRef.current[indexRef.current];
     const itemIdentity = getMediaStableIdentity(item);
     if (!activeItem || getMediaStableIdentity(activeItem) !== itemIdentity) return;
-    const token = `${getMediaStableIdentity(item)}|${indexRef.current}`;
+    const queuedIndex = indexRef.current;
+    const token = `${itemIdentity}|${queuedIndex}`;
     if (!token || lastVideoAdvanceIdentityRef.current === token) return;
     lastVideoAdvanceIdentityRef.current = token;
     if (pendingAdvanceRef.current) {
@@ -275,6 +291,11 @@ export default function SlideRenderer({
     pendingAdvanceRef.current = setTimeout(() => {
       pendingAdvanceRef.current = null;
       if (!isMountedRef.current) return;
+      const stillActive = filesRef.current[indexRef.current];
+      if (
+        indexRef.current !== queuedIndex ||
+        getMediaStableIdentity(stillActive) !== itemIdentity
+      ) return;
       goNext();
     }, 80);
   };
@@ -319,14 +340,17 @@ export default function SlideRenderer({
   const isMultiPaneLayout = config?.layout === "split" || config?.layout === "grid";
   const mediaRotateLayerStyle = styles.fillLayer;
 
-  // Debug logging
-  console.log(`=== SlideRenderer DEBUG ===`);
-  console.log(`sectionIndex: ${sectionIndex}`);
-  console.log(`layout: ${config?.layout}`);
-  console.log(`isMultiPaneLayout: ${isMultiPaneLayout}`);
-  console.log(`config.sections length: ${config?.sections?.length || 0}`);
-  console.log(`sectionConfig:`, sectionConfig);
-  console.log(`sectionMediaUrls:`, sectionMediaUrls);
+  if (cloudMode) {
+    console.log(`[Cloud SlideRenderer] section=${sectionIndex + 1} layout=${config?.layout || "fullscreen"} media=${sectionMediaUrls.length}`);
+  } else {
+    console.log(`=== SlideRenderer DEBUG ===`);
+    console.log(`sectionIndex: ${sectionIndex}`);
+    console.log(`layout: ${config?.layout}`);
+    console.log(`isMultiPaneLayout: ${isMultiPaneLayout}`);
+    console.log(`config.sections length: ${config?.sections?.length || 0}`);
+    console.log(`sectionConfig:`, sectionConfig);
+    console.log(`sectionMediaUrls:`, sectionMediaUrls);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -455,9 +479,20 @@ export default function SlideRenderer({
 
   const imageSlotUrlsRef = useRef({ a: "", b: "" });
   const failedCloudImageUrisRef = useRef<Set<string>>(new Set());
+  const cloudPlaybackPinOwnerRef = useRef("");
+  if (!cloudPlaybackPinOwnerRef.current) {
+    cloudPlaybackPinOwnerRef.current = `cloud-section-${sectionIndex}-${++cloudPlaybackPinSequence}`;
+  }
   useEffect(() => {
     imageSlotUrlsRef.current = imageSlotUrls;
   }, [imageSlotUrls]);
+
+  useEffect(() => {
+    if (!cloudMode) return;
+    const activeUrl = files[index]?.url;
+    setActiveCloudPlaybackMedia(cloudPlaybackPinOwnerRef.current, activeUrl);
+    return () => setActiveCloudPlaybackMedia(cloudPlaybackPinOwnerRef.current, "");
+  }, [cloudMode, files, index]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -536,8 +571,28 @@ export default function SlideRenderer({
     console.log("Media render error", {
       sectionIndex,
       name: activeFile?.name || activeFile?.originalName || "",
-      uri,
+      uri: cloudMode ? uri.replace(/([?&]deviceToken=)[^&]*/i, "$1[redacted]") : uri,
     });
+
+    if (
+      isActiveVideo &&
+      cloudMode &&
+      isLocalPlayableUri(uri) &&
+      /^https?:\/\//i.test(String(activeFile?.streamUrl || ""))
+    ) {
+      // A cache file passed integrity checks but its decoder can still reject
+      // its codec/container. Retry the original authenticated stream at once;
+      // activeFile.url is only a cache identity URL and has no device JWT.
+      prepareVideoReloadFromCurrentPosition();
+      const streamUri = normalizeMediaUri(String(activeFile.streamUrl));
+      pinnedMediaUriRef.current = {
+        identity: getMediaIdentity(activeFile),
+        uri: streamUri,
+      };
+      setUri(streamUri);
+      setVideoReloadToken((prev) => prev + 1);
+      return;
+    }
 
     if (isActiveVideo && errorKey) {
       const currentCount = videoTransientErrorRef.current[errorKey] || 0;
@@ -656,8 +711,12 @@ export default function SlideRenderer({
       try {
         let list: any[] = [];
 
-        // For split/grid layouts, ONLY use section.mediaUrls - never fall back to legacy getMediaFiles
-        if (isMultiPaneLayout) {
+        // Cloud configuration is the authoritative per-section playlist for
+        // every layout, including fullscreen. Reading fullscreen through the
+        // global legacy override allowed a later cache/runtime refresh to
+        // replace a two-item Cloud playlist with a partial list. LAN retains
+        // its existing fullscreen media service behavior.
+        if (cloudMode || isMultiPaneLayout) {
           if (sectionMediaUrls.length > 0) {
             const sectionItems = config?.sections?.[sectionIndex]?.mediaItems;
             list = sectionMediaUrls.map((url: string) => {
@@ -670,7 +729,10 @@ export default function SlideRenderer({
               return {
                 ...metadata,
                 url,
-                remoteUrl: url,
+                // NativeVideoPlayer and React Native Image cannot rely on the
+                // API client's Authorization header. Keep the short-lived,
+                // device-scoped playback URL produced by App.tsx.
+                remoteUrl: metadata?.streamUrl || url,
                 name: metadata?.name || url.split('/').pop() || url,
                 originalName: metadata?.originalName || url.split('/').pop() || url,
                 // Some TV browsers upload AVI/MKV/3GP with an octet-stream MIME.
@@ -717,6 +779,31 @@ export default function SlideRenderer({
           emptyFetchCountRef.current = 0;
           setFiles((prev) => (areMediaListsEqual(prev, list) ? prev : list));
           setIndex(findMatchingIndex(list, filesRef.current[indexRef.current], indexRef.current));
+          return;
+        }
+
+        if (cloudMode) {
+          // An empty Cloud override is an explicit saved configuration, such
+          // as the Clear action. Fullscreen previously retained its old list
+          // while the cache was removed, leaving a stale native video surface
+          // black. Clear state immediately so the empty section renders.
+          emptyFetchCountRef.current = 0;
+          pinnedMediaUriRef.current = null;
+          pinnedContentIdentityRef.current = "";
+          lastGoodUriByIdentityRef.current = {};
+          lastGoodAnyUriRef.current = "";
+          if (pendingAdvanceRef.current) {
+            clearTimeout(pendingAdvanceRef.current);
+            pendingAdvanceRef.current = null;
+          }
+          void clearSectionPlaybackState();
+          void clearAllSavedVideoPositions(filesRef.current);
+          setFiles([]);
+          setIndex(0);
+          setUri("");
+          setResumePositionMs(0);
+          setVideoBuffering(false);
+          setShowBufferIndicator(false);
           return;
         }
 
@@ -778,6 +865,13 @@ export default function SlideRenderer({
       // NativeVideoPlayer cannot send headers; Cloud URLs carry a short-lived
       // device-scoped query credential so remote video can stream securely.
       nextUri = localPlayableUri;
+    } else if (cloudMode && isVideo && hasLocalPlayableUri) {
+      // resolveCachedMediaItems replaces remoteUrl with a verified file:// URL.
+      // Do not fall through to file.url here: it is the config identity URL and
+      // intentionally has no device JWT, so native playback receives 401 after
+      // a video has been cached. The verified local file is the Cloud source
+      // for all later playlist cycles and for offline playback.
+      nextUri = localPlayableUri;
     } else if (!preferStreaming && !isVideo && hasLocalPlayableUri && isListFullyCached) {
       nextUri = localPlayableUri;
     } else if (preferStreaming && server && file?.url) {
@@ -818,6 +912,30 @@ export default function SlideRenderer({
     const hasLocalPlayableForNext =
       isLocalPlayableUri(normalizeMediaUri(String(file?.remoteUrl || ""))) ||
       isLocalPlayableUri(nextUri);
+    const currentStreamToken = cloudMode ? getUrlQueryValue(uri, "deviceToken") : "";
+    const refreshedStreamUrl = cloudMode
+      ? normalizeMediaUri(String(file?.streamUrl || ""))
+      : "";
+    const refreshedStreamToken = getUrlQueryValue(refreshedStreamUrl, "deviceToken");
+    if (
+      cloudMode &&
+      isVideo &&
+      currentStreamToken &&
+      refreshedStreamToken &&
+      currentStreamToken !== refreshedStreamToken &&
+      /^https?:\/\//i.test(uri) &&
+      /^https?:\/\//i.test(refreshedStreamUrl)
+    ) {
+      // Refresh an hour-lived device stream URL at its natural token renewal
+      // point. Resume from the saved position and use a verified local cache
+      // when available, so an overnight looping video does not expire black.
+      const refreshedUri = hasLocalPlayableUri ? localPlayableUri : refreshedStreamUrl;
+      prepareVideoReloadFromCurrentPosition();
+      pinnedMediaUriRef.current = { identity, uri: refreshedUri };
+      setUri(refreshedUri);
+      setVideoReloadToken((previous) => previous + 1);
+      return;
+    }
     if (
       isVideo &&
       pinned &&
@@ -1196,6 +1314,10 @@ export default function SlideRenderer({
     const active = files[index];
     const pathKey = String(active?.url || "");
     if (!pathKey) return;
+    // Cloud video continues streaming until its natural boundary. The next
+    // playlist item will use its cached file, which prevents a decoder reset
+    // and a visible black frame while a download completes.
+    if (cloudMode && isVideoFile(active)) return;
     if (cacheProgress < 100) return;
     if (cacheRefreshDoneRef.current.has(pathKey)) return;
 
@@ -1254,7 +1376,7 @@ export default function SlideRenderer({
     return () => {
       cancelled = true;
     };
-  }, [cacheProgress, files, index, sectionIndex, sourceType]);
+  }, [cacheProgress, files, index, sectionIndex, sourceType, cloudMode]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -2051,6 +2173,18 @@ export default function SlideRenderer({
     if (failedCloudImageUrisRef.current.has(failedUri)) return;
     failedCloudImageUrisRef.current.add(failedUri);
     setImageSlotLoaded((prev) => ({ ...prev, [slot]: false }));
+    const failedItem = filesRef.current.find((item) =>
+      normalizeMediaUri(String(item?.remoteUrl || "")) === failedUri ||
+      normalizeMediaUri(String(item?.streamUrl || "")) === failedUri
+    );
+    if (typeof onPlaybackError === "function") {
+      onPlaybackError({
+        section: sectionIndex + 1,
+        name: failedItem?.originalName || failedItem?.name || "Image media",
+        mediaType: failedItem?.type || "image",
+        message: "Image failed to load",
+      });
+    }
     // A failed preloaded next image must not interrupt the currently visible
     // item. It is skipped at the normal slide boundary. If the active image
     // itself failed, move on so the player never stays on an empty frame.
@@ -2121,7 +2255,7 @@ export default function SlideRenderer({
       return (
         <View style={styles.emptyWrap}>
           <View style={styles.emptyBadgeCentered}>
-            <Text style={styles.emptyBadgeText}>SECTION {sectionIndex + 1}</Text>
+            <Text style={styles.emptyBadgeText}>EMPTY SECTION {sectionIndex + 1}</Text>
           </View>
         </View>
       );
@@ -2263,6 +2397,13 @@ export default function SlideRenderer({
           ? (/^https?:\/\//i.test(file.url) ? normalizeMediaUri(file.url) : buildRemoteMediaUri(server, file.url, file?.mtimeMs || mediaVersion))
           : "")
       : "";
+  // A number of Android TV decoders do not reliably prepare a second remote
+  // source after the first one ends when the same native view is reused.
+  // Cloud playlists therefore receive a fresh native player for every item.
+  // The LAN key stays exactly as before.
+  const videoInstanceKey = cloudMode
+    ? `cloud-video-${index}-${currentFileIdentity}-${videoReloadToken}`
+    : `video-player-${videoReloadToken}`;
 
   return (
     <View
@@ -2352,7 +2493,7 @@ export default function SlideRenderer({
           mediaRotateLayerStyle={mediaRotateLayerStyle}
           styles={styles}
           videoFade={videoFade}
-          videoReloadToken={videoReloadToken}
+          videoInstanceKey={videoInstanceKey}
           effectiveVideoUri={effectiveVideoUri}
           videoPosterUri={!videoFrameReady ? videoPosterUri : ""}
           resumePositionMs={resumePositionMs}
@@ -2402,6 +2543,14 @@ export default function SlideRenderer({
                   return;
                 }
                 if (files.length > 1) {
+                  if (cloudMode) {
+                    // The cloud player's progress watchdog may already have
+                    // queued an advance near the end. Advancing directly from
+                    // the native end event avoids leaving this item active if
+                    // that timer is cancelled during a cache/list refresh.
+                    if (indexRef.current === index) goNext();
+                    return;
+                  }
                   const nextIndex = (indexRef.current + 1) % filesRef.current.length;
                   const nextFile = filesRef.current[nextIndex];
                   if (nextFile && isVideoFile(nextFile)) {

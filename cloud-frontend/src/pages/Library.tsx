@@ -16,6 +16,7 @@ export const Library = () => {
   const [selectedDevice, setSelectedDevice] = useState('');
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -47,8 +48,9 @@ export const Library = () => {
     if (!selectedFile) return;
 
     setUploading(true);
+    setUploadProgress(0);
     try {
-      await mediaAPI.uploadMedia(selectedFile, section, selectedDevice || undefined);
+      await mediaAPI.uploadMedia(selectedFile, section, selectedDevice || undefined, undefined, setUploadProgress);
       setSelectedFile(null);
       loadMedia();
     } catch (error) {
@@ -128,6 +130,12 @@ export const Library = () => {
               <Upload className="w-4 h-4 mr-2" />
               {uploading ? 'Uploading...' : 'Upload'}
             </Button>
+            {uploading ? (
+              <div className="space-y-1" role="status" aria-live="polite">
+                <div className="text-right text-xs text-gray-600">{uploadProgress}%</div>
+                <progress className="h-2 w-full accent-blue-600" value={uploadProgress} max={100} />
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 

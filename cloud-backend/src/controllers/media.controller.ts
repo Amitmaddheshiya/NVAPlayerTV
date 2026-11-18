@@ -8,7 +8,20 @@ import AuditLog from '../models/AuditLog';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
 import Device from '../models/Device';
 import { getSocketInstance } from '../socket/socket';
-import { getMediaPathFromUrl } from '../utils/mediaUrl';
+import { getMediaPathFromUrl, normalizeUserFolder } from '../utils/mediaUrl';
+import { createHash } from 'crypto';
+import { createReadStream } from 'fs';
+import path from 'path';
+
+async function getFileSha256(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const input = createReadStream(filePath);
+    input.on('error', reject);
+    input.on('data', (chunk) => hash.update(chunk));
+    input.on('end', () => resolve(hash.digest('hex')));
+  });
+}
 
 export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -36,6 +49,11 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
 
     if (folder && typeof folder !== 'string') {
       res.status(400).json({ error: 'Folder must be a string' });
+      return;
+    }
+    const normalizedFolder = normalizeUserFolder(folder);
+    if (!normalizedFolder) {
+      res.status(400).json({ error: 'Folder path is invalid' });
       return;
     }
 
@@ -71,23 +89,29 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
       }
     }
 
-    const filename = `${Date.now()}-${req.file.originalname}`;
+    const safeOriginalName = path.basename(String(req.file.originalname || 'media'))
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+      .replace(/[. ]+$/g, '')
+      .slice(0, 180) || 'media';
+    const filename = `${Date.now()}-${safeOriginalName}`;
     // NEW STRUCTURE: users/{userId}/{folder}/filename or users/{userId}/general/filename
     const userId = req.userId || 'admin';
-    const folderName = folder || 'general';
-    const path = `users/${userId}/${folderName}/${filename}`;
+    const folderName = normalizedFolder;
+    const mediaPath = `users/${userId}/${folderName}/${filename}`;
 
-    const uploadedPath = await storage.upload(req.file, path);
-    const url = storage.getUrl(path);
+    const sha256 = await getFileSha256(req.file.path);
+    await storage.upload(req.file, mediaPath);
+    const url = storage.getUrl(mediaPath);
 
     const media = new Media({
       filename,
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
       size: req.file.size,
+      hash: sha256,
       url,
       storageType: process.env.STORAGE_TYPE === 's3' ? 's3' : 'local',
-      path,
+      path: mediaPath,
       uploadedBy: req.userId,
       assignedDevices: deviceId ? [deviceId] : [],
       section: parseInt(section) || 1,
@@ -256,6 +280,7 @@ export const getMediaList = async (req: AuthRequest, res: Response): Promise<voi
       originalName: media.originalName,
       type: media.mimeType,
       size: media.size,
+      hash: media.hash,
       section: media.section || 1,
       mtimeMs: (media as any).updatedAt?.getTime() || media.createdAt.getTime(),
     }));
@@ -412,12 +437,16 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
 
     const storage = getStorageService();
     const oldFolder = media.folder || 'general';
-    const newFolder = folder || 'general';
+    const newFolder = normalizeUserFolder(folder === undefined ? oldFolder : folder);
+    if (!newFolder) {
+      res.status(400).json({ error: 'Folder path is invalid' });
+      return;
+    }
 
     // Update folder if provided and different from current
     if (folder !== undefined && folder !== media.folder) {
       const userId = media.uploadedBy?.toString() || 'admin';
-      const oldPath = `users/${userId}/${oldFolder}/${media.filename}`;
+      const oldPath = media.path || `users/${userId}/${oldFolder}/${media.filename}`;
       const newPath = `users/${userId}/${newFolder}/${media.filename}`;
 
       // Move file in storage

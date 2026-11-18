@@ -28,7 +28,8 @@ import SetupScreen from "../setup/SetupScreen";
 import ModeSelectionScreen from "../setup/ModeSelectionScreen";
 import DeviceActivationScreen, { isDeviceActivated, setDeviceActivated } from "../setup/DeviceActivationScreen";
 import { UpdatePopup } from "../components/UpdatePopup";
-import { loadConfig } from "../services/configService";
+import { loadConfig, reportCloudConfigSync } from "../services/configService";
+import { addCloudDeviceAccess } from "../services/cloudMediaUrl";
 import { writeConfig } from "../utils/fileSystem";
 import { resolveScheduledConfig } from "../services/scheduleService";
 import {
@@ -55,6 +56,7 @@ import {
   setMediaCacheMode,
   getActiveMediaCachePaths,
   clearMediaCache,
+  prefetchMediaItems,
   syncMedia,
 } from "../services/mediaService";
 import { DEFAULT_TEST_CLOUD_API_URL } from "../services/cloudRuntimeConfig";
@@ -221,17 +223,6 @@ async function unlinkPathIfExists(targetPath: string) {
   }
 }
 
-function addCloudDeviceAccess(value: string, deviceId: string, deviceToken = ''): string {
-  const url = String(value || '');
-  if (!deviceId || !url.includes('/api/media/file/')) return url;
-  const [base, query = ''] = url.split('?');
-  const params = new URLSearchParams(query);
-  params.set('deviceId', deviceId);
-  if (deviceToken) params.set('deviceToken', deviceToken);
-  else params.delete('deviceToken');
-  return `${base}?${params.toString()}`;
-}
-
 function decorateCloudConfigForPlayback(source: any, deviceId: string, deviceToken = '') {
   return {
     ...source,
@@ -267,6 +258,25 @@ const PRESERVED_ASYNC_KEYS = new Set([
   "@app_setup_completed",
   "tvCmsActiveGroupId",
 ]);
+const CLOUD_APPLIED_CONFIG_KEY = '@cloud_applied_config';
+const CLOUD_APPLIED_VERSION_KEY = '@cloud_applied_config_version';
+const CLOUD_PENDING_CONFIG_KEY = '@cloud_pending_config';
+const CLOUD_PENDING_VERSION_KEY = '@cloud_pending_config_version';
+const cloudPlaybackErrorReportAt = new Map<string, number>();
+
+function reportCloudPlaybackError(payload: any): void {
+  const section = Math.max(0, Math.min(3, Math.trunc(Number(payload?.section || 0))));
+  const identity = `${section}|${String(payload?.name || '')}|${String(payload?.mediaType || '')}`;
+  const now = Date.now();
+  if (now - Number(cloudPlaybackErrorReportAt.get(identity) || 0) <= 30_000) return;
+  cloudPlaybackErrorReportAt.set(identity, now);
+  void cloudService.reportPlaybackError({
+    section,
+    name: payload?.name,
+    mediaType: payload?.mediaType,
+    message: String(payload?.message || 'Cloud media could not be played'),
+  });
+}
 
 export default function App() {
   const [bootReady, setBootReady] = useState(false);
@@ -298,6 +308,8 @@ export default function App() {
   const pulseValue = useRef(new Animated.Value(0)).current;
   const deviceIdRef = useRef("unknown");
   const lastAppliedCloudConfigRef = useRef<{ version: number; signature: string } | null>(null);
+  const cloudConfigApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const cloudConfigQueuedVersionRef = useRef(0);
   const [deviceActivated, setDeviceActivatedState] = useState<boolean | null>(null);
   const [licenseReady, setLicenseReady] = useState(false);
   const [licensed, setLicensed] = useState(false);
@@ -442,7 +454,11 @@ export default function App() {
     // Set up event listeners for socket events
     const setupEventListeners = () => {
       console.log('=== APP: Setting up config:update event listener ===');
-      eventEmitter.on('config:update', async (incomingConfig: any) => {
+      eventEmitter.on('config:update', (incomingConfig: any) => {
+        const queuedVersion = Number(incomingConfig?.configVersion || 0);
+        if (queuedVersion > 0 && queuedVersion <= cloudConfigQueuedVersionRef.current) return;
+        if (queuedVersion > 0) cloudConfigQueuedVersionRef.current = queuedVersion;
+        cloudConfigApplyQueueRef.current = cloudConfigApplyQueueRef.current.then(async () => {
         if (!incomingConfig || typeof incomingConfig !== 'object') return;
         if (await getAppMode() !== 'cloudMode') return;
         const incomingVersion = Number(incomingConfig.configVersion || 0);
@@ -456,30 +472,9 @@ export default function App() {
         const serializedConfig = JSON.stringify(config);
         const lastApplied = lastAppliedCloudConfigRef.current;
         if (lastApplied && incomingVersion > 0 && incomingVersion < lastApplied.version) return;
-        if (
-          lastApplied?.signature === serializedConfig &&
-          (incomingVersion === 0 || incomingVersion <= lastApplied.version)
-        ) return;
-        lastAppliedCloudConfigRef.current = {
-          version: Math.max(incomingVersion, lastApplied?.version || 0),
-          signature: serializedConfig,
-        };
-        const [storedConfig, storedVersionText] = await Promise.all([
-          AsyncStorage.getItem('@cloud_device_config'),
-          AsyncStorage.getItem('@cloud_config_version'),
-        ]);
+        const storedVersionText = await AsyncStorage.getItem('@cloud_config_version');
         const storedVersion = Number(storedVersionText || 0);
         if (incomingVersion > 0 && incomingVersion < storedVersion) return;
-        let configChanged = true;
-        try {
-          configChanged = !storedConfig || JSON.stringify(JSON.parse(storedConfig)) !== serializedConfig;
-        } catch {
-          configChanged = true;
-        }
-        if (incomingVersion > 0) {
-          await AsyncStorage.setItem('@cloud_config_version', String(incomingVersion));
-        }
-        if (!configChanged) return;
         const mediaItems: any[] = [];
         if (config.sections && Array.isArray(config.sections)) {
           config.sections.forEach((section: any, index: number) => {
@@ -502,26 +497,96 @@ export default function App() {
             }
           });
         }
+        // Stage first. The previous applied config stays on screen and on disk
+        // until every selected asset is verified in the Cloud cache.
+        await AsyncStorage.multiSet([
+          [CLOUD_PENDING_CONFIG_KEY, JSON.stringify(sourceConfig)],
+          [CLOUD_PENDING_VERSION_KEY, String(incomingVersion)],
+        ]);
+        await reportCloudConfigSync({
+          configVersion: incomingVersion,
+          status: 'pending',
+          mediaTotal: mediaItems.length,
+          mediaCached: 0,
+          message: 'Downloading the saved playlist to the device',
+        });
+        const cacheResult = await prefetchMediaItems(mediaItems, async (progress) => {
+          const completed = progress.cached + progress.failed;
+          if (completed % 5 === 0 || completed === progress.total) {
+            await reportCloudConfigSync({
+              configVersion: incomingVersion,
+              status: 'pending',
+              mediaTotal: progress.total,
+              mediaCached: progress.cached,
+              message: `Caching media ${completed}/${progress.total}`,
+            });
+          }
+        });
+        if (cacheResult.failed > 0) {
+          await reportCloudConfigSync({
+            configVersion: incomingVersion,
+            status: 'failed',
+            mediaTotal: cacheResult.total,
+            mediaCached: cacheResult.cached,
+            message: `${cacheResult.failed} media file(s) could not be cached; the previous playlist remains active`,
+          });
+          return;
+        }
+        const latestVersion = Number(await AsyncStorage.getItem('@cloud_config_version') || incomingVersion);
+        if (incomingVersion > 0 && latestVersion > incomingVersion) return;
+
         // The saved Cloud configuration is authoritative even when it contains
-        // no media, so an empty selection must clear the previous playlist.
-        console.log(`Applying cloud config v${incomingVersion || 'legacy'} with ${mediaItems.length} media items`);
+        // no media, so an empty selection clears the previous playlist.
+        console.log(`Applying cloud config v${incomingVersion || 'legacy'} with ${mediaItems.length} cached media items`);
         setPlaybackOverride('cloud-config', mediaItems);
         if (mediaItems.length === 0) {
+          // An explicit Cloud Clear must unmount any currently-playing native
+          // media before the old cache is removed. Otherwise fullscreen can
+          // retain a stale player surface and show only a black frame.
+          setContentResetVersion((version) => version + 1);
+          setSectionMediaVersion({ 1: 0, 2: 0, 3: 0 });
           void clearMediaCache('cloud').catch((error) => console.warn('Cloud media cache cleanup failed:', error));
           void mediaCacheService.clearCache();
         }
 
-        // Save config to AsyncStorage for persistence
-        await AsyncStorage.setItem('@cloud_device_config', serializedConfig);
+        // Commit the staged snapshot only after the playlist is offline-ready.
+        await AsyncStorage.multiSet([
+          ['@cloud_device_config', serializedConfig],
+          [CLOUD_APPLIED_CONFIG_KEY, JSON.stringify(sourceConfig)],
+          [CLOUD_APPLIED_VERSION_KEY, String(incomingVersion)],
+          ['@cloud_config_version', String(incomingVersion)],
+        ]);
+        lastAppliedCloudConfigRef.current = {
+          version: Math.max(incomingVersion, lastApplied?.version || 0),
+          signature: serializedConfig,
+        };
 
         // Set cloud config flag to prevent embedded CMS from overwriting
         await AsyncStorage.setItem('@cloud_config_active', 'true');
+
+        const readyReported = await reportCloudConfigSync({
+          configVersion: incomingVersion,
+          status: 'ready',
+          mediaTotal: cacheResult.total,
+          mediaCached: cacheResult.cached,
+          message: 'Configuration applied and all selected media is cached',
+        });
+        if (readyReported) {
+          await AsyncStorage.multiRemove([CLOUD_PENDING_CONFIG_KEY, CLOUD_PENDING_VERSION_KEY]);
+        }
 
         setConfig(config);
         // Trigger media sync when config changes
         setMediaVersion(prev => prev + 1);
         // Also trigger source refresh to force player to reload media
         sourceManagerRef.current?.onCmsUpdate();
+        }).catch((error) => {
+          console.error('Cloud config apply failed:', error);
+        }).finally(() => {
+          if (queuedVersion > 0 && cloudConfigQueuedVersionRef.current === queuedVersion) {
+            cloudConfigQueuedVersionRef.current = 0;
+          }
+        });
       });
 
       // Handle device not registered event from cloud service
@@ -599,6 +664,28 @@ export default function App() {
   }, [appMode, deviceActivated]);
 
   useEffect(() => {
+    if (appMode !== 'cloudMode' || deviceActivated !== true) return;
+    const retryPendingCloudConfig = async () => {
+      try {
+        const [pendingConfig, pendingVersion] = await Promise.all([
+          AsyncStorage.getItem(CLOUD_PENDING_CONFIG_KEY),
+          AsyncStorage.getItem(CLOUD_PENDING_VERSION_KEY),
+        ]);
+        if (!pendingConfig || !pendingVersion) return;
+        eventEmitter.emit('config:update', {
+          config: JSON.parse(pendingConfig),
+          configVersion: Number(pendingVersion),
+        });
+      } catch {
+        // A malformed pending snapshot cannot replace the last applied config.
+      }
+    };
+    void retryPendingCloudConfig();
+    const timer = setInterval(retryPendingCloudConfig, 30_000);
+    return () => clearInterval(timer);
+  }, [appMode, deviceActivated]);
+
+  useEffect(() => {
     let mounted = true;
     getAppMode()
       .then((mode) => {
@@ -643,7 +730,11 @@ export default function App() {
         if (!response.ok) throw new Error(`activation-http-${response.status}`);
         const data = await response.json();
 
-        console.log('=== Activation check response:', data);
+        console.log('=== Activation check response:', {
+          activated: !!data.activated,
+          exists: !!data.exists,
+          tokenIssued: !!data.deviceToken,
+        });
 
         if (data.activated) {
           if (data.deviceToken) {
@@ -2411,7 +2502,27 @@ export default function App() {
         await setMediaCacheMode(persistedMode === 'cloudMode' ? 'cloud' : 'lan');
         if (persistedMode === 'cloudMode') {
           console.log('=== INIT: Cloud config is active, loading from AsyncStorage ===');
-          const cloudConfigStr = await AsyncStorage.getItem('@cloud_device_config');
+          const [appliedConfig, latestConfig] = await Promise.all([
+            AsyncStorage.getItem(CLOUD_APPLIED_CONFIG_KEY),
+            AsyncStorage.getItem('@cloud_device_config'),
+          ]);
+          const cloudConfigStr = appliedConfig || latestConfig;
+          const [latestVersionText, appliedVersionText] = await Promise.all([
+            AsyncStorage.getItem('@cloud_config_version'),
+            AsyncStorage.getItem(CLOUD_APPLIED_VERSION_KEY),
+          ]);
+          const latestVersion = Number(latestVersionText || 0);
+          const appliedVersion = Number(appliedVersionText || 0);
+          if (appliedConfig && latestConfig && latestVersion > appliedVersion) {
+            await AsyncStorage.multiSet([
+              [CLOUD_PENDING_CONFIG_KEY, latestConfig],
+              [CLOUD_PENDING_VERSION_KEY, String(latestVersion)],
+            ]);
+            eventEmitter.emit('config:update', {
+              config: JSON.parse(latestConfig),
+              configVersion: latestVersion,
+            });
+          }
           if (cloudConfigStr) {
             const cloudConfig = JSON.parse(cloudConfigStr);
             if (cloudConfig && typeof cloudConfig === "object") {
@@ -2448,6 +2559,9 @@ export default function App() {
                 });
                 console.log('=== INIT: Setting playback override with media items:', mediaItems.length);
                 setPlaybackOverride('cloud-config', mediaItems);
+                // Resume any interrupted downloads and fill missing Cloud
+                // cache entries whenever the TV starts with connectivity.
+                void prefetchMediaItems(mediaItems);
               }
 
               setReady(true);
@@ -3021,6 +3135,7 @@ export default function App() {
           playbackControllerRef={playbackControllerRef}
           sourceManagerRef={sourceManagerRef}
           reportRuntimeError={reportRuntimeError}
+          onPlaybackError={reportCloudPlaybackError}
         />
         {showModeSelection && appMode && (
           <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>

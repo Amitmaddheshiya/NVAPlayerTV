@@ -71,9 +71,128 @@ export const deviceAPI = {
 };
 
 // Media
+const CHUNKED_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024;
+
+async function sha256Blob(blob: Blob): Promise<string> {
+  if (!globalThis.crypto?.subtle) return '';
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function createUploadId(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (character) => {
+    const random = Math.floor(Math.random() * 16);
+    return (character === 'x' ? random : (random & 0x3) | 0x8).toString(16);
+  });
+}
+
+async function uploadMediaResumable(
+  file: File,
+  section?: number,
+  deviceId?: string,
+  folder?: string,
+  onProgress?: (percent: number) => void,
+) {
+  const resumeKey = `cloud-upload:${deviceId || ''}:${section || ''}:${folder || ''}:${file.name}:${file.size}:${file.lastModified}`;
+  let uploadId = localStorage.getItem(resumeKey) || '';
+  let status: { chunkSize: number; totalChunks: number; receivedChunks: number[] } | null = null;
+
+  if (uploadId) {
+    try {
+      const response = await api.get(`/media/uploads/${encodeURIComponent(uploadId)}`);
+      status = response.data;
+    } catch (error: any) {
+      if (error?.response?.status !== 404) throw error;
+      localStorage.removeItem(resumeKey);
+      uploadId = '';
+    }
+  }
+
+  if (!uploadId || !status) {
+    uploadId = uploadId || createUploadId();
+    localStorage.setItem(resumeKey, uploadId);
+    const response = await api.post('/media/uploads/init', {
+      uploadId,
+      filename: file.name,
+      size: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      section,
+      deviceId,
+      folder,
+    });
+    const returnedUploadId = String(response.data.uploadId || '');
+    if (returnedUploadId !== uploadId) throw new Error('The server returned a different upload session ID');
+    status = response.data;
+  }
+
+  const chunkSize = Number(status.chunkSize || 0);
+  const totalChunks = Number(status.totalChunks || 0);
+  if (!chunkSize || !totalChunks || totalChunks !== Math.ceil(file.size / chunkSize)) {
+    throw new Error('The saved upload session does not match the selected file');
+  }
+  const received = new Set((status.receivedChunks || []).map(Number));
+  let completedBytes = Array.from(received).reduce(
+    (sum, index) => sum + Math.min(chunkSize, Math.max(0, file.size - index * chunkSize)),
+    0,
+  );
+  onProgress?.(Math.min(99, Math.round((completedBytes / file.size) * 100)));
+
+  for (let index = 0; index < totalChunks; index += 1) {
+    if (received.has(index)) continue;
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    const chunk = file.slice(start, end);
+    let lastError: any;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const formData = new FormData();
+        formData.append('sha256', await sha256Blob(chunk));
+        formData.append('chunk', chunk, file.name);
+        await api.put(`/media/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          onUploadProgress: (event) => {
+            const sent = Math.min(chunk.size, Number(event.loaded || 0));
+            const percent = Math.round(((completedBytes + sent) / file.size) * 100);
+            onProgress?.(Math.min(99, percent));
+          },
+        });
+        lastError = null;
+        break;
+      } catch (error: any) {
+        lastError = error;
+        const statusCode = Number(error?.response?.status || 0);
+        if (statusCode && statusCode < 500 && statusCode !== 429) break;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
+    if (lastError) throw lastError;
+    completedBytes += chunk.size;
+    onProgress?.(Math.min(99, Math.round((completedBytes / file.size) * 100)));
+  }
+
+  let result;
+  try {
+    result = await api.post(`/media/uploads/${encodeURIComponent(uploadId)}/complete`);
+  } catch (error: any) {
+    if ([400, 403, 413].includes(Number(error?.response?.status || 0))) {
+      await api.delete(`/media/uploads/${encodeURIComponent(uploadId)}`).catch(() => undefined);
+      localStorage.removeItem(resumeKey);
+    }
+    throw error;
+  }
+  localStorage.removeItem(resumeKey);
+  onProgress?.(100);
+  return result;
+}
+
 export const mediaAPI = {
   getStats: () => api.get('/media/stats'),
-  uploadMedia: (file: File, section?: number, deviceId?: string, folder?: string) => {
+  uploadMedia: (file: File, section?: number, deviceId?: string, folder?: string, onProgress?: (percent: number) => void) => {
+    if (file.size > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
+      return uploadMediaResumable(file, section, deviceId, folder, onProgress);
+    }
     const formData = new FormData();
     formData.append('file', file);
     if (section) formData.append('section', section.toString());
@@ -81,6 +200,9 @@ export const mediaAPI = {
     if (folder) formData.append('folder', folder);
     return api.post('/media/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event) => {
+        if (file.size > 0) onProgress?.(Math.min(100, Math.round((Number(event.loaded || 0) / file.size) * 100)));
+      },
     });
   },
   getMedia: (params?: { section?: number; deviceId?: string; page?: number; limit?: number; search?: string; folder?: string; type?: string }) =>

@@ -12,6 +12,7 @@ export const UserLibrary = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [loading, setLoading] = useState(true);
   const [storageUsed, setStorageUsed] = useState(0);
   const [monthlyLimit, setMonthlyLimit] = useState(0);
@@ -108,16 +109,36 @@ export const UserLibrary = () => {
     if (!selectedFile && selectedFiles.length === 0) return;
 
     setUploading(true);
+    setUploadProgress(0);
     try {
       if (selectedFiles.length > 0) {
         // Multiple file upload
+        const totalBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
+        let completedBytes = 0;
         for (const file of selectedFiles) {
-          await mediaAPI.uploadMedia(file, undefined, undefined, currentFolder || undefined);
+          await mediaAPI.uploadMedia(
+            file,
+            undefined,
+            undefined,
+            currentFolder || undefined,
+            (percent) => setUploadProgress(totalBytes
+              ? Math.round(((completedBytes + file.size * percent / 100) / totalBytes) * 100)
+              : 100),
+          );
+          completedBytes += file.size;
         }
         setSelectedFiles([]);
       } else {
         // Single file upload (backward compatibility)
-        await mediaAPI.uploadMedia(selectedFile, undefined, undefined, currentFolder || undefined);
+        if (selectedFile) {
+          await mediaAPI.uploadMedia(
+            selectedFile,
+            undefined,
+            undefined,
+            currentFolder || undefined,
+            setUploadProgress,
+          );
+        }
         setSelectedFile(null);
       }
       loadMedia();
@@ -509,6 +530,15 @@ export const UserLibrary = () => {
                       {uploading ? 'Uploading...' : 'Upload'}
                     </Button>
                   </div>
+                  {uploading ? (
+                    <div className="space-y-1" role="status" aria-live="polite">
+                      <div className="flex justify-between text-xs text-gray-600">
+                        <span>Uploading media securely</span>
+                        <span>{uploadProgress}%</span>
+                      </div>
+                      <progress className="h-2 w-full accent-blue-600" value={uploadProgress} max={100} />
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </CardContent>

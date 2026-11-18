@@ -5,6 +5,7 @@ export interface IMedia extends Document {
   originalName: string;
   mimeType: string;
   size: number;
+  hash?: string;
   url: string;
   storageType: 'local' | 's3';
   path: string;
@@ -22,6 +23,7 @@ const MediaSchema = new Schema<IMedia>(
     originalName: { type: String, required: true, trim: true },
     mimeType: { type: String, required: true, trim: true },
     size: { type: Number, required: true, min: 0 },
+    hash: { type: String, trim: true, lowercase: true },
     url: { type: String, required: true, trim: true },
     storageType: { type: String, enum: ['local', 's3'], default: 'local' },
     path: { type: String, required: true, trim: true },

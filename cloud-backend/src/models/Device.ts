@@ -48,6 +48,7 @@ export interface IDevice extends Document {
     }>;
     totalCacheSize: number;
   };
+  health?: Record<string, unknown>;
   // Track who last configured this device
   lastConfiguredBy?: Types.ObjectId;
   lastConfiguredAt?: Date;
@@ -105,6 +106,7 @@ const DeviceSchema = new Schema<IDevice>(
       }],
       totalCacheSize: { type: Number, default: 0 },
     },
+    health: { type: Schema.Types.Mixed, default: () => ({ playbackErrorCount: 0, recentErrors: [] }) },
     // Track who last configured this device
     lastConfiguredBy: { type: Schema.Types.ObjectId, ref: 'User' },
     lastConfiguredAt: { type: Date },

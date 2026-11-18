@@ -92,7 +92,7 @@ export const UserDeviceDetail = () => {
       setDialog({
         type: 'success',
         title: 'Configuration cleared',
-        message: 'The default configuration was saved and sent to this device.',
+        message: 'The default configuration was saved. TV apply and cache status will update on this page.',
       });
     } catch (error) {
       console.error('Clear config error:', error);
@@ -111,6 +111,27 @@ export const UserDeviceDetail = () => {
       loadDevice();
       loadDeviceMedia();
     }
+  }, [deviceId]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    const refreshSyncStatus = async () => {
+      try {
+        const response = await deviceAPI.getDevice(deviceId);
+        const latest = response.data;
+        setDevice((previous: any) => previous ? {
+          ...previous,
+          status: latest.status,
+          lastSeen: latest.lastSeen,
+          cacheInfo: latest.cacheInfo,
+          health: latest.health,
+        } : latest);
+      } catch {
+        // Keep the last known status visible during short network interruptions.
+      }
+    };
+    const timer = window.setInterval(refreshSyncStatus, 10_000);
+    return () => window.clearInterval(timer);
   }, [deviceId]);
 
   // Ensure sections are properly initialized when layout changes
@@ -252,7 +273,7 @@ export const UserDeviceDetail = () => {
       setDialog({
         type: 'success',
         title: 'Configuration saved',
-        message: 'The updated layout, settings, and selected media were saved and sent to this device.',
+        message: 'The layout, settings, and selected media were saved. TV apply and cache status will update on this page.',
       });
     } catch (error) {
       console.error('Save config error:', error);
@@ -347,6 +368,30 @@ export const UserDeviceDetail = () => {
           </div>
         </div>
       </header>
+
+      {device.health?.cloudSync && (
+        <div className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 pt-2">
+          <div className={`rounded-md border px-3 py-2 text-xs ${
+            device.health.cloudSync.status === 'ready'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+              : device.health.cloudSync.status === 'failed'
+              ? 'border-rose-200 bg-rose-50 text-rose-800'
+              : 'border-amber-200 bg-amber-50 text-amber-800'
+          }`}>
+            <strong>TV sync · v{device.health.cloudSync.configVersion}</strong>
+            <span className="ml-2">
+              {device.health.cloudSync.status === 'ready'
+                ? `Applied and cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files`
+                : device.health.cloudSync.status === 'failed'
+                ? device.health.cloudSync.message || `Cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files; previous playlist is still active`
+                : `Pending · cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files`}
+            </span>
+            {device.status !== 'online' && device.health.cloudSync.status !== 'ready' && (
+              <span className="ml-2">TV is offline; it will sync when it reconnects.</span>
+            )}
+          </div>
+        </div>
+      )}
 
       <main className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 py-2 sm:py-3">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 sm:gap-3">

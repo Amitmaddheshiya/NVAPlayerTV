@@ -13,6 +13,13 @@ import {
   getMediaStats,
 } from '../controllers/media.controller';
 import { adminOnly, auth, deviceAuth } from '../middleware/auth.middleware';
+import {
+  completeChunkedUpload,
+  cancelChunkedUpload,
+  getChunkedUploadStatus,
+  initializeChunkedUpload,
+  uploadChunk as handleUploadChunk,
+} from '../controllers/chunkedUpload.controller';
 
 const router = Router();
 
@@ -66,7 +73,42 @@ const uploadMediaFile = (req: any, res: any, next: any) => {
   })().catch(next);
 };
 
-router.post('/upload', auth, uploadMediaFile, uploadMedia);
+const uploadMediaAndCleanup = async (req: any, res: any, next: any) => {
+  try {
+    await uploadMedia(req, res);
+  } catch (error) {
+    next(error);
+  } finally {
+    if (req.file?.path) await fs.promises.unlink(req.file.path).catch(() => undefined);
+  }
+};
+
+const uploadChunkFile = (req: any, res: any, next: any) => {
+  const tempDir = path.resolve(process.cwd(), 'uploads/temp/chunks');
+  fs.mkdirSync(tempDir, { recursive: true });
+  multer({
+    storage: multer.diskStorage({
+      destination: (_request, _file, callback) => callback(null, tempDir),
+      filename: (_request, file, callback) => callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`),
+    }),
+    fileFilter: mediaFileFilter,
+    limits: { fileSize: 16 * 1024 * 1024, fields: 2, fieldSize: 128, files: 1 },
+  }).single('chunk')(req, res, (error: any) => {
+    if (error) {
+      const status = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      res.status(status).json({ error: status === 413 ? 'Upload chunk exceeds 16 MB' : error.message });
+      return;
+    }
+    next();
+  });
+};
+
+router.post('/upload', auth, uploadMediaFile, uploadMediaAndCleanup);
+router.post('/uploads/init', auth, initializeChunkedUpload);
+router.get('/uploads/:uploadId', auth, getChunkedUploadStatus);
+router.delete('/uploads/:uploadId', auth, cancelChunkedUpload);
+router.put('/uploads/:uploadId/chunks/:index', auth, uploadChunkFile, handleUploadChunk);
+router.post('/uploads/:uploadId/complete', auth, completeChunkedUpload);
 router.get('/stats', auth, adminOnly, getMediaStats);
 router.get('/', auth, getMedia);
 router.get('/media-list', deviceAuth, getMediaList);

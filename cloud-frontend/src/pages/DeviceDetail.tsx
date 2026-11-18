@@ -16,6 +16,7 @@ export const DeviceDetail = () => {
   const [section, setSection] = useState(1);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [config, setConfig] = useState({
     layout: 'fullscreen',
     sections: [],
@@ -29,6 +30,16 @@ export const DeviceDetail = () => {
       loadDevice();
       loadDeviceMedia();
     }
+  }, [deviceId]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    const timer = window.setInterval(() => {
+      deviceAPI.getDevice(deviceId).then((response) => {
+        setDevice((current) => current ? { ...current, health: response.data.health } : current);
+      }).catch(() => undefined);
+    }, 15000);
+    return () => window.clearInterval(timer);
   }, [deviceId]);
 
   const loadDevice = async () => {
@@ -58,8 +69,9 @@ export const DeviceDetail = () => {
     if (!selectedFile || !deviceId) return;
 
     setUploading(true);
+    setUploadProgress(0);
     try {
-      await mediaAPI.uploadMedia(selectedFile, section, deviceId);
+      await mediaAPI.uploadMedia(selectedFile, section, deviceId, undefined, setUploadProgress);
       setSelectedFile(null);
       loadDeviceMedia();
     } catch (error) {
@@ -156,6 +168,32 @@ export const DeviceDetail = () => {
           </CardContent>
         </Card>
 
+        <Card>
+          <CardHeader>
+            <CardTitle>Playback Health</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="text-sm text-gray-700">
+              Reported playback errors: <span className="font-semibold">{device.health?.playbackErrorCount || 0}</span>
+            </div>
+            {device.health?.lastError ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                <div className="font-semibold">
+                  {device.health.lastError.fileName || 'Media error'}
+                  {device.health.lastError.section ? ` (Section ${device.health.lastError.section})` : ''}
+                </div>
+                <div>{device.health.lastError.message || 'Playback failed'}</div>
+                <div className="mt-1 text-xs text-amber-800">
+                  {device.health.lastError.at ? new Date(device.health.lastError.at).toLocaleString() : 'Time unavailable'}
+                  {device.health.lastError.mediaType ? ` (${device.health.lastError.mediaType})` : ''}
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-gray-500">No playback errors have been reported by this device.</div>
+            )}
+          </CardContent>
+        </Card>
+
         {/* Configuration Card */}
         <Card>
           <CardHeader>
@@ -211,6 +249,12 @@ export const DeviceDetail = () => {
               <Upload className="w-4 h-4 mr-2" />
               {uploading ? 'Uploading...' : 'Upload to Device'}
             </Button>
+            {uploading ? (
+              <div className="space-y-1" role="status" aria-live="polite">
+                <div className="text-right text-xs text-gray-600">{uploadProgress}%</div>
+                <progress className="h-2 w-full accent-blue-600" value={uploadProgress} max={100} />
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 

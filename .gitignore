@@ -33,6 +33,16 @@ local.properties
 .cxx/
 *.keystore
 !debug.keystore
+# Never commit release signing credentials. The debug keystore exception above
+# remains available for local development if this project ever needs it.
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+android/key.properties
+android/keystore.properties
 .kotlin/
 
 # node.js
@@ -78,6 +88,7 @@ yarn-error.log
 # Environment files
 .env
 .env.*
+.envrc
 
 # Logs
 *.log
@@ -96,6 +107,10 @@ server/installer/output/
 # Runtime uploads
 server/uploads/
 server/installer/build-meta.json
+# Cloud backend runtime media and resumable-upload chunks. These files are
+# generated locally and must never be committed from the root repository.
+cloud-backend/uploads/
+cloud-backend/dist/
 
 # Android build folders
 android/app/build/

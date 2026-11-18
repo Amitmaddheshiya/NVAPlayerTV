@@ -18,6 +18,32 @@ export interface Device {
     schedule?: any;
   };
   location?: string;
+  health?: {
+    playbackErrorCount?: number;
+    lastReportAt?: string;
+    cloudSync?: {
+      configVersion: number;
+      status: 'pending' | 'ready' | 'failed';
+      mediaTotal: number;
+      mediaCached: number;
+      message?: string;
+      updatedAt?: string;
+    };
+    lastError?: {
+      at?: string;
+      section?: number;
+      fileName?: string;
+      mediaType?: string;
+      message?: string;
+    };
+    recentErrors?: Array<{
+      at?: string;
+      section?: number;
+      fileName?: string;
+      mediaType?: string;
+      message?: string;
+    }>;
+  };
   createdAt: string;
   updatedAt: string;
 }

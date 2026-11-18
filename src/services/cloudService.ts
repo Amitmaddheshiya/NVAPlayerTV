@@ -267,6 +267,36 @@ class CloudService {
     }
   }
 
+  async reportPlaybackError(report: {
+    section?: number;
+    name?: string;
+    mediaType?: string;
+    message?: string;
+  }): Promise<void> {
+    if (!this.config?.enabled || !this.config.apiUrl || !this.config.deviceId) return;
+    try {
+      const deviceToken = await this.ensureDeviceAuthToken();
+      if (!deviceToken) return;
+      const response = await fetch(`${this.config.apiUrl}/api/devices/${encodeURIComponent(this.config.deviceId)}/health`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${deviceToken}`,
+        },
+        body: JSON.stringify({
+          kind: 'playback-error',
+          section: Math.max(0, Math.min(3, Math.trunc(Number(report.section || 0)))),
+          fileName: String(report.name || '').slice(0, 200),
+          mediaType: String(report.mediaType || '').slice(0, 64),
+          message: String(report.message || 'Media playback failed').slice(0, 500),
+        }),
+      });
+      if (!response.ok) throw new Error(`health-report-http-${response.status}`);
+    } catch (error) {
+      console.warn('Cloud playback error report failed:', error);
+    }
+  }
+
   async downloadMedia(mediaUrl: string, localPath: string): Promise<boolean> {
     try {
       const deviceToken = await this.ensureDeviceAuthToken();
