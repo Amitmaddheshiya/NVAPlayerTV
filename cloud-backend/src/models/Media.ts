@@ -13,6 +13,7 @@ export interface IMedia extends Document {
   assignedDevices: string[];
   section: number;
   folder?: string;
+  deletedFromLibrary?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -31,6 +32,7 @@ const MediaSchema = new Schema<IMedia>(
     assignedDevices: [{ type: String }],
     section: { type: Number, required: true, min: 1 },
     folder: { type: String, trim: true },
+    deletedFromLibrary: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );

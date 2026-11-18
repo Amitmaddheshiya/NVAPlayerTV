@@ -96,6 +96,7 @@ export default function SlideRenderer({
     b: false,
   });
   const [imageVisibleSlot, setImageVisibleSlot] = useState<"a" | "b">("a");
+  const [cloudImageLoadedUri, setCloudImageLoadedUri] = useState("");
   const [forceLocalRestart, setForceLocalRestart] = useState(false);
   const [templateIndex, setTemplateIndex] = useState(0);
   const [resumePositionMs, setResumePositionMs] = useState(0);
@@ -164,6 +165,8 @@ export default function SlideRenderer({
   // delayed timer from advancing the newly-applied CMS/USB playlist.
   const playbackTimerGenerationRef = useRef(0);
   const lastVideoAdvanceIdentityRef = useRef<string>("");
+  const lastCloudAdvanceTokenRef = useRef<string>("");
+  const lastCloudAdvanceIndexRef = useRef(0);
   const EMPTY_FETCH_CLEAR_THRESHOLD = 8;
   const MAX_SINGLE_VIDEO_RETRY = 3;
   const MAX_TRANSIENT_VIDEO_RETRY = 2;
@@ -378,6 +381,10 @@ export default function SlideRenderer({
     }
     filesRef.current = files;
     indexRef.current = index;
+    if (lastCloudAdvanceIndexRef.current !== index) {
+      lastCloudAdvanceIndexRef.current = index;
+      lastCloudAdvanceTokenRef.current = "";
+    }
     setForceLocalRestart(false);
     lastIndexChangeAtRef.current = Date.now();
     videoGateLoopRef.current = 0;
@@ -707,6 +714,7 @@ export default function SlideRenderer({
     }
 
     // Load media even when server is "" – getMediaFiles falls back to cached list.
+    let cancelled = false;
     const load = async () => {
       try {
         let list: any[] = [];
@@ -746,9 +754,11 @@ export default function SlideRenderer({
             if (cloudMode) {
               const cloudItems = list;
               list = await resolveCachedMediaItems(cloudItems);
+              if (cancelled || !isMountedRef.current) return;
               if (cloudItems.some((item: any, index: number) => item.remoteUrl === list[index]?.remoteUrl)) {
                 void prefetchMediaItems(cloudItems).then(async () => {
                   const cachedItems = await resolveCachedMediaItems(cloudItems);
+                  if (cancelled || !isMountedRef.current) return;
                   setFiles((prev) => {
                     if (!Array.isArray(prev) || prev.length !== cloudItems.length || prev.some((item, i) => item?.url !== cloudItems[i]?.url)) return prev;
                     const playbackChanged = cachedItems.some((item, i) => item?.localPath !== prev[i]?.localPath || item?.remoteUrl !== prev[i]?.remoteUrl);
@@ -775,10 +785,18 @@ export default function SlideRenderer({
           list = await getMediaFiles(sectionIndex, playlistNames);
         }
 
+        if (cancelled || !isMountedRef.current) return;
         if (Array.isArray(list) && list.length > 0) {
           emptyFetchCountRef.current = 0;
+          const previousPlaylist = filesRef.current.map((item) => String(item?.url || '').split('?')[0]);
+          const nextPlaylist = list.map((item) => String(item?.url || '').split('?')[0]);
+          const cloudPlaylistChanged = cloudMode && previousPlaylist.length > 0 &&
+            (previousPlaylist.length !== nextPlaylist.length || previousPlaylist.some((url, i) => url !== nextPlaylist[i]));
           setFiles((prev) => (areMediaListsEqual(prev, list) ? prev : list));
-          setIndex(findMatchingIndex(list, filesRef.current[indexRef.current], indexRef.current));
+          // A newly saved order always starts at item 1. Preserve the active
+          // index only for cache refreshes or config edits that kept the same
+          // ordered URLs, so background cache completion cannot jump playback.
+          setIndex(cloudPlaylistChanged ? 0 : findMatchingIndex(list, filesRef.current[indexRef.current], indexRef.current));
           return;
         }
 
@@ -815,11 +833,17 @@ export default function SlideRenderer({
         }
         scheduleRetryLoad();
       } catch (error) {
+        if (cancelled) return;
         console.log("Media load error:", error);
         scheduleRetryLoad();
       }
     };
     load();
+    return () => {
+      // A slower cache/config read from the previous version must never replace
+      // the newer section playlist after a save or reconnect.
+      cancelled = true;
+    };
   }, [sectionIndex, server, mediaVersion, sourceType, sourceUrl, JSON.stringify(playlistNames || []), JSON.stringify(sectionMediaUrls), isMultiPaneLayout]);
 
   useEffect(() => {
@@ -871,6 +895,11 @@ export default function SlideRenderer({
       // intentionally has no device JWT, so native playback receives 401 after
       // a video has been cached. The verified local file is the Cloud source
       // for all later playlist cycles and for offline playback.
+      nextUri = localPlayableUri;
+    } else if (cloudMode && !isVideo && hasLocalPlayableUri) {
+      // Cloud playlists are cached per selected asset. Do not require the
+      // unrelated global media list to be fully cached before using this
+      // already-verified local image; that list may be unavailable offline.
       nextUri = localPlayableUri;
     } else if (!preferStreaming && !isVideo && hasLocalPlayableUri && isListFullyCached) {
       nextUri = localPlayableUri;
@@ -1178,11 +1207,48 @@ export default function SlideRenderer({
     return Math.max(1, Number(raw || 5)) * 1000;
   };
 
+  const activeImageFile = files[index];
+  const activeImageType = String(activeImageFile?.type || "").toLowerCase();
+  const activeIsPdf = activeImageType === "pdf" || /\.pdf$/i.test(activeImageFile?.originalName || activeImageFile?.name || "");
+  const activeIsText = activeImageType === "text" || /\.txt$/i.test(activeImageFile?.originalName || activeImageFile?.name || "");
+  const currentImageUri = cloudMode && activeImageFile && !isVideoFile(activeImageFile) && !activeIsPdf && !activeIsText
+    ? normalizeMediaUri(uri)
+    : "";
+
+  useEffect(() => {
+    setCloudImageLoadedUri("");
+  }, [currentImageUri]);
+
+  const handleCloudImageLoad = (loadedUri: string) => {
+    if (!loadedUri || loadedUri !== normalizeMediaUri(uri)) return;
+    failedCloudImageUrisRef.current.delete(loadedUri);
+    setCloudImageLoadedUri(loadedUri);
+  };
+
+  const handleCloudImageError = (failedUri: string) => {
+    if (!failedUri || failedUri !== normalizeMediaUri(uri)) return;
+    if (failedCloudImageUrisRef.current.has(failedUri)) return;
+    failedCloudImageUrisRef.current.add(failedUri);
+    if (typeof onPlaybackError === "function") {
+      onPlaybackError({
+        section: sectionIndex + 1,
+        name: currentFile?.originalName || currentFile?.name || "Image media",
+        mediaType: currentFile?.type || "image",
+        message: "Image failed to load",
+      });
+    }
+    if (filesRef.current.length > 1) goNext();
+    else handleRenderError();
+  };
+
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
     if (!files.length) return;
     const active = files[index];
     if (isVideoFile(active)) return;
+    // Cloud images use an active-image load event and one authoritative timer;
+    // the LAN/slot watchdog must not race that timer and skip a slide.
+    if (cloudMode) return;
     if (playerPaused) return;
     const watchdog = setInterval(() => {
       if (!filesRef.current.length || filesRef.current.length === 1) return;
@@ -1192,7 +1258,7 @@ export default function SlideRenderer({
       }
     }, 1200);
     return () => clearInterval(watchdog);
-  }, [files, index, sourceType, config, sectionIndex, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused]);
+  }, [files, index, sourceType, config, sectionIndex, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused, cloudMode]);
 
   const getNextIndexForPlayback = () => {
     if (!files.length) return indexRef.current;
@@ -1637,6 +1703,11 @@ export default function SlideRenderer({
     const file = files[index];
     const isVideo = isVideoFile(file);
     if (!isVideo) {
+      const fileType = String(file?.type || "").toLowerCase();
+      const fileIsPdf = fileType === "pdf" || /\.pdf$/i.test(file?.originalName || file?.name || "");
+      const fileIsText = fileType === "text" || /\.txt$/i.test(file?.originalName || file?.name || "");
+      const isImage = cloudMode && !fileIsPdf && !fileIsText;
+      if (isImage && (!currentImageUri || cloudImageLoadedUri !== currentImageUri)) return;
       const duration = pausedSlideRemainingMsRef.current ??
         (config?.sections?.[sectionIndex]?.slideDuration ||
           config?.slideDuration ||
@@ -1645,7 +1716,19 @@ export default function SlideRenderer({
       slideDeadlineRef.current = Date.now() + duration;
       const advanceWhenReady = () => {
         if (playbackTimerGenerationRef.current !== timerGeneration || !isMountedRef.current) return;
-        if (isNextImageReady()) {
+        if (isImage) {
+          slideDeadlineRef.current = 0;
+          goNext();
+          return;
+        }
+        const cloudImageWaitExpired =
+          cloudMode &&
+          slideDeadlineRef.current > 0 &&
+          Date.now() - slideDeadlineRef.current >= 1500;
+        if (isNextImageReady() || cloudImageWaitExpired) {
+          if (cloudImageWaitExpired && !isNextImageReady()) {
+            console.warn(`[Cloud SlideRenderer] section=${sectionIndex + 1} image preload timed out; advancing playlist`);
+          }
           slideDeadlineRef.current = 0;
           goNext();
           return;
@@ -1675,7 +1758,7 @@ export default function SlideRenderer({
       }
       slideDeadlineRef.current = 0;
     };
-  }, [index, files, config, sectionIndex, sourceType, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused]);
+  }, [index, files, config, sectionIndex, sourceType, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused, cloudMode, currentImageUri, cloudImageLoadedUri]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -1776,6 +1859,15 @@ export default function SlideRenderer({
     if (playerPausedRef.current) return;
     if (!files.length) return;
     if (files.length === 1) return;
+    if (cloudMode) {
+      const activeFile = filesRef.current[indexRef.current];
+      const advanceToken = `${indexRef.current}|${getMediaStableIdentity(activeFile)}`;
+      if (lastCloudAdvanceTokenRef.current === advanceToken) return;
+      // Video end, near-end progress, and image readiness callbacks can fire
+      // close together on Android TV. Claim each item once before React updates
+      // indexRef so duplicate callbacks cannot skip or replay playlist items.
+      lastCloudAdvanceTokenRef.current = advanceToken;
+    }
     const { nextIndex, wrappedToStart } = getPlaylistAdvanceState(
       filesRef.current.length,
       indexRef.current
@@ -2490,6 +2582,8 @@ export default function SlideRenderer({
           isVideo={isVideo}
           isPdf={isPdf}
           isText={isText}
+          cloudMode={cloudMode}
+          cloudImageUri={currentImageUri}
           mediaRotateLayerStyle={mediaRotateLayerStyle}
           styles={styles}
           videoFade={videoFade}
@@ -2706,6 +2800,8 @@ export default function SlideRenderer({
           onPdfError={handlePdfError}
           onImageLoadEnd={handleImageLoadEnd}
           onImageLoadError={handleImageLoadError}
+          onCloudImageLoad={handleCloudImageLoad}
+          onCloudImageError={handleCloudImageError}
         />
       </Animated.View>
     </View>

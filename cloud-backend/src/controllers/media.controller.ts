@@ -165,7 +165,7 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
 export const getMedia = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { section, deviceId, page = '1', limit = '10', search, folder, type } = req.query;
-    const filter: any = {};
+    const filter: any = { deletedFromLibrary: { $ne: true } };
 
     if (section) filter.section = parseInt(section as string);
     if (deviceId) filter.assignedDevices = deviceId;
@@ -306,40 +306,51 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const storage = getStorageService();
-    await storage.delete(media.path);
-
-    // Remove deleted URLs from persisted device configs so the TV does not keep
-    // retrying an asset that no longer exists.
+    // Check persisted configurations before removing the backing file. A media
+    // asset selected by a saved Cloud playlist must remain recoverable by TV.
     const configuredDevices = await Device.find({
       $or: [
         { 'config.mediaUrls': media.url },
         { 'config.sections.mediaUrls': media.url },
+        ...(media.assignedDevices?.length ? [{ deviceId: { $in: media.assignedDevices } }] : []),
       ],
-    });
-    const io = getSocketInstance();
-    for (const device of configuredDevices) {
-      const mediaPath = media.path;
-      device.config.mediaUrls = (device.config.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== mediaPath);
-      if (Array.isArray(device.config.sections)) {
-        device.config.sections = device.config.sections.map((section: any) => ({
-          ...section,
-          mediaUrls: (section.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== mediaPath),
-          mediaItems: (section.mediaItems || []).filter((item: any) => getMediaPathFromUrl(item.url) !== mediaPath),
-        }));
-        if (device.config.layout === 'fullscreen') {
-          device.config.mediaUrls = device.config.sections[0]?.mediaUrls || [];
-        }
+    }).select('deviceId');
+    if (configuredDevices.length > 0) {
+      // A configured cloud playlist is a durable assignment. Hide the asset
+      // from the user's library, but keep its file and DB metadata available
+      // so assigned TVs can recover or re-cache it after restart/offline use.
+      media.deletedFromLibrary = true;
+      await media.save();
+      await cacheDelPattern('media:*');
+      if (req.userId) {
+        await AuditLog.create({
+          userId: req.userId,
+          action: 'delete_media',
+          targetType: 'media',
+          targetId: media._id.toString(),
+          details: {
+            filename: media.originalName,
+            size: media.size,
+            folder: media.folder,
+            retainedForConfiguredDevices: configuredDevices.map((device) => device.deviceId),
+          },
+          ipAddress: req.ip,
+          userAgent: req.get('user-agent'),
+        });
       }
-      if (device.cacheInfo) {
-        device.cacheInfo.configVersion += 1;
-        device.cacheInfo.lastSyncTime = new Date();
-        device.cacheInfo.cachedMedia = (device.cacheInfo.cachedMedia || []).filter((entry: any) => getMediaPathFromUrl(entry.url) !== mediaPath);
-      }
-      await device.save();
-      io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
+      res.json({
+        success: true,
+        archived: true,
+        retainedDeviceCount: configuredDevices.length,
+        message: `Removed from library; retained for ${configuredDevices.length} saved device configuration(s)`,
+      });
+      return;
     }
 
+    // No saved device config references the media, so it is safe to remove the
+    // stored file and record permanently.
+    const storage = getStorageService();
+    await storage.delete(media.path);
     await Media.findByIdAndDelete(req.params.id);
 
     // Invalidate media cache on delete

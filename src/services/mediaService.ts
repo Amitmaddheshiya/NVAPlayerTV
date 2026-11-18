@@ -186,6 +186,16 @@ const lastMediaLogAtBySection: Record<number, number> = {};
 const lastMediaLogKeyBySection: Record<number, string> = {};
 let cacheSummaryCache = { at: 0, total: 0, cached: 0, percent: 0 };
 let playbackOverride: PlaybackOverride | null = null;
+let pinnedCloudConfigUrls = new Set<string>();
+
+function normalizeCacheUrl(value: string): string {
+  return String(value || "").trim().split(/[?#]/, 1)[0];
+}
+
+/** Keep every asset in the saved Cloud config while it is the offline source of truth. */
+export function setCloudConfigMediaUrls(urls: string[]): void {
+  pinnedCloudConfigUrls = new Set((Array.isArray(urls) ? urls : []).map(normalizeCacheUrl).filter(Boolean));
+}
 
 function getListCacheState(mode: MediaCacheMode = activeMediaCacheMode): ListCacheState {
   return listCacheStates[mode];
@@ -766,6 +776,9 @@ async function downloadIfNeeded(
 
       const finalStat = await RNFS.stat(tempPath);
       const finalSize = Number(finalStat?.size || 0);
+      if (expectedSize > 0 && finalSize !== expectedSize) {
+        throw new Error(`download-size-mismatch:${finalSize}:${expectedSize}`);
+      }
       if (expectedHash) {
         const actualHash = await computeFileHash(tempPath, expectedHash);
         if (!actualHash || actualHash !== expectedHash) {
@@ -826,7 +839,9 @@ async function downloadIfNeeded(
     }
   }
 
-  delete manifest[remotePath];
+  // A failed Cloud replacement must not discard the last applied manifest
+  // entry: rollback may still use its old size/hash to resolve the prior file.
+  if (mode !== "cloud") delete manifest[remotePath];
   await writeManifest(manifest);
   return null;
 }
@@ -856,7 +871,8 @@ async function downloadIfNeededDeduped(
 async function removeStaleFiles(
   manifest: ManifestMap,
   activeUrls: Set<string>,
-  options: { immediate?: boolean } = {}
+  options: { immediate?: boolean } = {},
+  mode: MediaCacheMode = activeMediaCacheMode,
 ) {
   const now = Date.now();
   const activeList = Array.from(activeUrls);
@@ -874,7 +890,8 @@ async function removeStaleFiles(
   for (const url of Object.keys(manifest)) {
     const entry = manifest[url];
     if (!entry) continue;
-    if (activeUrls.has(url)) {
+    const pinnedByCloudConfig = mode === "cloud" && pinnedCloudConfigUrls.has(normalizeCacheUrl(url));
+    if (activeUrls.has(url) || pinnedByCloudConfig) {
       entry.lastSeenAt = now;
       continue;
     }
@@ -1056,7 +1073,7 @@ async function mapServerListToPlayable(
     };
   });
 
-  await removeStaleFiles(manifest, activeUrls, { immediate: !!options.pruneStaleNow });
+  await removeStaleFiles(manifest, activeUrls, { immediate: !!options.pruneStaleNow }, mode);
   clearProgressForMissingPaths(activeUrls);
   await writeManifest(manifest);
   if (!sameMediaList(listState.list, mapped)) {
@@ -1485,8 +1502,13 @@ export async function pruneCacheIfLow(minFreeBytes = DEFAULT_MIN_FREE_BYTES) {
     await ensureMediaDirs();
     const manifest = await readManifest();
     const activeUrls = new Set(activePlaybackUrls.values());
+    if (activeMediaCacheMode === "cloud") {
+      for (const url of pinnedCloudConfigUrls) activeUrls.add(url);
+    }
     const entries = Object.values(manifest).filter(
-      (entry) => entry?.localPath && !activeUrls.has(String(entry.url || ""))
+      (entry) => entry?.localPath &&
+        !activeUrls.has(String(entry.url || "")) &&
+        !(activeMediaCacheMode === "cloud" && pinnedCloudConfigUrls.has(normalizeCacheUrl(String(entry.url || ""))))
     );
     if (!entries.length) return false;
 
@@ -1522,12 +1544,16 @@ export async function prefetchMediaItems(
   items: MediaItem[],
   onProgress?: (result: MediaPrefetchResult) => void | Promise<void>
 ): Promise<MediaPrefetchResult> {
+  const requestedItems = (Array.isArray(items) ? items : []).filter((item) => !!item?.url);
   const uniqueItems = Array.from(new Map(
-    (Array.isArray(items) ? items : [])
-      .filter((item) => !!item?.url)
-      .map((item) => [String(item.url), item])
+    requestedItems.map((item) => [String(item.url), item])
   ).values());
-  const result: MediaPrefetchResult = { total: uniqueItems.length, cached: 0, failed: 0 };
+  const assignmentsByUrl = new Map<string, number>();
+  requestedItems.forEach((item) => {
+    const key = String(item.url);
+    assignmentsByUrl.set(key, (assignmentsByUrl.get(key) || 0) + 1);
+  });
+  const result: MediaPrefetchResult = { total: requestedItems.length, cached: 0, failed: 0 };
   try {
     const mode = activeMediaCacheMode;
     const server = mode === "cloud" ? cloudService.getApiUrl() : getServer();
@@ -1541,16 +1567,17 @@ export async function prefetchMediaItems(
 
     for (const item of uniqueItems) {
       const task = async () => {
+        const assignmentCount = assignmentsByUrl.get(String(item.url)) || 1;
         try {
           if (!shouldCacheItem(item)) {
-            result.failed += 1;
+            result.failed += assignmentCount;
           } else {
             const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode);
-            if (localPathValue && await fileExists(localPathValue)) result.cached += 1;
-            else result.failed += 1;
+            if (localPathValue && await fileExists(localPathValue)) result.cached += assignmentCount;
+            else result.failed += assignmentCount;
           }
         } catch {
-          result.failed += 1;
+          result.failed += assignmentCount;
         }
         await onProgress?.({ ...result });
       };
@@ -1573,6 +1600,34 @@ export async function prefetchMediaItems(
   } catch {
     return { ...result, failed: Math.max(result.failed, result.total - result.cached) };
   }
+}
+
+/** Count playlist placements whose local files still pass the saved metadata checks. */
+export async function verifyCachedMediaItems(items: MediaItem[]): Promise<MediaPrefetchResult> {
+  const requestedItems = (Array.isArray(items) ? items : []).filter((item) => !!item?.url);
+  const result: MediaPrefetchResult = { total: requestedItems.length, cached: 0, failed: 0 };
+  if (!requestedItems.length) return result;
+
+  try {
+    const manifest = await readManifest(activeMediaCacheMode);
+    for (const item of requestedItems) {
+      const entry = manifest[String(item.url || "")];
+      if (await isManifestEntryUsable(
+        entry,
+        Number(item.size || 0),
+        Number(item.mtimeMs || 0),
+        String(item.hash || "")
+      )) {
+        result.cached += 1;
+      } else {
+        result.failed += 1;
+      }
+    }
+    await writeManifest(manifest);
+  } catch {
+    result.failed = result.total - result.cached;
+  }
+  return result;
 }
 
 export async function getCacheSummary() {

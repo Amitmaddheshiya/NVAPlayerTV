@@ -458,7 +458,9 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     };
     device.cacheInfo.configVersion += 1;
     device.cacheInfo.lastSyncTime = new Date();
-    const expectedMediaCount = uniqueMediaPaths.length;
+    // Count playlist placements across sections. A shared asset is downloaded
+    // once but is still selected in each section and should count in each.
+    const expectedMediaCount = configuredMediaUrls.length;
     device.set('health.cloudSync', {
       configVersion: device.cacheInfo.configVersion,
       status: 'pending',

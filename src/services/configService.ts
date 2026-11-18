@@ -2,7 +2,7 @@ import { readConfig, writeConfig } from "../utils/fileSystem";
 import { getServer } from "./serverService";
 import { NativeModules } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { setPlaybackOverride } from "./mediaService";
+import { setCloudConfigMediaUrls, setPlaybackOverride } from "./mediaService";
 import cloudService from "./cloudService";
 import { getAppMode } from "./setupService";
 import { addCloudDeviceAccess } from "./cloudMediaUrl";
@@ -69,6 +69,12 @@ export async function loadConfig(setConfig: Function) {
       if (cloudConfigStr) {
         const storedConfig = JSON.parse(cloudConfigStr);
         if (storedConfig && typeof storedConfig === "object") {
+          const savedMediaUrls = Array.isArray(storedConfig.sections)
+            ? storedConfig.sections.flatMap((section: any) =>
+                section?.contentType === "multimedia" && Array.isArray(section.mediaUrls) ? section.mediaUrls : []
+              )
+            : Array.isArray(storedConfig.mediaUrls) ? storedConfig.mediaUrls : [];
+          setCloudConfigMediaUrls(savedMediaUrls);
           const deviceId = cloudService.getDeviceId();
           const deviceToken = await AsyncStorage.getItem('@signage_device_token') || '';
           const withDeviceAccess = (value: string, includeToken = false) =>

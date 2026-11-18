@@ -1,5 +1,5 @@
 import React from "react";
-import { Text, View } from "react-native";
+import { Text, View, useWindowDimensions } from "react-native";
 import Video, { BufferingStrategyType } from "react-native-video";
 import { WebView } from "react-native-webview";
 import SlideRenderer from "./SlideRenderer";
@@ -9,6 +9,36 @@ import WeatherWidget from "./WeatherWidget";
 import EmergencyAlertWidget from "./EmergencyAlertWidget";
 
 const GRID_GAP = 0;
+
+function getRotationDegrees(value: any) {
+  const legacy: Record<string, number> = { horizontal: 0, vertical: 90, "reverse-horizontal": 180, "reverse-vertical": 270 };
+  const parsed = typeof value === "number" ? value : Number(value);
+  const degrees = Number.isFinite(parsed) ? parsed : legacy[String(value)] ?? 0;
+  return ((Math.round(degrees / 90) * 90) % 360 + 360) % 360;
+}
+
+function CloudRotationFrame({ config, backgroundColor, children }: any) {
+  const { width, height } = useWindowDimensions();
+  const rotation = getRotationDegrees(config?.orientation);
+  const quarterTurn = rotation === 90 || rotation === 270;
+  const frameWidth = quarterTurn ? height : width;
+  const frameHeight = quarterTurn ? width : height;
+  return (
+    <View style={{ flex: 1, backgroundColor: "#000000", overflow: "hidden" }}>
+      <View style={{
+        width: frameWidth,
+        height: frameHeight,
+        position: "absolute",
+        top: (height - frameHeight) / 2,
+        left: (width - frameWidth) / 2,
+        transform: [{ rotate: `${rotation}deg` }],
+        backgroundColor: backgroundColor || "#000000",
+      }}>
+        {children}
+      </View>
+    </View>
+  );
+}
 
 function parseRatio(value: any, count: number): number[] {
   const parts = String(value || "")
@@ -369,19 +399,19 @@ export default function CloudPlayerScreen({
     
     if (fallbackMode === "media" && fallbackMediaUrl) {
       return (
-        <View style={{ flex: 1, backgroundColor: fallbackBgColor }}>
+        <CloudRotationFrame config={config} backgroundColor={fallbackBgColor}>
           <Video
             source={{ uri: fallbackMediaUrl }}
             style={{ flex: 1 }}
             resizeMode="cover"
             repeat
           />
-        </View>
+        </CloudRotationFrame>
       );
     }
     
     return (
-      <View style={{ flex: 1, backgroundColor: fallbackBgColor }} />
+      <CloudRotationFrame config={config} backgroundColor={fallbackBgColor} />
     );
   }
 
@@ -390,7 +420,7 @@ export default function CloudPlayerScreen({
   const layout = config?.layout || "fullscreen";
 
   return (
-    <View style={{ flex: 1, backgroundColor: config?.bgColor || "#000000" }}>
+    <CloudRotationFrame config={config} backgroundColor={config?.bgColor}>
       {ticker && config.ticker?.position === "top" ? ticker : null}
       <View style={{ flex: 1 }}>
         {layout === "fullscreen" && (
@@ -427,6 +457,6 @@ export default function CloudPlayerScreen({
         }}
         onClear={onClearEmergencyAlert || (() => {})}
       />
-    </View>
+    </CloudRotationFrame>
   );
 }

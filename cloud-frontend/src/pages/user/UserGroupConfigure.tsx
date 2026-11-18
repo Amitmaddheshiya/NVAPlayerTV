@@ -6,6 +6,8 @@ import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Select } from '../../components/ui/Select';
 import { LayoutGrid } from '../../components/LayoutGrid';
+import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
+import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
 import { LibraryModal } from '../../components/LibraryModal';
 import { ArrowLeft, Save, Monitor, Layers, Settings } from 'lucide-react';
 
@@ -18,10 +20,11 @@ export const UserGroupConfigure = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [config, setConfig] = useState({
-    orientation: 'horizontal',
+    orientation: 0,
     layout: 'fullscreen',
     grid2Layout: 'horizontal',
     grid3Layout: 'stack-v',
+    gridRatio: '1:1:1',
     slideDuration: 5,
     animation: 'slide',
     bgColor: '#000000',
@@ -42,10 +45,11 @@ export const UserGroupConfigure = () => {
   const [currentSectionIndex, setCurrentSectionIndex] = useState<number | null>(null);
 
   const defaultConfig = {
-    orientation: 'horizontal',
+    orientation: 0,
     layout: 'fullscreen',
     grid2Layout: 'horizontal',
     grid3Layout: 'stack-v',
+    gridRatio: '1:1:1',
     slideDuration: 5,
     animation: 'slide',
     bgColor: '#000000',
@@ -69,9 +73,15 @@ export const UserGroupConfigure = () => {
       setSaving(true);
       try {
         const response = await groupAPI.configureGroup(groupId, defaultConfig);
-        if (!response.data?.success) throw new Error(response.data?.message || 'Group configuration was not applied');
-        setConfig(defaultConfig);
-        alert('Configuration cleared successfully for all devices in the group');
+        if (!response.data?.success) {
+          const result = response.data || {};
+          if (!result.partial && !(result.failedDeviceIds || []).length) throw new Error(result.message || 'Group configuration was not applied');
+          if ((result.appliedDeviceIds || []).length) setConfig(defaultConfig);
+          alert(`${result.message || 'Configuration was only partially applied.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`);
+        } else {
+          setConfig(defaultConfig);
+          alert('Clear configuration saved for the group. Each device cache/apply status will update below.');
+        }
       } catch (error) {
         console.error('Clear config error:', error);
         alert((error as any)?.response?.data?.message || (error as any)?.message || 'Failed to clear configuration');
@@ -88,6 +98,31 @@ export const UserGroupConfigure = () => {
       loadMedia();
     }
   }, [groupId]);
+
+  useEffect(() => {
+    const deviceIds: string[] = Array.isArray(group?.devices) ? group.devices.map((id: string) => String(id)) : [];
+    if (!deviceIds.length) return;
+    let active = true;
+    const refreshDeviceSync = async () => {
+      const results = await Promise.allSettled(deviceIds.map((id) => deviceAPI.getDevice(id)));
+      if (!active) return;
+      const latestById = new Map<string, any>();
+      results.forEach((result) => {
+        if (result.status === 'fulfilled') latestById.set(String(result.value.data?.deviceId), result.value.data);
+      });
+      if (!latestById.size) return;
+      setDevices((previous) => previous.map((device) => {
+        const latest = latestById.get(String(device.deviceId));
+        return latest ? { ...device, status: latest.status, lastSeen: latest.lastSeen, health: latest.health } : device;
+      }));
+    };
+    void refreshDeviceSync();
+    const timer = window.setInterval(refreshDeviceSync, 10_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [group?.devices?.join('|')]);
 
   // Ensure sections are properly initialized when layout changes
   useEffect(() => {
@@ -125,7 +160,33 @@ export const UserGroupConfigure = () => {
       if (firstDeviceId) {
         const deviceResponse = await deviceAPI.getDevice(firstDeviceId);
         if (deviceResponse.data?.config) {
-          setConfig((current) => ({ ...current, ...deviceResponse.data.config }));
+          const loadedConfig = deviceResponse.data.config;
+          const loadedSections = Array.isArray(loadedConfig.sections) && loadedConfig.sections.length
+            ? loadedConfig.sections
+            : [
+                {
+                  id: 1,
+                  contentType: 'multimedia',
+                  mediaUrls: loadedConfig.mediaUrls || [],
+                  webUrl: '',
+                  youtubeUrl: '',
+                  slideDuration: loadedConfig.slideDuration || 5,
+                },
+              ];
+          setConfig((current) => ({
+            ...current,
+            ...loadedConfig,
+            sections: loadedSections,
+            ticker: { ...current.ticker, ...(loadedConfig.ticker || {}) },
+            widgets: {
+              ...current.widgets,
+              ...(loadedConfig.widgets || {}),
+              clock: { ...current.widgets.clock, ...(loadedConfig.widgets?.clock || {}) },
+              weather: { ...current.widgets.weather, ...(loadedConfig.widgets?.weather || {}) },
+              emergencyAlert: { ...current.widgets.emergencyAlert, ...(loadedConfig.widgets?.emergencyAlert || {}) },
+            },
+            cache: { ...current.cache, ...(loadedConfig.cache || {}) },
+          }));
         }
       }
     } catch (error) {
@@ -207,14 +268,22 @@ export const UserGroupConfigure = () => {
       
       const configToSave = {
         ...config,
+        orientation: normalizeCloudOrientation(config.orientation),
+        gridRatio: normalizeCloudGridRatio(config.layout, config.grid3Layout, config.gridRatio),
+        ticker: { ...config.ticker, fontSize: Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24)) },
         sections: sectionsWithAbsoluteUrls,
       };
       
       // Apply config to all devices in the group
       const response = await groupAPI.configureGroup(groupId, configToSave);
-      if (!response.data?.success) throw new Error(response.data?.message || 'Group configuration was not applied');
+      if (!response.data?.success) {
+        const result = response.data || {};
+        if (!result.partial && !(result.failedDeviceIds || []).length) throw new Error(result.message || 'Group configuration was not applied');
+        alert(`${result.message || 'Configuration was only partially saved.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`);
+        return;
+      }
 
-      alert('Configuration saved and applied to all devices in the group');
+      alert('Configuration saved for all group devices. Each device cache/apply status will update below.');
     } catch (error) {
       console.error('Save config error:', error);
       const result = (error as any)?.response?.data;
@@ -266,6 +335,25 @@ export const UserGroupConfigure = () => {
   }
 
   const groupDevices = devices.filter((d) => group?.devices.includes(d.deviceId));
+  const syncedDevices = groupDevices.filter((device) => device.health?.cloudSync);
+  const expectedPlacements = (device: any) => (Array.isArray(device.config?.sections)
+    ? device.config.sections.reduce((count: number, section: any) =>
+        count + (section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls.length : 0), 0)
+    : Array.isArray((device.config as any)?.mediaUrls) ? (device.config as any).mediaUrls.length : 0);
+  const syncTotals = groupDevices.reduce((totals, device) => ({
+    cached: totals.cached + Number(device.health?.cloudSync?.mediaCached || 0),
+    total: totals.total + Number(device.health?.cloudSync?.mediaTotal ?? expectedPlacements(device)),
+  }), { cached: 0, total: 0 });
+  const readyDeviceCount = groupDevices.filter((device) => {
+    const sync = device.health?.cloudSync;
+    return sync?.status === 'ready' && sync.mediaCached === sync.mediaTotal;
+  }).length;
+  const syncState = syncedDevices.some((device) => device.health?.cloudSync?.status === 'failed')
+    ? 'failed'
+    : groupDevices.length > 0 && readyDeviceCount === groupDevices.length
+    ? 'ready'
+    : 'pending';
+  const tickerFontSize = Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24));
   const sectionCount = getSectionCount();
 
   return (
@@ -299,6 +387,41 @@ export const UserGroupConfigure = () => {
         </div>
       </header>
 
+      {groupDevices.length > 0 && (
+        <div className="max-w-[95vw] sm:max-w-[1200px] mx-auto px-2 sm:px-3 md:px-4 pt-2">
+          <div className={`rounded-md border px-3 py-2 text-xs ${
+            syncState === 'ready'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+              : syncState === 'failed'
+              ? 'border-rose-200 bg-rose-50 text-rose-800'
+              : 'border-amber-200 bg-amber-50 text-amber-800'
+          }`}>
+            <strong>Group TV sync</strong>
+            {groupDevices.length > 0 ? (
+              <>
+                <span className="ml-2">
+                  {syncState === 'ready' ? 'Applied and cached' : syncState === 'failed' ? 'Some devices need attention' : 'Sync in progress'}
+                  {' '}· cached {syncTotals.cached}/{syncTotals.total} file placements across {readyDeviceCount}/{groupDevices.length} devices
+                </span>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px]">
+                  {groupDevices.map((device) => {
+                    const sync = device.health?.cloudSync;
+                    return (
+                      <span key={device.deviceId}>
+                        {device.name}: {sync ? `v${sync.configVersion} ${sync.status} ${sync.mediaCached}/${sync.mediaTotal}` : 'waiting for first sync status'}
+                        {!sync && device.status !== 'online' ? ' (offline)' : ''}
+                      </span>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              <span className="ml-2">Waiting for TVs to report their saved configuration and cache status.</span>
+            )}
+          </div>
+        </div>
+      )}
+
       <main className="max-w-[95vw] sm:max-w-[1200px] mx-auto px-2 sm:px-3 md:px-4 py-2 sm:py-3 md:py-4">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 sm:gap-3 md:gap-4">
           {/* Left Column - Configuration */}
@@ -319,6 +442,13 @@ export const UserGroupConfigure = () => {
                   onSelectLayout={(layout) => setConfig({ ...config, layout })}
                   onSelectGrid2Layout={(grid2Layout) => setConfig({ ...config, grid2Layout })}
                   onSelectGrid3Layout={(grid3Layout) => setConfig({ ...config, grid3Layout })}
+                />
+                <CloudSectionRatioControl
+                  layout={config.layout}
+                  grid2Layout={config.grid2Layout}
+                  grid3Layout={config.grid3Layout}
+                  value={config.gridRatio}
+                  onChange={(gridRatio) => setConfig({ ...config, gridRatio })}
                 />
               </CardContent>
             </Card>
@@ -453,7 +583,7 @@ export const UserGroupConfigure = () => {
                   onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, text: e.target.value } })}
                   className="text-[10px] sm:text-xs"
                 />
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-3">
                   <div>
                     <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Text Color</label>
                     <Input
@@ -484,6 +614,19 @@ export const UserGroupConfigure = () => {
                     />
                   </div>
                   <div>
+                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Font Size</label>
+                    <div className="flex h-8 sm:h-10 items-center justify-between rounded-md border border-gray-300 bg-white">
+                      <button type="button" aria-label="Decrease ticker font size" disabled={tickerFontSize <= 10}
+                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.max(10, tickerFontSize - 2) } })}
+                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">−</button>
+                      <span className="min-w-10 text-center text-xs font-medium">{tickerFontSize}px</span>
+                      <button type="button" aria-label="Increase ticker font size" disabled={tickerFontSize >= 100}
+                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.min(100, tickerFontSize + 2) } })}
+                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">+</button>
+                    </div>
+                    <span className="text-[9px] text-gray-500">10–100 px</span>
+                  </div>
+                  <div>
                     <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Position</label>
                     <Select
                       options={[
@@ -502,6 +645,14 @@ export const UserGroupConfigure = () => {
 
           {/* Right Column - Devices & Info */}
           <div className="space-y-2 sm:space-y-3 md:space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Live TV Preview</CardTitle>
+              </CardHeader>
+              <CardContent className="p-1.5 sm:p-2">
+                <CloudOrientationPicker value={config.orientation} onChange={(orientation) => setConfig({ ...config, orientation })} config={config} mediaList={mediaList} />
+              </CardContent>
+            </Card>
             {/* Group Info */}
             <Card>
               <CardHeader>
@@ -550,6 +701,23 @@ export const UserGroupConfigure = () => {
                             {device.status}
                           </span>
                         </div>
+                        {device.health?.cloudSync && (
+                          <div className={`mt-1 text-[9px] sm:text-[10px] ${
+                            device.health.cloudSync.status === 'ready'
+                              ? 'text-emerald-700'
+                              : device.health.cloudSync.status === 'failed'
+                              ? 'text-rose-700'
+                              : 'text-amber-700'
+                          }`}>
+                            v{device.health.cloudSync.configVersion} · {device.health.cloudSync.status} · cache {device.health.cloudSync.mediaCached}/{device.health.cloudSync.mediaTotal}
+                            {device.health.cloudSync.status === 'failed' && device.health.cloudSync.message
+                              ? ` · ${device.health.cloudSync.message}`
+                              : ''}
+                            {device.status !== 'online' && device.health.cloudSync.status !== 'ready'
+                              ? ' · waiting for device to reconnect'
+                              : ''}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>

@@ -57,6 +57,8 @@ import {
   getActiveMediaCachePaths,
   clearMediaCache,
   prefetchMediaItems,
+  verifyCachedMediaItems,
+  setCloudConfigMediaUrls,
   syncMedia,
 } from "../services/mediaService";
 import { DEFAULT_TEST_CLOUD_API_URL } from "../services/cloudRuntimeConfig";
@@ -247,6 +249,17 @@ function decorateCloudConfigForPlayback(source: any, deviceId: string, deviceTok
         })
       : source?.sections,
   };
+}
+
+function getCloudConfigMediaUrls(source: any): string[] {
+  if (Array.isArray(source?.sections)) {
+    return source.sections.flatMap((section: any) =>
+      section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls)
+        ? section.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean)
+        : []
+    );
+  }
+  return Array.isArray(source?.mediaUrls) ? source.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean) : [];
 }
 
 const PRESERVED_ASYNC_KEYS = new Set([
@@ -503,6 +516,19 @@ export default function App() {
           [CLOUD_PENDING_CONFIG_KEY, JSON.stringify(sourceConfig)],
           [CLOUD_PENDING_VERSION_KEY, String(incomingVersion)],
         ]);
+        const previousAppliedConfig = await AsyncStorage.getItem(CLOUD_APPLIED_CONFIG_KEY);
+        let previousSourceConfig: any = null;
+        try {
+          previousSourceConfig = previousAppliedConfig ? JSON.parse(previousAppliedConfig) : null;
+        } catch {
+          previousSourceConfig = null;
+        }
+        // Keep the old offline set until the replacement set is verified. Also
+        // protect the new staged URLs while their downloads are in progress.
+        setCloudConfigMediaUrls([
+          ...getCloudConfigMediaUrls(previousSourceConfig),
+          ...getCloudConfigMediaUrls(sourceConfig),
+        ]);
         await reportCloudConfigSync({
           configVersion: incomingVersion,
           status: 'pending',
@@ -510,7 +536,13 @@ export default function App() {
           mediaCached: 0,
           message: 'Downloading the saved playlist to the device',
         });
-        const cacheResult = await prefetchMediaItems(mediaItems, async (progress) => {
+        // Start playback from the authenticated stream immediately. The last
+        // applied snapshot remains durable until the full cache is verified.
+        // This avoids a ticker-only gap while a larger video downloads.
+        setPlaybackOverride('cloud-config', mediaItems);
+        setConfig(config);
+        setMediaVersion((version) => version + 1);
+        const downloadResult = await prefetchMediaItems(mediaItems, async (progress) => {
           const completed = progress.cached + progress.failed;
           if (completed % 5 === 0 || completed === progress.total) {
             await reportCloudConfigSync({
@@ -522,14 +554,54 @@ export default function App() {
             });
           }
         });
+        // A successful HTTP transfer is not enough to call the TV offline-ready.
+        // Recheck every placement against its expected size/hash in the manifest.
+        const cacheResult = await verifyCachedMediaItems(mediaItems);
+        if (downloadResult.failed > 0 && cacheResult.failed === 0) {
+          console.warn('Cloud download reported failures but all assets passed final cache verification');
+        }
         if (cacheResult.failed > 0) {
+          if (previousSourceConfig) {
+            try {
+              const previousToken = await AsyncStorage.getItem('@signage_device_token') || '';
+              const previousConfig = decorateCloudConfigForPlayback(previousSourceConfig, deviceId, previousToken);
+              const previousMediaItems: any[] = [];
+              (Array.isArray(previousConfig.sections) ? previousConfig.sections : []).forEach((section: any, index: number) => {
+                if (section?.contentType !== 'multimedia' || !Array.isArray(section.mediaUrls)) return;
+                section.mediaUrls.forEach((url: string, urlIndex: number) => {
+                  const metadata = Array.isArray(section.mediaItems)
+                    ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+                    : null;
+                  previousMediaItems.push({
+                    ...metadata,
+                    url,
+                    remoteUrl: metadata?.streamUrl || url,
+                    name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
+                    originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
+                    type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
+                    size: Number(metadata?.size || 0),
+                    section: index + 1,
+                  });
+                });
+              });
+              setPlaybackOverride('cloud-config', previousMediaItems);
+              setConfig(previousConfig);
+              setCloudConfigMediaUrls(getCloudConfigMediaUrls(previousSourceConfig));
+              setMediaVersion((version) => version + 1);
+            } catch (restoreError) {
+              console.warn('Could not restore the last applied Cloud config:', restoreError);
+            }
+          }
           await reportCloudConfigSync({
             configVersion: incomingVersion,
             status: 'failed',
             mediaTotal: cacheResult.total,
             mediaCached: cacheResult.cached,
-            message: `${cacheResult.failed} media file(s) could not be cached; the previous playlist remains active`,
+            message: previousSourceConfig
+              ? `${cacheResult.failed} media file(s) could not be cached; the previous playlist remains active`
+              : `${cacheResult.failed} media file(s) could not be cached; streamed playback remains active while sync retries`,
           });
+          if (!previousSourceConfig) setCloudConfigMediaUrls(getCloudConfigMediaUrls(sourceConfig));
           return;
         }
         const latestVersion = Number(await AsyncStorage.getItem('@cloud_config_version') || incomingVersion);
@@ -539,6 +611,7 @@ export default function App() {
         // no media, so an empty selection clears the previous playlist.
         console.log(`Applying cloud config v${incomingVersion || 'legacy'} with ${mediaItems.length} cached media items`);
         setPlaybackOverride('cloud-config', mediaItems);
+        setCloudConfigMediaUrls(getCloudConfigMediaUrls(sourceConfig));
         if (mediaItems.length === 0) {
           // An explicit Cloud Clear must unmount any currently-playing native
           // media before the old cache is removed. Otherwise fullscreen can
@@ -575,9 +648,6 @@ export default function App() {
           await AsyncStorage.multiRemove([CLOUD_PENDING_CONFIG_KEY, CLOUD_PENDING_VERSION_KEY]);
         }
 
-        setConfig(config);
-        // Trigger media sync when config changes
-        setMediaVersion(prev => prev + 1);
         // Also trigger source refresh to force player to reload media
         sourceManagerRef.current?.onCmsUpdate();
         }).catch((error) => {
@@ -1937,7 +2007,9 @@ export default function App() {
   }, [licenseReady, licensed]);
 
   useEffect(() => {
-    if (!bootReady || !licenseReady || !licensed) return;
+    // Cloud mode has its own device activation and local config snapshot; it
+    // must initialize offline playback even when this APK has no LAN license.
+    if (!bootReady || !licenseReady || (!licensed && appMode !== 'cloudMode')) return;
     let isMounted = true;
     let watchdogTimer: ReturnType<typeof setInterval> | null = null;
     let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -2530,6 +2602,7 @@ export default function App() {
               const deviceId = cloudService.getDeviceId();
               const streamToken = await AsyncStorage.getItem('@signage_device_token') || '';
               const activeCloudConfig = decorateCloudConfigForPlayback(cloudConfig, deviceId, streamToken);
+              setCloudConfigMediaUrls(getCloudConfigMediaUrls(cloudConfig));
               setConfig(activeCloudConfig);
               setSectionPlaybackTimeline(normalizePlaybackTimeline(cloudConfig?.playbackTimeline));
               lastConfigSyncAtRef.current = new Date().toISOString();
@@ -3029,7 +3102,7 @@ export default function App() {
       }
       socketUrlRef.current = "";
     };
-  }, [bootReady, licenseReady, licensed]);
+  }, [bootReady, licenseReady, licensed, appMode]);
 
   useEffect(() => {
     if (!config) return;

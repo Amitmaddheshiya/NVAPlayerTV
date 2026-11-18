@@ -249,13 +249,15 @@ export const UserLibrary = () => {
       showConfirm: true,
       onConfirm: async () => {
         try {
-          await mediaAPI.deleteMedia(id);
+          const response = await mediaAPI.deleteMedia(id);
           loadMedia();
           loadStorageInfo();
           setAlertState({
             isOpen: true,
             title: 'Success',
-            message: 'File deleted successfully',
+            message: response.data?.archived
+              ? `${response.data.message}. Existing device configurations and TV caches are unchanged.`
+              : 'File deleted successfully',
             type: 'success',
           });
         } catch (error) {
@@ -301,16 +303,21 @@ export const UserLibrary = () => {
       showConfirm: true,
       onConfirm: async () => {
         try {
+          let retained = 0;
           for (const id of selectedFilesForDelete) {
-            await mediaAPI.deleteMedia(id);
+            const response = await mediaAPI.deleteMedia(id);
+            if (response.data?.archived) retained += 1;
           }
+          const selectedCount = selectedFilesForDelete.size;
           setSelectedFilesForDelete(new Set());
           loadMedia();
           loadStorageInfo();
           setAlertState({
             isOpen: true,
             title: 'Success',
-            message: `${selectedFilesForDelete.size} file(s) deleted successfully`,
+            message: retained
+              ? `${selectedCount} file(s) removed from the library; ${retained} file(s) remain stored for saved TV configurations.`
+              : `${selectedCount} file(s) deleted successfully`,
             type: 'success',
           });
         } catch (error) {

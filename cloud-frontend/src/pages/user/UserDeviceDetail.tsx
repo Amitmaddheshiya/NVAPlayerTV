@@ -6,6 +6,8 @@ import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Select } from '../../components/ui/Select';
 import { LayoutGrid } from '../../components/LayoutGrid';
+import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
+import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
 import { LibraryModal } from '../../components/LibraryModal';
 import { ArrowLeft, Settings, Save, CheckCircle2, XCircle, AlertTriangle, Info, X } from 'lucide-react';
 
@@ -26,10 +28,11 @@ export const UserDeviceDetail = () => {
   const [mediaList, setMediaList] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [config, setConfig] = useState({
-    orientation: 'horizontal',
+    orientation: 0,
     layout: 'fullscreen',
     grid2Layout: 'horizontal',
     grid3Layout: 'stack-v',
+    gridRatio: '1:1:1',
     slideDuration: 5,
     animation: 'slide',
     bgColor: '#000000',
@@ -53,10 +56,11 @@ export const UserDeviceDetail = () => {
   const navigate = useNavigate();
 
   const defaultConfig = {
-    orientation: 'horizontal',
+    orientation: 0,
     layout: 'fullscreen',
     grid2Layout: 'horizontal',
     grid3Layout: 'stack-v',
+    gridRatio: '1:1:1',
     slideDuration: 5,
     animation: 'slide',
     bgColor: '#000000',
@@ -262,6 +266,9 @@ export const UserDeviceDetail = () => {
       
       const configToSave = {
         ...config,
+        orientation: normalizeCloudOrientation(config.orientation),
+        gridRatio: normalizeCloudGridRatio(config.layout, config.grid3Layout, config.gridRatio),
+        ticker: { ...config.ticker, fontSize: Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24)) },
         sections: sectionsWithAbsoluteUrls,
       };
       
@@ -330,6 +337,9 @@ export const UserDeviceDetail = () => {
   }
 
   const sectionCount = getSectionCount();
+  const tickerFontSize = Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24));
+  const cloudSync = device.health?.cloudSync;
+  const cloudSyncReady = cloudSync?.status === 'ready' && cloudSync.mediaCached === cloudSync.mediaTotal;
   const dialogAppearance = dialog?.type === 'success'
     ? { Icon: CheckCircle2, iconClass: 'text-emerald-600 bg-emerald-50', titleClass: 'text-emerald-900', buttonClass: 'bg-emerald-600 hover:bg-emerald-700' }
     : dialog?.type === 'error'
@@ -372,7 +382,7 @@ export const UserDeviceDetail = () => {
       {device.health?.cloudSync && (
         <div className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 pt-2">
           <div className={`rounded-md border px-3 py-2 text-xs ${
-            device.health.cloudSync.status === 'ready'
+            cloudSyncReady
               ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
               : device.health.cloudSync.status === 'failed'
               ? 'border-rose-200 bg-rose-50 text-rose-800'
@@ -380,13 +390,13 @@ export const UserDeviceDetail = () => {
           }`}>
             <strong>TV sync · v{device.health.cloudSync.configVersion}</strong>
             <span className="ml-2">
-              {device.health.cloudSync.status === 'ready'
+              {cloudSyncReady
                 ? `Applied and cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files`
                 : device.health.cloudSync.status === 'failed'
                 ? device.health.cloudSync.message || `Cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files; previous playlist is still active`
                 : `Pending · cached ${device.health.cloudSync.mediaCached}/${device.health.cloudSync.mediaTotal} files`}
             </span>
-            {device.status !== 'online' && device.health.cloudSync.status !== 'ready' && (
+            {device.status !== 'online' && !cloudSyncReady && (
               <span className="ml-2">TV is offline; it will sync when it reconnects.</span>
             )}
           </div>
@@ -413,6 +423,13 @@ export const UserDeviceDetail = () => {
                   onSelectLayout={(layout) => setConfig({ ...config, layout })}
                   onSelectGrid2Layout={(grid2Layout) => setConfig({ ...config, grid2Layout })}
                   onSelectGrid3Layout={(grid3Layout) => setConfig({ ...config, grid3Layout })}
+                />
+                <CloudSectionRatioControl
+                  layout={config.layout}
+                  grid2Layout={config.grid2Layout}
+                  grid3Layout={config.grid3Layout}
+                  value={config.gridRatio}
+                  onChange={(gridRatio) => setConfig({ ...config, gridRatio })}
                 />
               </CardContent>
             </Card>
@@ -547,7 +564,7 @@ export const UserDeviceDetail = () => {
                   onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, text: e.target.value } })}
                   className="text-[10px] sm:text-xs"
                 />
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-3">
                   <div>
                     <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Text Color</label>
                     <Input
@@ -578,6 +595,19 @@ export const UserDeviceDetail = () => {
                     />
                   </div>
                   <div>
+                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Font Size</label>
+                    <div className="flex h-8 sm:h-10 items-center justify-between rounded-md border border-gray-300 bg-white">
+                      <button type="button" aria-label="Decrease ticker font size" disabled={tickerFontSize <= 10}
+                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.max(10, tickerFontSize - 2) } })}
+                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">−</button>
+                      <span className="min-w-10 text-center text-xs font-medium">{tickerFontSize}px</span>
+                      <button type="button" aria-label="Increase ticker font size" disabled={tickerFontSize >= 100}
+                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.min(100, tickerFontSize + 2) } })}
+                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">+</button>
+                    </div>
+                    <span className="text-[9px] text-gray-500">10–100 px</span>
+                  </div>
+                  <div>
                     <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Position</label>
                     <Select
                       options={[
@@ -595,6 +625,14 @@ export const UserDeviceDetail = () => {
 
           {/* Right Column - Device Info */}
           <div className="space-y-2 sm:space-y-3">
+            <Card>
+              <CardHeader className="p-3 sm:p-4">
+                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Live TV Preview</CardTitle>
+              </CardHeader>
+              <CardContent className="p-1.5 sm:p-2">
+                <CloudOrientationPicker value={config.orientation} onChange={(orientation) => setConfig({ ...config, orientation })} config={config} mediaList={mediaList} />
+              </CardContent>
+            </Card>
             {/* Device Info */}
             <Card>
               <CardHeader className="p-3 sm:p-4">

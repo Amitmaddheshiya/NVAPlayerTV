@@ -252,7 +252,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       .filter((path: string | null): path is string => !!path);
     const uniqueMediaPaths = [...new Set(mediaPaths)];
     const mediaDocs = uniqueMediaPaths.length
-      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size updatedAt createdAt uploadedBy').lean()
+      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size hash updatedAt createdAt uploadedBy').lean()
       : [];
     if (mediaDocs.length !== uniqueMediaPaths.length) {
       res.status(400).json({ error: 'Configuration contains a media file that no longer exists' });
@@ -280,6 +280,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
                 originalName: media.originalName,
                 type: media.mimeType,
                 size: Number(media.size || 0),
+                hash: media.hash,
                 mtimeMs: Number(media.updatedAt?.getTime?.() || media.createdAt?.getTime?.() || 0),
               } : { url };
             });
@@ -326,6 +327,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       };
       device.cacheInfo.configVersion += 1;
       device.cacheInfo.lastSyncTime = new Date();
+      const configVersion = device.cacheInfo.configVersion;
 
       // Update cached media tracking
       const cachedMediaArray: any[] = [];
@@ -346,6 +348,15 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
         });
       }
       device.cacheInfo.cachedMedia = cachedMediaArray;
+      device.cacheInfo.totalCacheSize = 0;
+      device.set('health.cloudSync', {
+        configVersion,
+        status: 'pending',
+        mediaTotal: mediaPaths.length,
+        mediaCached: 0,
+        message: 'Waiting for device to download and apply this group configuration',
+        updatedAt: new Date(),
+      });
 
       await device.save();
 

@@ -12,6 +12,8 @@ type Props = {
   isVideo: boolean;
   isPdf: boolean;
   isText: boolean;
+  cloudMode: boolean;
+  cloudImageUri: string;
   mediaRotateLayerStyle: any;
   styles: any;
   videoFade: Animated.Value;
@@ -52,6 +54,8 @@ type Props = {
   onPdfError: () => void;
   onImageLoadEnd: (slot: "a" | "b", uri?: string) => void;
   onImageLoadError: (slot: "a" | "b", uri: string) => void;
+  onCloudImageLoad: (uri: string) => void;
+  onCloudImageError: (uri: string) => void;
 };
 
 export default function SlideRendererMediaStage(props: Props) {
@@ -64,6 +68,8 @@ export default function SlideRendererMediaStage(props: Props) {
     isVideo,
     isPdf,
     isText,
+    cloudMode,
+    cloudImageUri,
     mediaRotateLayerStyle,
     styles,
     videoFade,
@@ -104,6 +110,8 @@ export default function SlideRendererMediaStage(props: Props) {
     onPdfError,
     onImageLoadEnd,
     onImageLoadError,
+    onCloudImageLoad,
+    onCloudImageError,
   } = props;
 
   if (showProcessingOverlay) {
@@ -219,6 +227,25 @@ export default function SlideRendererMediaStage(props: Props) {
             {textContent || "No text content"}
           </Text>
         </ScrollView>
+      </View>
+    );
+  }
+
+  // Cloud images use one keyed source per playlist index. The two-slot
+  // preloader is retained for LAN transitions, but on TV it could keep an old
+  // image visible after a fast all-image playlist changed cache/local URIs.
+  if (cloudMode && cloudImageUri) {
+    return (
+      <View style={mediaRotateLayerStyle}>
+        <Image
+          key={`cloud-image-${cloudImageUri}`}
+          source={{ uri: cloudImageUri }}
+          style={styles.media}
+          resizeMode={mediaResizeMode}
+          fadeDuration={0}
+          onLoad={() => onCloudImageLoad(cloudImageUri)}
+          onError={() => onCloudImageError(cloudImageUri)}
+        />
       </View>
     );
   }
