@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { deviceAPI, groupAPI, mediaAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
@@ -9,7 +9,9 @@ import { LayoutGrid } from '../../components/LayoutGrid';
 import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
 import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
 import { LibraryModal } from '../../components/LibraryModal';
-import { ArrowLeft, Save, Monitor, Layers, Settings } from 'lucide-react';
+import { Alert } from '../../components/ui/Alert';
+import { ArrowLeft, Save, Monitor, Layers, Settings, History, RotateCcw } from 'lucide-react';
+import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
 
 export const UserGroupConfigure = () => {
   const { groupId } = useParams<{ groupId: string }>();
@@ -19,6 +21,13 @@ export const UserGroupConfigure = () => {
   const [mediaList, setMediaList] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [configHistory, setConfigHistory] = useState<any[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [retryingDevices, setRetryingDevices] = useState<string[]>([]);
+  const [dialog, setDialog] = useState<{ isOpen: boolean; title: string; message: string; type: 'success' | 'error' | 'warning' | 'info'; showConfirm: boolean; confirmText: string }>({
+    isOpen: false, title: '', message: '', type: 'info', showConfirm: false, confirmText: 'Confirm',
+  });
+  const confirmationResolver = useRef<((confirmed: boolean) => void) | null>(null);
   const [config, setConfig] = useState({
     orientation: 0,
     layout: 'fullscreen',
@@ -43,6 +52,22 @@ export const UserGroupConfigure = () => {
   });
   const [libraryModalOpen, setLibraryModalOpen] = useState(false);
   const [currentSectionIndex, setCurrentSectionIndex] = useState<number | null>(null);
+
+  const showNotice = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info', title?: string) => {
+    setDialog({ isOpen: true, title: title || (type === 'error' ? 'Error' : type === 'success' ? 'Success' : 'Notice'), message, type, showConfirm: false, confirmText: 'Confirm' });
+  };
+
+  const askConfirmation = (message: string, title = 'Please confirm') => new Promise<boolean>((resolve) => {
+    confirmationResolver.current = resolve;
+    setDialog({ isOpen: true, title, message, type: 'warning', showConfirm: true, confirmText: 'Continue' });
+  });
+
+  const closeDialog = (confirmed = false) => {
+    setDialog((current) => ({ ...current, isOpen: false }));
+    const resolve = confirmationResolver.current;
+    confirmationResolver.current = null;
+    resolve?.(confirmed);
+  };
 
   const defaultConfig = {
     orientation: 0,
@@ -69,7 +94,7 @@ export const UserGroupConfigure = () => {
 
   const handleClearConfig = async () => {
     if (!groupId) return;
-    if (confirm('Are you sure you want to clear all configuration? This will remove all files and settings from all devices in the group.')) {
+    if (await askConfirmation('Are you sure you want to clear all configuration? This will remove all files and settings from all devices in the group.', 'Clear group configuration')) {
       setSaving(true);
       try {
         const response = await groupAPI.configureGroup(groupId, defaultConfig);
@@ -77,14 +102,14 @@ export const UserGroupConfigure = () => {
           const result = response.data || {};
           if (!result.partial && !(result.failedDeviceIds || []).length) throw new Error(result.message || 'Group configuration was not applied');
           if ((result.appliedDeviceIds || []).length) setConfig(defaultConfig);
-          alert(`${result.message || 'Configuration was only partially applied.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`);
+          showNotice(`${result.message || 'Configuration was only partially applied.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`, 'warning');
         } else {
           setConfig(defaultConfig);
-          alert('Clear configuration saved for the group. Each device cache/apply status will update below.');
+          showNotice('Clear configuration saved for the group. Each device cache/apply status will update below.', 'success');
         }
       } catch (error) {
         console.error('Clear config error:', error);
-        alert((error as any)?.response?.data?.message || (error as any)?.message || 'Failed to clear configuration');
+        showNotice((error as any)?.response?.data?.message || (error as any)?.message || 'Failed to clear configuration', 'error');
       } finally {
         setSaving(false);
       }
@@ -113,7 +138,7 @@ export const UserGroupConfigure = () => {
       if (!latestById.size) return;
       setDevices((previous) => previous.map((device) => {
         const latest = latestById.get(String(device.deviceId));
-        return latest ? { ...device, status: latest.status, lastSeen: latest.lastSeen, health: latest.health } : device;
+        return latest ? { ...device, status: latest.status, lastSeen: latest.lastSeen, appVersion: latest.appVersion, storage: latest.storage, health: latest.health } : device;
       }));
     };
     void refreshDeviceSync();
@@ -157,37 +182,38 @@ export const UserGroupConfigure = () => {
       const groupData = groups.find((g: any) => g._id === groupId);
       setGroup(groupData);
       const firstDeviceId = groupData?.devices?.[0];
-      if (firstDeviceId) {
+      let loadedConfig = groupData?.config;
+      if (!loadedConfig && firstDeviceId) {
         const deviceResponse = await deviceAPI.getDevice(firstDeviceId);
-        if (deviceResponse.data?.config) {
-          const loadedConfig = deviceResponse.data.config;
-          const loadedSections = Array.isArray(loadedConfig.sections) && loadedConfig.sections.length
-            ? loadedConfig.sections
-            : [
-                {
-                  id: 1,
-                  contentType: 'multimedia',
-                  mediaUrls: loadedConfig.mediaUrls || [],
-                  webUrl: '',
-                  youtubeUrl: '',
-                  slideDuration: loadedConfig.slideDuration || 5,
-                },
-              ];
-          setConfig((current) => ({
-            ...current,
-            ...loadedConfig,
-            sections: loadedSections,
-            ticker: { ...current.ticker, ...(loadedConfig.ticker || {}) },
-            widgets: {
-              ...current.widgets,
-              ...(loadedConfig.widgets || {}),
-              clock: { ...current.widgets.clock, ...(loadedConfig.widgets?.clock || {}) },
-              weather: { ...current.widgets.weather, ...(loadedConfig.widgets?.weather || {}) },
-              emergencyAlert: { ...current.widgets.emergencyAlert, ...(loadedConfig.widgets?.emergencyAlert || {}) },
-            },
-            cache: { ...current.cache, ...(loadedConfig.cache || {}) },
-          }));
-        }
+        loadedConfig = deviceResponse.data?.config;
+      }
+      if (loadedConfig) {
+        const loadedSections = Array.isArray(loadedConfig.sections) && loadedConfig.sections.length
+          ? loadedConfig.sections
+          : [
+              {
+                id: 1,
+                contentType: 'multimedia',
+                mediaUrls: loadedConfig.mediaUrls || [],
+                webUrl: '',
+                youtubeUrl: '',
+                slideDuration: loadedConfig.slideDuration || 5,
+              },
+            ];
+        setConfig((current) => ({
+          ...current,
+          ...loadedConfig,
+          sections: loadedSections,
+          ticker: { ...current.ticker, ...(loadedConfig.ticker || {}) },
+          widgets: {
+            ...current.widgets,
+            ...(loadedConfig.widgets || {}),
+            clock: { ...current.widgets.clock, ...(loadedConfig.widgets?.clock || {}) },
+            weather: { ...current.widgets.weather, ...(loadedConfig.widgets?.weather || {}) },
+            emergencyAlert: { ...current.widgets.emergencyAlert, ...(loadedConfig.widgets?.emergencyAlert || {}) },
+          },
+          cache: { ...current.cache, ...(loadedConfig.cache || {}) },
+        }));
       }
     } catch (error) {
       console.error('Failed to load group:', error);
@@ -273,26 +299,89 @@ export const UserGroupConfigure = () => {
         ticker: { ...config.ticker, fontSize: Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24)) },
         sections: sectionsWithAbsoluteUrls,
       };
+
+      const currentGroupDevices = devices.filter((device) => group?.devices?.includes(device.deviceId));
+      const storageCheck = getInsufficientStorageDevices(configToSave, mediaList, currentGroupDevices);
+      if (storageCheck.insufficient.length) {
+        const limited = storageCheck.insufficient
+          .map((tv) => `${tv.name}: ${formatStorageBytes(tv.freeBytes)} free`)
+          .join('\n');
+        const proceed = await askConfirmation(
+          `Some TVs may not have enough free storage. This update needs about ${formatStorageBytes(storageCheck.requiredBytes)} per TV including safety space.\n${limited}\n\nThe previous cached playlist stays active if a TV cannot complete the download. Save this update anyway?`
+        );
+        if (!proceed) return;
+      } else if (storageCheck.bytes > 0 && (storageCheck.unknownFiles > 0 || storageCheck.unknownStorageDevices.length > 0)) {
+        const proceed = await askConfirmation(
+          `Free-storage data for ${storageCheck.unknownStorageDevices.length} TV(s) or ${storageCheck.unknownFiles} media file size(s) could not be confirmed. Each TV will check real free space before downloading and keep its old playlist if needed. Continue saving?`
+        );
+        if (!proceed) return;
+      }
       
       // Apply config to all devices in the group
       const response = await groupAPI.configureGroup(groupId, configToSave);
       if (!response.data?.success) {
         const result = response.data || {};
         if (!result.partial && !(result.failedDeviceIds || []).length) throw new Error(result.message || 'Group configuration was not applied');
-        alert(`${result.message || 'Configuration was only partially saved.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`);
+        showNotice(`${result.message || 'Configuration was only partially saved.'} Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`, 'warning');
         return;
       }
 
-      alert('Configuration saved for all group devices. Each device cache/apply status will update below.');
+      showNotice('Configuration saved for all group devices. Each device cache/apply status will update below.', 'success');
     } catch (error) {
       console.error('Save config error:', error);
       const result = (error as any)?.response?.data;
       const partialDetails = result?.partial
         ? ` Applied: ${(result.appliedDeviceIds || []).join(', ') || 'none'}. Failed: ${(result.failedDeviceIds || []).join(', ') || 'unknown'}.`
         : '';
-      alert(`${result?.message || (error as any)?.message || 'Failed to save configuration'}${partialDetails}`);
+      showNotice(`${result?.message || (error as any)?.message || 'Failed to save configuration'}${partialDetails}`, 'error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const openConfigHistory = async () => {
+    if (!groupId) return;
+    try {
+      const response = await groupAPI.getConfigHistory(groupId);
+      setConfigHistory(response.data?.entries || []);
+      setHistoryOpen(true);
+    } catch (error) {
+      showNotice((error as any)?.response?.data?.error || 'Could not load group configuration history.', 'error');
+    }
+  };
+
+  const rollbackGroupConfig = async (entry: any) => {
+    if (!groupId || !entry?.config) return;
+    if (!await askConfirmation('Restore this saved group configuration? Each TV will keep playing its current cache until the restored media is fully downloaded.', 'Restore configuration')) return;
+    const storageCheck = getInsufficientStorageDevices(entry.config, mediaList, devices.filter((device) => group?.devices?.includes(device.deviceId)));
+    if (storageCheck.insufficient.length && !await askConfirmation(
+      `This saved configuration may need about ${formatStorageBytes(storageCheck.requiredBytes)} including safety space. ${storageCheck.insufficient.length} TV(s) report less free storage. Restore anyway?`
+    )) return;
+    setSaving(true);
+    try {
+      const response = await groupAPI.configureGroup(groupId, entry.config);
+      if (!response.data?.success) throw new Error(response.data?.message || 'Group configuration restore failed');
+      setConfig((previous) => ({ ...previous, ...entry.config }));
+      setHistoryOpen(false);
+      showNotice('Previous configuration restored for the group. TV cache/apply status will update below.', 'success');
+    } catch (error) {
+      showNotice((error as any)?.response?.data?.message || (error as any)?.message || 'Could not restore group configuration.', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const retryDeviceSync = async (deviceId: string) => {
+    if (retryingDevices.includes(deviceId)) return;
+    setRetryingDevices((previous) => [...previous, deviceId]);
+    try {
+      await deviceAPI.retryCloudSync(deviceId);
+      const response = await deviceAPI.getDevice(deviceId);
+      setDevices((previous) => previous.map((device) => device.deviceId === deviceId ? { ...device, ...response.data } : device));
+    } catch (error) {
+      showNotice((error as any)?.response?.data?.error || (error as any)?.message || `Could not retry sync for ${deviceId}.`, 'error');
+    } finally {
+      setRetryingDevices((previous) => previous.filter((id) => id !== deviceId));
     }
   };
 
@@ -364,7 +453,7 @@ export const UserGroupConfigure = () => {
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
       <header className="bg-white border-b sticky top-0 z-10">
-        <div className="max-w-[95vw] sm:max-w-[1200px] mx-auto px-2 sm:px-3 md:px-4 py-2 sm:py-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+        <div className="max-w-[95vw] sm:max-w-[1200px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 md:px-4 xl:px-8 py-2 sm:py-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
           <div className="flex items-center gap-2 sm:gap-3">
             <Button variant="secondary" onClick={() => navigate('/user/groups')} className="text-[10px] sm:text-xs">
               <ArrowLeft className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
@@ -380,6 +469,9 @@ export const UserGroupConfigure = () => {
             <span className="px-1.5 sm:px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-medium bg-blue-100 text-blue-800">
               {groupDevices.length} Devices
             </span>
+            <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
+              <History className="mr-1 h-3 w-3" />History
+            </Button>
             <Button onClick={handleClearConfig} variant="secondary" className="text-[10px] sm:text-xs">
               Clear
             </Button>
@@ -392,7 +484,7 @@ export const UserGroupConfigure = () => {
       </header>
 
       {groupDevices.length > 0 && (
-        <div className="max-w-[95vw] sm:max-w-[1200px] mx-auto px-2 sm:px-3 md:px-4 pt-2">
+        <div className="max-w-[95vw] sm:max-w-[1200px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 md:px-4 xl:px-8 pt-2">
           <div className={`rounded-md border px-3 py-2 text-xs ${
             syncState === 'ready'
               ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
@@ -431,7 +523,7 @@ export const UserGroupConfigure = () => {
         </div>
       )}
 
-      <main className="max-w-[95vw] sm:max-w-[1200px] mx-auto px-2 sm:px-3 md:px-4 py-2 sm:py-3 md:py-4">
+      <main className="max-w-[95vw] sm:max-w-[1200px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 md:px-4 xl:px-8 py-2 sm:py-3 md:py-4">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 sm:gap-3 md:gap-4">
           {/* Left Column - Configuration */}
           <div className="lg:col-span-2 space-y-2 sm:space-y-3 md:space-y-4">
@@ -467,7 +559,7 @@ export const UserGroupConfigure = () => {
               <CardHeader>
                 <CardTitle className="text-[10px] sm:text-xs md:text-sm">Section Configuration</CardTitle>
               </CardHeader>
-              <CardContent className="space-y-2 sm:space-y-3 md:space-y-4">
+              <CardContent className={`space-y-2 sm:space-y-3 md:space-y-4 xl:grid xl:gap-3 xl:space-y-0 ${sectionCount === 3 ? 'xl:grid-cols-3' : sectionCount === 2 ? 'xl:grid-cols-2' : 'xl:grid-cols-1'}`}>
                 {Array.from({ length: sectionCount }).map((_, index) => {
                   const section = config.sections[index] || {
                     id: index + 1,
@@ -710,6 +802,9 @@ export const UserGroupConfigure = () => {
                             {device.status}
                           </span>
                         </div>
+                        <div className="mt-1 text-[9px] text-gray-500">
+                          APK {device.appVersion || 'unknown'} · Last seen {device.lastSeen ? new Date(device.lastSeen).toLocaleString() : 'unknown'}
+                        </div>
                         {device.health?.cloudSync && (
                           <div className={`mt-1 text-[9px] sm:text-[10px] ${
                             device.health.cloudSync.status === 'ready'
@@ -726,6 +821,17 @@ export const UserGroupConfigure = () => {
                               ? ' · waiting for device to reconnect'
                               : ''}
                           </div>
+                        )}
+                        {device.health?.cloudSync?.status === 'failed' && (
+                          <Button
+                            variant="secondary"
+                            disabled={retryingDevices.includes(device.deviceId)}
+                            onClick={() => void retryDeviceSync(device.deviceId)}
+                            className="mt-1 text-[9px] sm:text-[10px]"
+                          >
+                            <RotateCcw className="mr-1 h-3 w-3" />
+                            {retryingDevices.includes(device.deviceId) ? 'Retrying…' : 'Retry sync'}
+                          </Button>
                         )}
                       </div>
                     ))}
@@ -766,6 +872,43 @@ export const UserGroupConfigure = () => {
         }}
         selectedUrls={currentSectionIndex !== null ? config.sections[currentSectionIndex]?.mediaUrls || [] : []}
       />
+
+      <Alert
+        isOpen={dialog.isOpen}
+        onClose={() => closeDialog(false)}
+        title={dialog.title}
+        message={dialog.message}
+        type={dialog.type}
+        showConfirm={dialog.showConfirm}
+        confirmText={dialog.confirmText}
+        onConfirm={() => closeDialog(true)}
+      />
+
+      {historyOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/45 p-4">
+          <section role="dialog" aria-modal="true" className="w-full max-w-xl rounded-xl bg-white p-4 shadow-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-semibold">Group configuration history</h2>
+              <button type="button" onClick={() => setHistoryOpen(false)} aria-label="Close history">×</button>
+            </div>
+            {configHistory.length ? (
+              <div className="max-h-[60vh] space-y-2 overflow-y-auto">
+                {configHistory.map((entry) => (
+                  <div key={entry._id || entry.savedAt} className="flex items-center justify-between gap-3 rounded-lg border p-3">
+                    <div>
+                      <div className="text-sm font-medium">{entry.config?.layout || 'configuration'}</div>
+                      <div className="text-xs text-slate-500">{entry.savedAt ? new Date(entry.savedAt).toLocaleString() : 'Saved earlier'}</div>
+                    </div>
+                    <Button variant="secondary" disabled={saving} onClick={() => void rollbackGroupConfig(entry)} className="shrink-0 text-xs">
+                      <RotateCcw className="mr-1 h-3 w-3" />Restore
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="py-6 text-center text-sm text-slate-500">No group configuration history yet.</p>}
+          </section>
+        </div>
+      )}
     </div>
   );
 };

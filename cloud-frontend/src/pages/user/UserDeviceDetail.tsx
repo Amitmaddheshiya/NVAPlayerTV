@@ -9,7 +9,8 @@ import { LayoutGrid } from '../../components/LayoutGrid';
 import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
 import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
 import { LibraryModal } from '../../components/LibraryModal';
-import { ArrowLeft, Settings, Save, CheckCircle2, XCircle, AlertTriangle, Info, X } from 'lucide-react';
+import { ArrowLeft, Settings, Save, CheckCircle2, XCircle, AlertTriangle, Info, X, History, RotateCcw } from 'lucide-react';
+import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
 
 type DialogState = {
   type: 'success' | 'error' | 'warning' | 'info';
@@ -51,6 +52,9 @@ export const UserDeviceDetail = () => {
   });
   const [savingConfig, setSavingConfig] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  const [configHistory, setConfigHistory] = useState<any[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [retryingSync, setRetryingSync] = useState(false);
   const [libraryModalOpen, setLibraryModalOpen] = useState(false);
   const [currentSectionIndex, setCurrentSectionIndex] = useState<number | null>(null);
   const navigate = useNavigate();
@@ -127,6 +131,8 @@ export const UserDeviceDetail = () => {
           ...previous,
           status: latest.status,
           lastSeen: latest.lastSeen,
+          appVersion: latest.appVersion,
+          storage: latest.storage,
           cacheInfo: latest.cacheInfo,
           health: latest.health,
         } : latest);
@@ -271,6 +277,20 @@ export const UserDeviceDetail = () => {
         ticker: { ...config.ticker, fontSize: Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24)) },
         sections: sectionsWithAbsoluteUrls,
       };
+
+      const storageCheck = getInsufficientStorageDevices(configToSave, mediaList, [device]);
+      if (storageCheck.insufficient.length) {
+        const tv = storageCheck.insufficient[0];
+        const proceed = window.confirm(
+          `TV storage may be too low. ${tv.name} has about ${formatStorageBytes(tv.freeBytes)} free; this update needs about ${formatStorageBytes(storageCheck.requiredBytes)} including safety space. The old playlist will keep playing unless the new cache fully downloads. Save this update anyway?`
+        );
+        if (!proceed) return;
+      } else if (storageCheck.bytes > 0 && (storageCheck.unknownFiles > 0 || storageCheck.unknownStorageDevices.length > 0)) {
+        const proceed = window.confirm(
+          `TV free-storage data or ${storageCheck.unknownFiles} media file size(s) could not be confirmed yet. The TV will check real free space before downloading and keep the old playlist if there is not enough. Continue saving?`
+        );
+        if (!proceed) return;
+      }
       
       console.log('Saving config:', JSON.stringify(configToSave, null, 2));
       console.log('Section count:', sectionCount);
@@ -291,6 +311,50 @@ export const UserDeviceDetail = () => {
       });
     } finally {
       setSavingConfig(false);
+    }
+  };
+
+  const openConfigHistory = async () => {
+    try {
+      const response = await deviceAPI.getConfigHistory(deviceId!);
+      setConfigHistory(response.data?.entries || []);
+      setHistoryOpen(true);
+    } catch (error) {
+      setDialog({ type: 'error', title: 'History unavailable', message: getRequestErrorMessage(error, 'Could not load configuration history.') });
+    }
+  };
+
+  const rollbackConfig = async (entry: any) => {
+    if (!deviceId || !entry?.config) return;
+    if (!window.confirm('Restore this saved configuration? The TV will keep its current playlist until the restored media is fully cached.')) return;
+    const storageCheck = getInsufficientStorageDevices(entry.config, mediaList, [device]);
+    if (storageCheck.insufficient.length && !window.confirm(
+      `This saved configuration may need about ${formatStorageBytes(storageCheck.requiredBytes)} including safety space, but the TV reports ${formatStorageBytes(storageCheck.insufficient[0].freeBytes)} free. Restore anyway?`
+    )) return;
+    setSavingConfig(true);
+    try {
+      await deviceAPI.updateConfig(deviceId, entry.config);
+      setHistoryOpen(false);
+      await loadDevice();
+      setDialog({ type: 'success', title: 'Configuration restored', message: 'The previous settings were saved as a new version. TV playback switches after its cache is verified.' });
+    } catch (error) {
+      setDialog({ type: 'error', title: 'Could not restore configuration', message: getRequestErrorMessage(error, 'The previous configuration could not be restored.') });
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  const retryDeviceSync = async () => {
+    if (!deviceId || retryingSync) return;
+    setRetryingSync(true);
+    try {
+      await deviceAPI.retryCloudSync(deviceId);
+      const response = await deviceAPI.getDevice(deviceId);
+      setDevice(response.data);
+    } catch (error) {
+      setDialog({ type: 'error', title: 'Retry could not start', message: getRequestErrorMessage(error, 'Could not retry this TV sync.') });
+    } finally {
+      setRetryingSync(false);
     }
   };
 
@@ -353,7 +417,7 @@ export const UserDeviceDetail = () => {
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
       <header className="bg-white border-b sticky top-0 z-10">
-        <div className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 py-1.5 sm:py-2 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-1.5 sm:gap-2">
+        <div className="max-w-[95vw] sm:max-w-[1120px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 xl:px-6 py-1.5 sm:py-2 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-1.5 sm:gap-2">
           <div className="flex items-center gap-2 sm:gap-3">
             <Button variant="secondary" onClick={() => navigate('/user/devices')} className="text-[10px] sm:text-xs">
               <ArrowLeft className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
@@ -372,6 +436,9 @@ export const UserDeviceDetail = () => {
             <Button onClick={handleClearConfig} variant="secondary" className="text-[10px] sm:text-xs">
               Clear
             </Button>
+            <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
+              <History className="mr-1 h-3 w-3" />History
+            </Button>
             <Button onClick={handleSaveConfig} disabled={savingConfig} className="bg-blue-600 hover:bg-blue-700 text-[10px] sm:text-xs">
               <Save className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
               {savingConfig ? 'Saving...' : 'Save'}
@@ -381,7 +448,7 @@ export const UserDeviceDetail = () => {
       </header>
 
       {device.health?.cloudSync && (
-        <div className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 pt-2">
+        <div className="max-w-[95vw] sm:max-w-[1120px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 xl:px-6 pt-2">
           <div className={`rounded-md border px-3 py-2 text-xs ${
             cloudSyncReady
               ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
@@ -405,11 +472,21 @@ export const UserDeviceDetail = () => {
             {device.status !== 'online' && !cloudSyncReady && (
               <span className="ml-2">TV is offline; it will sync when it reconnects.</span>
             )}
+            <div className="mt-1 text-[11px] opacity-80">
+              APK {device.appVersion || 'unknown'} · Last seen {device.lastSeen ? new Date(device.lastSeen).toLocaleString() : 'unknown'}
+            </div>
+          </div>
+          <div className="mt-2 flex gap-2">
+            {device.health.cloudSync.status === 'failed' && (
+              <Button variant="secondary" disabled={retryingSync} onClick={retryDeviceSync} className="text-[10px] sm:text-xs">
+                <RotateCcw className="mr-1 h-3 w-3" />{retryingSync ? 'Retrying…' : 'Retry sync'}
+              </Button>
+            )}
           </div>
         </div>
       )}
 
-      <main className="max-w-[95vw] sm:max-w-[1120px] mx-auto px-2 sm:px-3 py-2 sm:py-3">
+      <main className="max-w-[95vw] sm:max-w-[1120px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 xl:px-6 py-2 sm:py-3">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 sm:gap-3">
           {/* Left Column - Configuration */}
           <div className="lg:col-span-2 space-y-2 sm:space-y-3">
@@ -445,7 +522,7 @@ export const UserDeviceDetail = () => {
               <CardHeader className="p-3 sm:p-4">
                 <CardTitle className="text-[10px] sm:text-xs md:text-sm">Section Configuration</CardTitle>
               </CardHeader>
-              <CardContent className="p-3 sm:p-4 space-y-2 sm:space-y-3">
+              <CardContent className={`p-3 sm:p-4 space-y-2 sm:space-y-3 xl:grid xl:gap-3 xl:space-y-0 ${sectionCount === 3 ? 'xl:grid-cols-3' : sectionCount === 2 ? 'xl:grid-cols-2' : 'xl:grid-cols-1'}`}>
                 {Array.from({ length: sectionCount }).map((_, index) => {
                   const section = config.sections[index] || {
                     id: index + 1,
@@ -695,6 +772,32 @@ export const UserDeviceDetail = () => {
         }}
         selectedUrls={currentSectionIndex !== null ? config.sections[currentSectionIndex]?.mediaUrls || [] : []}
       />
+
+      {historyOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/45 p-4">
+          <section role="dialog" aria-modal="true" className="w-full max-w-xl rounded-xl bg-white p-4 shadow-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-semibold">Configuration history</h2>
+              <button type="button" onClick={() => setHistoryOpen(false)} aria-label="Close history"><X className="h-4 w-4" /></button>
+            </div>
+            {configHistory.length ? (
+              <div className="max-h-[60vh] space-y-2 overflow-y-auto">
+                {configHistory.map((entry) => (
+                  <div key={entry._id || `${entry.configVersion}-${entry.savedAt}`} className="flex items-center justify-between gap-3 rounded-lg border p-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">Version {entry.configVersion} · {entry.config?.layout || 'configuration'}</div>
+                      <div className="text-xs text-slate-500">{entry.savedAt ? new Date(entry.savedAt).toLocaleString() : 'Saved earlier'} · {entry.source || 'saved config'}</div>
+                    </div>
+                    <Button variant="secondary" disabled={savingConfig} onClick={() => void rollbackConfig(entry)} className="shrink-0 text-xs">
+                      <RotateCcw className="mr-1 h-3 w-3" />Restore
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="py-6 text-center text-sm text-slate-500">No saved configuration history yet.</p>}
+          </section>
+        </div>
+      )}
 
       {dialog && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4" role="presentation">

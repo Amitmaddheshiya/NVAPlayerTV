@@ -60,6 +60,8 @@ export const deviceAPI = {
     api.get('/devices', { params }),
   getDevice: (id: string) => api.get(`/devices/${id}`),
   getDeviceMedia: (id: string) => api.get(`/devices/${id}/media`),
+  getConfigHistory: (id: string) => api.get(`/devices/${id}/config-history`),
+  retryCloudSync: (id: string) => api.post(`/devices/${id}/retry-cloud-sync`),
   getDeviceStats: () => api.get('/devices/stats'),
   heartbeat: (id: string, data: any) => api.post(`/devices/${id}/heartbeat`, data),
   updateConfig: (id: string, config: any) => api.post(`/devices/${id}/config`, { config }),
@@ -231,6 +233,7 @@ export const groupAPI = {
     api.put(`/groups/${id}`, { name, devices }),
   deleteGroup: (id: string) => api.delete(`/groups/${id}`),
   configureGroup: (id: string, config: any) => api.post(`/groups/${id}/configure`, { config }),
+  getConfigHistory: (id: string) => api.get(`/groups/${id}/config-history`),
 };
 
 // Users

@@ -119,6 +119,7 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
 
     // Get paginated devices
     const devices = await Device.find(filter)
+      .select('-configHistory')
       .sort({ updatedAt: -1 })
       .skip(skip)
       .limit(limitNum);
@@ -159,7 +160,7 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
 
 export const getDevice = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const device = await Device.findOne({ deviceId: req.params.id });
+    const device = await Device.findOne({ deviceId: req.params.id }).select('-configHistory');
     if (!device) {
       res.status(404).json({ error: 'Device not found' });
       return;
@@ -184,6 +185,75 @@ export const getDevice = async (req: AuthRequest, res: Response): Promise<void> 
   } catch (error) {
     console.error('Get device error:', error);
     res.status(500).json({ error: 'Failed to fetch device' });
+  }
+};
+
+export const getDeviceConfigHistory = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const device = await Device.findOne({ deviceId: req.params.id }).select('assignedUserId configHistory');
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    if (req.userRole !== 'admin' && device.assignedUserId?.toString() !== req.userId) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+    res.json({ entries: [...(device.configHistory || [])].reverse() });
+  } catch (error) {
+    console.error('Get device config history error:', error);
+    res.status(500).json({ error: 'Failed to fetch configuration history' });
+  }
+};
+
+export const retryCloudSync = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const device = await Device.findOne({ deviceId: req.params.id });
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    if (req.userRole !== 'admin' && device.assignedUserId?.toString() !== req.userId) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+    if ((device.health as any)?.cloudSync?.status !== 'failed') {
+      res.status(409).json({ error: 'Only a failed device sync can be retried' });
+      return;
+    }
+    device.cacheInfo = device.cacheInfo || {
+      configVersion: 0,
+      lastSyncTime: new Date(),
+      cachedMedia: [],
+      totalCacheSize: 0,
+    } as any;
+    const configVersion = Number(device.cacheInfo.configVersion || 0) + 1;
+    device.cacheInfo.configVersion = configVersion;
+    device.cacheInfo.lastSyncTime = new Date();
+    const sections = Array.isArray(device.config?.sections) ? device.config.sections : [];
+    const previousSync = (device.health as any)?.cloudSync || {};
+    const mediaTotal = sections.reduce((count: number, section: any) =>
+      count + (section?.contentType === 'multimedia' && Array.isArray(section?.mediaUrls) ? section.mediaUrls.length : 0), 0);
+    device.set('health.cloudSync', {
+      configVersion,
+      status: 'pending',
+      mediaTotal,
+      mediaCached: 0,
+      requiredStorageBytes: Math.max(0, Number(previousSync.requiredStorageBytes || 0)),
+      message: 'Manual retry requested; the TV will download and verify this configuration again',
+      updatedAt: new Date(),
+    });
+    await device.save();
+    getSocketInstance().to(`device:${device.deviceId}`).emit('config:update', {
+      config: device.config,
+      configVersion,
+      retry: true,
+    });
+    await cacheDelPattern('devices:*');
+    res.json({ success: true, configVersion, status: 'pending' });
+  } catch (error) {
+    console.error('Retry Cloud sync error:', error);
+    res.status(500).json({ error: 'Failed to retry device sync' });
   }
 };
 
@@ -335,6 +405,9 @@ export const reportCloudSyncStatus = async (req: AuthRequest, res: Response): Pr
       status,
       mediaTotal,
       mediaCached,
+      requiredStorageBytes: Math.max(0, Number(req.body?.requiredStorageBytes ?? savedSync.requiredStorageBytes ?? 0)),
+      availableStorageBytes: Math.max(0, Number(req.body?.availableStorageBytes ?? savedSync.availableStorageBytes ?? 0)),
+      storageReserveBytes: Math.max(0, Number(req.body?.storageReserveBytes ?? savedSync.storageReserveBytes ?? 0)),
       onlineOnlySections,
       message: String(req.body?.message || '').slice(0, 500),
       updatedAt: new Date(),
@@ -418,6 +491,12 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     }
     const mediaByPath = new Map(configuredMedia.map((media: any) => [String(media.path), media]));
 
+    if (previousConfig && JSON.stringify(previousConfig) !== JSON.stringify(config)) {
+      device.configHistory = [
+        { config: previousConfig, configVersion: Number(device.cacheInfo?.configVersion || 0), savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined, source: 'device' },
+        ...(device.configHistory || []),
+      ].slice(0, 20) as any;
+    }
     device.config = config;
 
     // Process sections to convert media URLs to absolute and clean up irrelevant fields
@@ -507,6 +586,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       status: 'pending',
       mediaTotal: expectedMediaCount,
       mediaCached: 0,
+      requiredStorageBytes: configuredMedia.reduce((total: number, media: any) => total + Math.max(0, Number(media.size || 0)), 0),
       onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
         (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
         (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
@@ -841,6 +921,13 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
     if (updates.activated !== undefined) device.activated = updates.activated;
 
     if (assignmentChanged) {
+      const priorConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
+      if (priorConfig) {
+        device.configHistory = [
+          { config: priorConfig, configVersion: Number(device.cacheInfo?.configVersion || 0), savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined, source: 'assignment-change' },
+          ...(device.configHistory || []),
+        ].slice(0, 20) as any;
+      }
       await Group.updateMany({ devices: deviceId }, { $pull: { devices: deviceId } });
       await Media.updateMany({ assignedDevices: deviceId }, { $pull: { assignedDevices: deviceId } });
       device.config = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;

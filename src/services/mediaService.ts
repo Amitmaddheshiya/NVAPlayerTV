@@ -1605,7 +1605,12 @@ export async function pruneCacheIfLow(minFreeBytes = DEFAULT_MIN_FREE_BYTES) {
   }
 }
 
-export type MediaPrefetchResult = { total: number; cached: number; failed: number };
+export type MediaPrefetchResult = {
+  total: number;
+  cached: number;
+  failed: number;
+  storageBlock?: { freeBytes: number; requiredBytes: number; reserveBytes: number };
+};
 
 export async function prefetchMediaItems(
   items: MediaItem[],
@@ -1631,15 +1636,54 @@ export async function prefetchMediaItems(
     const safeGeneration = mode === "cloud" && generation ? normalizeGeneration(generation) : undefined;
     await ensureMediaDirs(mode, safeGeneration);
     const manifest = await readManifest(mode, safeGeneration);
+    const preflightCachedUrls = new Set<string>();
+    if (mode === "cloud" && safeGeneration) {
+      const assignments = new Map<string, number>();
+      requestedItems.forEach((item) => {
+        const key = String(item.url || "");
+        assignments.set(key, (assignments.get(key) || 0) + 1);
+      });
+      let requiredBytes = 0;
+      for (const item of uniqueItems) {
+        const cached = await isManifestEntryUsable(
+          manifest[String(item.url)],
+          Number(item.size || 0),
+          Number(item.mtimeMs || 0),
+          String(item.hash || "")
+        );
+        const placementCount = assignments.get(String(item.url)) || 1;
+        if (cached) {
+          result.cached += placementCount;
+          preflightCachedUrls.add(String(item.url));
+        }
+        else requiredBytes += Math.max(0, Number(item.size || 0));
+      }
+      const storageInfo = await RNFS.getFSInfo();
+      const freeBytes = Math.max(0, Number(storageInfo?.freeSpace || 0));
+      const reserveBytes = 128 * 1024 * 1024;
+      if (freeBytes > 0 && freeBytes < requiredBytes + reserveBytes) {
+        result.failed = Math.max(0, result.total - result.cached);
+        result.storageBlock = { freeBytes, requiredBytes, reserveBytes };
+        await onProgress?.({ ...result });
+        return result;
+      }
+    }
     const videoTasks: Array<() => Promise<void>> = [];
     const otherTasks: Array<() => Promise<void>> = [];
 
     for (const item of uniqueItems) {
       const task = async () => {
         const assignmentCount = assignmentsByUrl.get(String(item.url)) || 1;
+        if (preflightCachedUrls.has(String(item.url))) {
+          await onProgress?.({ ...result });
+          return;
+        }
         try {
           const requiresVerifiedGeneration = mode === "cloud" && !!safeGeneration;
-          if ((requiresVerifiedGeneration && Number(item.size || 0) <= 0) || !shouldCacheItem(item)) {
+          const cacheEligible = requiresVerifiedGeneration
+            ? Number(item.size || 0) > 0
+            : shouldCacheItem(item);
+          if (!cacheEligible) {
             result.failed += assignmentCount;
           } else {
             const localPathValue = await downloadIfNeededDeduped(server, item, manifest, mode, safeGeneration);

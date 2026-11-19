@@ -5,6 +5,7 @@ import {
   updateGroup,
   deleteGroup,
   configureGroup,
+  getGroupConfigHistory,
 } from '../controllers/group.controller';
 import { auth } from '../middleware/auth.middleware';
 
@@ -15,5 +16,6 @@ router.post('/', auth, createGroup);
 router.put('/:id', auth, updateGroup);
 router.delete('/:id', auth, deleteGroup);
 router.post('/:id/configure', auth, configureGroup);
+router.get('/:id/config-history', auth, getGroupConfigHistory);
 
 export default router;

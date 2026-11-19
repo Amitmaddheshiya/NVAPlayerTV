@@ -48,6 +48,13 @@ export interface IDevice extends Document {
     }>;
     totalCacheSize: number;
   };
+  configHistory: Array<{
+    config: Record<string, unknown>;
+    configVersion: number;
+    savedAt: Date;
+    savedBy?: Types.ObjectId;
+    source: string;
+  }>;
   health?: Record<string, unknown>;
   // Track who last configured this device
   lastConfiguredBy?: Types.ObjectId;
@@ -106,6 +113,13 @@ const DeviceSchema = new Schema<IDevice>(
       }],
       totalCacheSize: { type: Number, default: 0 },
     },
+    configHistory: [{
+      config: { type: Schema.Types.Mixed, required: true },
+      configVersion: { type: Number, default: 0 },
+      savedAt: { type: Date, default: Date.now },
+      savedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+      source: { type: String, default: 'device' },
+    }],
     health: { type: Schema.Types.Mixed, default: () => ({ playbackErrorCount: 0, recentErrors: [] }) },
     // Track who last configured this device
     lastConfiguredBy: { type: Schema.Types.ObjectId, ref: 'User' },

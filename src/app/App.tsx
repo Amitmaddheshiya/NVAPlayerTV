@@ -584,6 +584,22 @@ export default function App() {
             await progressReportQueue;
           }
         }, generation);
+        if (downloadResult.storageBlock) {
+          const { freeBytes, requiredBytes, reserveBytes } = downloadResult.storageBlock;
+          const formatStorage = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+          await reportCloudConfigSync({
+            configVersion: incomingVersion,
+            status: 'failed',
+            mediaTotal: downloadResult.total,
+            mediaCached: downloadResult.cached,
+            requiredStorageBytes: requiredBytes + reserveBytes,
+            availableStorageBytes: freeBytes,
+            storageReserveBytes: reserveBytes,
+            message: `Not enough TV storage to safely cache this update. Free: ${formatStorage(freeBytes)}; needed: ${formatStorage(requiredBytes)} plus ${formatStorage(reserveBytes)} safety space. Free storage on the TV and tap Retry sync. The previous cached playlist remains active.`,
+          });
+          await pruneCloudCacheGenerations([activeGeneration]);
+          return;
+        }
         // A successful HTTP transfer is not enough to call the TV offline-ready.
         // Recheck every placement against its expected size/hash in the manifest.
         const cacheResult = await verifyCachedMediaItems(mediaItems, generation);
@@ -600,6 +616,7 @@ export default function App() {
               ? `${cacheResult.failed} media file(s) could not be cached; the previous playlist remains active`
               : `${cacheResult.failed} media file(s) could not be cached; Cloud playback is waiting for a complete offline cache`,
           });
+          await pruneCloudCacheGenerations([activeGeneration]);
           return;
         }
         const latestVersion = Number(await AsyncStorage.getItem(CLOUD_PENDING_VERSION_KEY) || incomingVersion);
@@ -985,6 +1002,12 @@ export default function App() {
     const subscription = BackHandler.addEventListener("hardwareBackPress", handleTvBackAction);
     return () => subscription.remove();
   }, [handleTvBackAction]);
+
+  useEffect(() => {
+    if (!showModeSelection || appMode !== "cloudMode") return;
+    const timer = setTimeout(() => setShowModeSelection(false), 15_000);
+    return () => clearTimeout(timer);
+  }, [appMode, showModeSelection]);
 
   useEffect(() => {
     if (!showAdmin || adminInitialView !== "access" || !adminOpenedByBackRef.current) return;
@@ -3204,6 +3227,7 @@ export default function App() {
           <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>
             <ModeSelectionScreen
               currentMode={appMode}
+              showAdminMode={false}
               onSwitchMode={async (mode) => {
                 await selectAppMode(mode, true);
                 setShowModeSelection(false);
@@ -3667,6 +3691,7 @@ export default function App() {
         <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>
           <ModeSelectionScreen
             currentMode={appMode}
+            showAdminMode={false}
             onSwitchMode={async (mode) => {
               await selectAppMode(mode, true);
               setShowModeSelection(false);

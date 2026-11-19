@@ -61,6 +61,7 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
 
     // Return groups with filter applied
     let groups = await Group.find(filter)
+      .select('-configHistory')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limitNum);
@@ -310,11 +311,28 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       });
     }
 
+    const previousGroupConfig = group.config
+      ? JSON.parse(JSON.stringify(group.config))
+      : devices[0]?.config ? JSON.parse(JSON.stringify(devices[0].config)) : null;
+
     // Apply config to each device in the group
     const io = getSocketInstance();
     const updatePromises = devices.map(async (device) => {
       // Store previous config for audit
-      const previousConfig = device.config ? { ...device.config } : null;
+      const previousConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
+
+      if (previousConfig && JSON.stringify(previousConfig) !== JSON.stringify(config)) {
+        device.configHistory = [
+          {
+            config: previousConfig,
+            configVersion: Number(device.cacheInfo?.configVersion || 0),
+            savedAt: new Date(),
+            savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined,
+            source: 'group',
+          },
+          ...(device.configHistory || []),
+        ].slice(0, 20) as any;
+      }
 
       // Update device config
       device.config = config;
@@ -359,6 +377,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
         status: 'pending',
         mediaTotal: mediaPaths.length,
         mediaCached: 0,
+        requiredStorageBytes: mediaDocs.reduce((total: number, media: any) => total + Math.max(0, Number(media.size || 0)), 0),
         onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
           (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
           (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
@@ -402,6 +421,22 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     const updateResults = await Promise.allSettled(updatePromises);
     const appliedDeviceIds = updateResults.flatMap((result, index) => result.status === 'fulfilled' ? [devices[index].deviceId] : []);
     const failedDeviceIds = updateResults.flatMap((result, index) => result.status === 'rejected' ? [devices[index].deviceId] : []);
+
+    if (appliedDeviceIds.length > 0) {
+      if (previousGroupConfig && JSON.stringify(previousGroupConfig) !== JSON.stringify(config)) {
+        group.configHistory = [
+          { config: previousGroupConfig, savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined },
+          ...(group.configHistory || []),
+        ].slice(0, 20) as any;
+      }
+      group.config = config;
+      try {
+        await group.save();
+        await cacheDelPattern('groups:*');
+      } catch (historyError) {
+        console.error('Group configuration history save failed after device saves:', historyError);
+      }
+    }
 
     try {
       await cacheDelPattern('devices:*');
@@ -462,5 +497,25 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
   } catch (error) {
     console.error('Configure group error:', error);
     res.status(500).json({ error: 'Failed to configure group' });
+  }
+};
+
+export const getGroupConfigHistory = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const group = await Group.findById(req.params.id);
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
+      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: req.userId })) === group.devices.length;
+    if (req.userRole !== 'admin' && group.ownerId?.toString() !== req.userId && !ownsLegacyGroup) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+    res.json({ entries: [...(group.configHistory || [])].reverse() });
+  } catch (error) {
+    console.error('Get group config history error:', error);
+    res.status(500).json({ error: 'Failed to fetch group configuration history' });
   }
 };

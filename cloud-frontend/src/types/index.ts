@@ -26,6 +26,9 @@ export interface Device {
       status: 'pending' | 'ready' | 'failed';
       mediaTotal: number;
       mediaCached: number;
+      requiredStorageBytes?: number;
+      availableStorageBytes?: number;
+      storageReserveBytes?: number;
       message?: string;
       updatedAt?: string;
     };

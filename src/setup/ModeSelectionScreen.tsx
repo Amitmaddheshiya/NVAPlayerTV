@@ -18,10 +18,12 @@ const isPortrait = height > width;
 
 export default function ModeSelectionScreen({
   currentMode,
+  showAdminMode = true,
   onSwitchMode,
   onClose,
 }: {
   currentMode: AppMode;
+  showAdminMode?: boolean;
   onSwitchMode: (mode: AppMode) => void;
   onClose: () => void;
 }) {
@@ -156,7 +158,7 @@ export default function ModeSelectionScreen({
             <Text style={styles.modeButtonHint}>Remote management via cloud</Text>
           </Pressable>
 
-          <Pressable
+          {showAdminMode && <Pressable
             onPress={handleAdminMode}
             onFocus={() => setFocused("admin")}
             onBlur={() => setFocused(null)}
@@ -170,7 +172,7 @@ export default function ModeSelectionScreen({
           >
             <Text style={styles.modeButtonTitle}>Admin Only</Text>
             <Text style={styles.modeButtonHint}>Manage a TV CMS</Text>
-          </Pressable>
+          </Pressable>}
         </View>
 
         {/* Close Button */}
