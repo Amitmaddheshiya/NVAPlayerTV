@@ -241,7 +241,7 @@ export const UserDeviceDetail = () => {
       
       // Clean up sections - clear irrelevant fields based on contentType
       sectionsToSave = sectionsToSave.map((section) => {
-        const cleaned = { ...section };
+        const cleaned: any = { ...section };
         if (cleaned.contentType === 'multimedia') {
           cleaned.webUrl = '';
           cleaned.youtubeUrl = '';
@@ -364,7 +364,7 @@ export const UserDeviceDetail = () => {
       sections: prevConfig.sections.map((s, idx) => {
         // Match by array index (0-based) instead of ID for proper isolation
         if (idx === sectionId - 1) {
-          const updated = { ...s, ...updates };
+          const updated: any = { ...s, ...updates };
           
           // Clear irrelevant fields based on contentType
           if (updates.contentType === 'multimedia') {
@@ -466,7 +466,7 @@ export const UserDeviceDetail = () => {
             </span>
             {onlineOnlySections > 0 && (
               <span className="ml-2 font-medium">
-                {onlineOnlySections} web/YouTube section{onlineOnlySections === 1 ? '' : 's'} require internet and are not part of offline media cache.
+                {onlineOnlySections} web/video embed section{onlineOnlySections === 1 ? '' : 's'} require internet and are not part of offline media cache.
               </span>
             )}
             {device.status !== 'online' && !cloudSyncReady && (
@@ -533,7 +533,7 @@ export const UserDeviceDetail = () => {
                     slideDuration: 5,
                   };
                   const actualSectionId = index + 1;
-                  const currentContentType = section.contentType;
+                  const currentContentType: string = section.contentType;
                   return (
                     <div key={actualSectionId} className="border rounded-lg p-2 sm:p-3">
                       <h3 className="text-[10px] sm:text-xs md:text-sm font-medium mb-2 sm:mb-3">Section {actualSectionId}</h3>

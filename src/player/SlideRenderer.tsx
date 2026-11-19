@@ -40,7 +40,7 @@ import {
 } from "./slideRendererUtils";
 
 const LARGE_VIDEO_STREAM_THRESHOLD_BYTES = 300 * 1024 * 1024;
-const CLOUD_YOUTUBE_APP_ORIGIN = "https://com.signageplayertv";
+const CLOUD_EMBED_APP_ORIGIN = "https://com.signageplayertv";
 let cloudPlaybackPinSequence = 0;
 const HOLD_LARGE_VIDEO_UNTIL_CACHED = false;
 const VIDEO_PROGRESS_SAVE_INTERVAL_MS = 1000;
@@ -49,14 +49,13 @@ function buildCloudYoutubeEmbedUrl(url: string): string {
   const videoId = extractYoutubeId(url);
   if (!videoId) return "";
   const encodedId = encodeURIComponent(videoId);
-  const origin = encodeURIComponent(CLOUD_YOUTUBE_APP_ORIGIN);
+  const origin = encodeURIComponent(CLOUD_EMBED_APP_ORIGIN);
   return `https://www.youtube.com/embed/${encodedId}?autoplay=1&controls=0&fs=0&iv_load_policy=3&loop=1&playlist=${encodedId}&playsinline=1&rel=0&origin=${origin}`;
 }
 
-function buildCloudYoutubeEmbedHtml(embedUrl: string, isShort: boolean): string {
+function buildCloudSocialEmbedHtml(embedUrl: string, aspect: number, fit: "cover" | "contain" = "cover"): string {
   const safeEmbedUrl = embedUrl.replace(/&/g, "&amp;").replace(/\"/g, "&quot;");
-  const aspect = isShort ? 9 / 16 : 16 / 9;
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>html,body{position:fixed;inset:0;margin:0;width:100%;height:100%;overflow:hidden;background:#000}iframe{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);border:0;overflow:hidden}</style></head><body><iframe id="youtube-player" src="${safeEmbedUrl}" title="YouTube video player" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe><script>const player=document.getElementById('youtube-player');function fitPlayer(){const vw=document.documentElement.clientWidth;const vh=document.documentElement.clientHeight;let w=vw;let h=w/${aspect};if(h<vh){h=vh;w=h*${aspect};}player.style.width=Math.ceil(w+2)+'px';player.style.height=Math.ceil(h+2)+'px';}window.addEventListener('resize',fitPlayer);fitPlayer();</script></body></html>`;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>html,body{position:fixed;inset:0;margin:0;width:100%;height:100%;overflow:hidden;background:#000}iframe{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);border:0;overflow:hidden}</style></head><body><iframe id="embedded-video-player" src="${safeEmbedUrl}" title="Embedded video player" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe><script>const player=document.getElementById('embedded-video-player');function fitPlayer(){const vw=document.documentElement.clientWidth;const vh=document.documentElement.clientHeight;let w=vw;let h=w/${aspect};if('${fit}'==='cover'?h<vh:h>vh){h=vh;w=h*${aspect};}player.style.width=Math.ceil(w)+'px';player.style.height=Math.ceil(h)+'px';}window.addEventListener('resize',fitPlayer);fitPlayer();</script></body></html>`;
 }
 
 function getUrlQueryValue(value: string, key: string): string {
@@ -2349,6 +2348,7 @@ export default function SlideRenderer({
   if (sourceType !== SOURCE_TYPES.multimedia) {
     const isTemplateSource = sourceType === SOURCE_TYPES.template;
     const isCloudYoutubeSource = cloudMode && sourceType === SOURCE_TYPES.youtube;
+    const isCloudSocialSource = isCloudYoutubeSource;
     const isYoutubeShort = /youtube\.com\/shorts\//i.test(sourceUrl);
     if (!uri && !isTemplateSource) {
       return (
@@ -2360,7 +2360,7 @@ export default function SlideRenderer({
 
     return (
       <Animated.View
-        style={isCloudYoutubeSource ? styles.container : [
+        style={isCloudSocialSource ? styles.container : [
           styles.container,
           {
             opacity,
@@ -2385,11 +2385,12 @@ export default function SlideRenderer({
             source={
               isTemplateSource
                 ? { html: buildOrderTemplateHtml(sourceTemplate), baseUrl: "https://template.local" }
-                : isCloudYoutubeSource
-                ? { html: buildCloudYoutubeEmbedHtml(uri, isYoutubeShort), baseUrl: CLOUD_YOUTUBE_APP_ORIGIN }
+                : isCloudSocialSource
+                ? { html: buildCloudSocialEmbedHtml(uri, isYoutubeShort ? 9 / 16 : 16 / 9, isCloudYoutubeSource && !isYoutubeShort ? "contain" : "cover"), baseUrl: CLOUD_EMBED_APP_ORIGIN }
                 : { uri }
             }
             style={styles.media}
+            scrollEnabled={!isCloudSocialSource}
             javaScriptEnabled
             domStorageEnabled
             allowsInlineMediaPlayback
