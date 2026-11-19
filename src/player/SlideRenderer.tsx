@@ -145,6 +145,7 @@ export default function SlideRenderer({
   const lastProgressPersistAtRef = useRef(0);
   const lastObservedVideoPositionRef = useRef(0);
   const lastObservedVideoProgressAtRef = useRef(0);
+  const cloudVideoStallCountRef = useRef<Record<string, number>>({});
   const skipLoopGuardRef = useRef(0);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const videoReadyRef = useRef(false);
@@ -399,8 +400,12 @@ export default function SlideRenderer({
       if (identity && !lastStableVideoProgressRef.current[identity]) {
         lastStableVideoProgressRef.current[identity] = 0;
       }
+      if (cloudMode) {
+        lastObservedVideoPositionRef.current = 0;
+        lastObservedVideoProgressAtRef.current = Date.now();
+      }
     }
-  }, [files, index]);
+  }, [files, index, cloudMode]);
 
   useEffect(() => {
     if (!files.length) return;
@@ -581,26 +586,6 @@ export default function SlideRenderer({
       uri: cloudMode ? uri.replace(/([?&]deviceToken=)[^&]*/i, "$1[redacted]") : uri,
     });
 
-    if (
-      isActiveVideo &&
-      cloudMode &&
-      isLocalPlayableUri(uri) &&
-      /^https?:\/\//i.test(String(activeFile?.streamUrl || ""))
-    ) {
-      // A cache file passed integrity checks but its decoder can still reject
-      // its codec/container. Retry the original authenticated stream at once;
-      // activeFile.url is only a cache identity URL and has no device JWT.
-      prepareVideoReloadFromCurrentPosition();
-      const streamUri = normalizeMediaUri(String(activeFile.streamUrl));
-      pinnedMediaUriRef.current = {
-        identity: getMediaIdentity(activeFile),
-        uri: streamUri,
-      };
-      setUri(streamUri);
-      setVideoReloadToken((prev) => prev + 1);
-      return;
-    }
-
     if (isActiveVideo && errorKey) {
       const currentCount = videoTransientErrorRef.current[errorKey] || 0;
       if (currentCount < MAX_TRANSIENT_VIDEO_RETRY) {
@@ -622,6 +607,7 @@ export default function SlideRenderer({
 
     if (
       isActiveVideo &&
+      !cloudMode &&
       isLocalPlayableUri(uri) &&
       !isUsbSourceItem(activeFile) &&
       server &&
@@ -1242,6 +1228,29 @@ export default function SlideRenderer({
   };
 
   useEffect(() => {
+    if (!cloudMode || !currentImageUri || playerPaused) return;
+    const watchedUri = currentImageUri;
+    const timeout = setTimeout(() => {
+      if (!isMountedRef.current || cloudImageLoadedUri === watchedUri) return;
+      const active = filesRef.current[indexRef.current];
+      if (normalizeMediaUri(uri) !== watchedUri || !active || isVideoFile(active)) return;
+      if (!failedCloudImageUrisRef.current.has(watchedUri)) {
+        failedCloudImageUrisRef.current.add(watchedUri);
+        if (typeof onPlaybackError === "function") {
+          onPlaybackError({
+            section: sectionIndex + 1,
+            name: active.originalName || active.name || "Image media",
+            mediaType: active.type || "image",
+            message: "Cloud image did not finish loading",
+          });
+        }
+      }
+      if (filesRef.current.length > 1) goNext();
+    }, 15000);
+    return () => clearTimeout(timeout);
+  }, [cloudMode, currentImageUri, cloudImageLoadedUri, playerPaused, uri, files, index, sectionIndex]);
+
+  useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
     if (!files.length) return;
     const active = files[index];
@@ -1509,6 +1518,41 @@ export default function SlideRenderer({
     if (!isVideoFile(file)) return;
     videoFade.setValue(1);
   }, [files, index, uri, sourceType, videoFade]);
+
+  useEffect(() => {
+    if (!cloudMode || playerPaused || sourceType !== SOURCE_TYPES.multimedia) return;
+    const active = files[index];
+    if (!isVideoFile(active) || !isLocalPlayableUri(uri)) return;
+    const activeIdentity = getMediaStableIdentity(active);
+    const watchdog = setInterval(() => {
+      if (!isMountedRef.current || !videoReadyRef.current) return;
+      const current = filesRef.current[indexRef.current];
+      if (getMediaStableIdentity(current) !== activeIdentity) return;
+      const lastProgressAt = Number(lastObservedVideoProgressAtRef.current || 0);
+      if (!lastProgressAt || Date.now() - lastProgressAt < 30000) return;
+      // Throttle recovery attempts so one stalled native decoder produces one
+      // retry at a time. handleRenderError eventually skips a bad item when
+      // this section has another playlist entry.
+      lastObservedVideoProgressAtRef.current = Date.now();
+      const stallCount = (cloudVideoStallCountRef.current[activeIdentity] || 0) + 1;
+      cloudVideoStallCountRef.current[activeIdentity] = stallCount;
+      if (stallCount >= 3) {
+        if (filesRef.current.length > 1) {
+          goNext();
+        } else if (stallCount === 3 && typeof onPlaybackError === "function") {
+          onPlaybackError({
+            section: sectionIndex + 1,
+            name: active.originalName || active.name || "Video media",
+            mediaType: active.type || "video",
+            message: "Cached Cloud video stopped making playback progress",
+          });
+        }
+        return;
+      }
+      handleRenderError();
+    }, 5000);
+    return () => clearInterval(watchdog);
+  }, [cloudMode, playerPaused, sourceType, files, index, uri, videoReloadToken, onPlaybackError, sectionIndex]);
 
   useEffect(() => {
     return () => {
@@ -2664,6 +2708,10 @@ export default function SlideRenderer({
                 if (cloudMode && getMediaStableIdentity(filesRef.current[indexRef.current]) !== getMediaStableIdentity(file)) return;
                 videoRetryCountRef.current = 0;
                 videoReadyRef.current = true;
+                if (cloudMode) {
+                  lastObservedVideoPositionRef.current = Math.max(0, Number(videoProgressRef.current.positionMs || 0));
+                  lastObservedVideoProgressAtRef.current = Date.now();
+                }
                 setVideoBuffering(false);
                 setShowBufferIndicator(false);
                 if (bufferTimerRef.current) {
@@ -2703,6 +2751,9 @@ export default function SlideRenderer({
                 if (positionMs > lastObservedVideoPositionRef.current + 400) {
                   lastObservedVideoPositionRef.current = positionMs;
                   lastObservedVideoProgressAtRef.current = Date.now();
+                  if (cloudMode) {
+                    delete cloudVideoStallCountRef.current[getMediaStableIdentity(file)];
+                  }
                 }
                 const identity = getMediaStableIdentity(file);
                 const lastStablePosition = Math.max(
