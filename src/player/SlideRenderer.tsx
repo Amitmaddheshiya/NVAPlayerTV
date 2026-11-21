@@ -614,6 +614,11 @@ export default function SlideRenderer({
   }, [livePulse]);
 
   const scheduleRetryLoad = () => {
+    // Cloud sections resolve their playlist from section mediaUrls via
+    // resolveCachedMediaItems; getMediaFiles would read the global
+    // 'cloud-config' playbackOverride (base + all schedule profiles) and
+    // corrupt the per-section playlist. Retry is LAN-only.
+    if (cloudMode) return;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     retryTimerRef.current = setTimeout(async () => {
       if (!isMountedRef.current) return;
@@ -766,8 +771,11 @@ export default function SlideRenderer({
         // every layout, including fullscreen. Reading fullscreen through the
         // global legacy override allowed a later cache/runtime refresh to
         // replace a two-item Cloud playlist with a partial list. LAN retains
-        // its existing fullscreen media service behavior.
-        if (cloudMode || isMultiPaneLayout) {
+        // its existing fullscreen media service behavior. LAN sections never
+        // carry mediaUrls (they use playlistNames + the section media list),
+        // so a LAN multi-pane section without mediaUrls must fall through to
+        // getMediaFiles instead of rendering an empty playlist.
+        if (cloudMode || (isMultiPaneLayout && mediaUrlsForLoad.length > 0)) {
           if (mediaUrlsForLoad.length > 0) {
             list = mediaUrlsForLoad.map((url: string) => {
               const metadata = Array.isArray(mediaItemsForLoad)
@@ -1442,7 +1450,11 @@ export default function SlideRenderer({
     // Cloud video continues streaming until its natural boundary. The next
     // playlist item will use its cached file, which prevents a decoder reset
     // and a visible black frame while a download completes.
-    if (cloudMode && isVideoFile(active)) return;
+    // Cloud images must also skip this LAN cache-refresh: getMediaFiles reads
+    // the global 'cloud-config' playbackOverride (base + every schedule
+    // profile), so it would replace this section's playlist with a mixed
+    // union and can clear it to empty when any union item is uncached.
+    if (cloudMode) return;
     if (cacheProgress < 100) return;
     if (cacheRefreshDoneRef.current.has(pathKey)) return;
 

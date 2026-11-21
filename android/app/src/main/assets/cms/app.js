@@ -2308,6 +2308,11 @@ function updateGridRatioOptions() {
 }
 
 function scheduleId(prefix) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
+// Must match EmbeddedCmsServer.sanitizeFileName: the server stores uploaded
+// files with [^a-zA-Z0-9._-] replaced by "_", and /media-list reports that
+// stored name. playlistNames must use the same form or getMediaFiles never
+// matches the scheduled files.
+function sanitizeScheduleFileName(raw) { return String(raw == null ? "" : raw).replace(/[^a-zA-Z0-9._-]/g, "_"); }
 function scheduleMinutes(value) {
   const [hour, minute] = String(value || "").split(":").map(Number);
   return Number.isInteger(hour) && Number.isInteger(minute) && hour >= 0 && hour < 24 && minute >= 0 && minute < 60 ? hour * 60 + minute : null;
@@ -2428,7 +2433,7 @@ function addUploadedMediaToScheduleProfile(section, uploadFiles) {
   profile.config.sections = Array.isArray(profile.config.sections) ? profile.config.sections : [];
   profile.config.sections[index] = profile.config.sections[index] || { sourceType: "multimedia" };
   const existing = Array.isArray(profile.config.sections[index].playlistNames) ? profile.config.sections[index].playlistNames : [];
-  const names = (uploadFiles || []).map((file) => String(file?.name || "").trim()).filter(Boolean);
+  const names = (uploadFiles || []).map((file) => sanitizeScheduleFileName(file?.name)).filter(Boolean);
   profile.config.sections[index].playlistNames = Array.from(new Set([...existing, ...names]));
   markCmsFormDirty();
 }

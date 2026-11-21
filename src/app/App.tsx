@@ -3400,10 +3400,27 @@ export default function App() {
       );
     }
 
+    // Cloud scheduling: resolve the active schedule profile here. This branch
+    // returns before the LAN schedule-resolution code below, so CloudPlayerScreen
+    // must receive the resolved config (with __scheduleRuntime) itself.
+    const scheduledCloudConfig = config
+      ? resolveScheduledConfig(config, new Date(scheduleClockTick))
+      : null;
+    const cloudPlaybackConfig = scheduledCloudConfig?.config
+      ? {
+          ...scheduledCloudConfig.config,
+          __scheduleRuntime: {
+            enabled: scheduledCloudConfig.enabled,
+            active: !!scheduledCloudConfig.activeEntry || config?.schedule?.fallbackMode === 'config',
+            activeEntryId: String(scheduledCloudConfig.activeEntry?.id || ""),
+          },
+        }
+      : config;
+
     return (
       <PlayerErrorBoundary onError={(error) => reportRuntimeError(error.message, String(error))}>
         <CloudPlayerScreen
-          config={config}
+          config={cloudPlaybackConfig}
           setConfig={setConfig}
           mediaVersion={mediaVersion}
           scheduleClockTick={scheduleClockTick}
