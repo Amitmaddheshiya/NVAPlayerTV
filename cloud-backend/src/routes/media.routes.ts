@@ -6,6 +6,7 @@ import GlobalConfig from '../models/GlobalConfig';
 import {
   uploadMedia,
   getMedia,
+  getMediaFolders,
   getMediaList,
   deleteMedia,
   assignMedia,
@@ -61,7 +62,7 @@ const mediaFileFilter: multer.Options['fileFilter'] = (_req, file, cb) => {
 const uploadMediaFile = (req: any, res: any, next: any) => {
   void (async () => {
     const config = await (GlobalConfig as any).getConfig();
-    const configuredLimitMB = Number(config.singleUploadLimitMB || 500);
+    const configuredLimitMB = Number(config.singleUploadLimitMB || 2048);
     const maxBytes = Math.max(1, configuredLimitMB) * 1024 * 1024;
     multer({ storage, fileFilter: mediaFileFilter, limits: { fileSize: maxBytes } }).single('file')(req, res, (error: any) => {
       if (error) {
@@ -93,7 +94,7 @@ const uploadChunkFile = (req: any, res: any, next: any) => {
       filename: (_request, file, callback) => callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`),
     }),
     fileFilter: mediaFileFilter,
-    limits: { fileSize: 16 * 1024 * 1024, fields: 2, fieldSize: 128, files: 1 },
+    limits: { fileSize: 17 * 1024 * 1024, fields: 2, fieldSize: 128, files: 1 },
   }).single('chunk')(req, res, (error: any) => {
     if (error) {
       const status = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
@@ -112,6 +113,7 @@ router.put('/uploads/:uploadId/chunks/:index', auth, requirePermission('library'
 router.post('/uploads/:uploadId/complete', auth, requirePermission('library'), completeChunkedUpload);
 router.get('/stats', auth, adminOnly, getMediaStats);
 router.get('/', auth, requirePermission('library'), getMedia);
+router.get('/folders', auth, requirePermission('library'), getMediaFolders);
 router.get('/media-list', deviceAuth, getMediaList);
 router.delete('/:id', auth, requirePermission('library'), deleteMedia);
 router.post('/:id/assign', auth, requirePermission('library'), assignMedia);

@@ -161,9 +161,9 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
     }
 
     const config = await (GlobalConfig as any).getConfig();
-    const maxBytes = Math.max(1, Number(config.singleUploadLimitMB || 500)) * 1024 * 1024;
+    const maxBytes = Math.max(1, Number(config.singleUploadLimitMB || 2048)) * 1024 * 1024;
     if (totalSize > maxBytes) {
-      res.status(413).json({ error: `File exceeds the ${config.singleUploadLimitMB || 500} MB upload limit` });
+      res.status(413).json({ error: `File exceeds the ${config.singleUploadLimitMB || 2048} MB upload limit` });
       return;
     }
     if (req.userRole !== 'admin') {

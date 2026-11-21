@@ -10,6 +10,7 @@ import Device from '../models/Device';
 import { getSocketInstance } from '../socket/socket';
 import { getMediaPathFromUrl, normalizeUserFolder } from '../utils/mediaUrl';
 import { createHash } from 'crypto';
+import mongoose from 'mongoose';
 import { createReadStream } from 'fs';
 import path from 'path';
 
@@ -238,6 +239,32 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
   } catch (error) {
     console.error('Get media error:', error);
     res.status(500).json({ error: 'Failed to fetch media' });
+  }
+};
+
+export const getMediaFolders = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const filter: any = { deletedFromLibrary: { $ne: true } };
+    // Mirror getMedia ownership: non-admin users only see their own uploads.
+    // NOTE: aggregation pipelines do NOT apply schema casting, so uploadedBy
+    // (ObjectId) must be cast manually or the match returns zero documents.
+    if (req.userRole !== 'admin' && req.userId) {
+      const ownerId = String(req.effectiveUserId || req.userId);
+      filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
+        ? new mongoose.Types.ObjectId(ownerId)
+        : ownerId;
+    }
+    const folders = await Media.aggregate([
+      { $match: filter },
+      { $group: { _id: { $ifNull: ['$folder', 'general'] }, count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]);
+    res.json({
+      data: folders.map((folder: any) => ({ name: String(folder._id || 'general'), count: Number(folder.count || 0) })),
+    });
+  } catch (error) {
+    console.error('Get media folders error:', error);
+    res.status(500).json({ error: 'Failed to fetch folders' });
   }
 };
 

@@ -9,7 +9,7 @@ import { Save, Package, AlertCircle } from 'lucide-react';
 export const AdminConfig = () => {
   const [config, setConfig] = useState({
     monthlyUploadLimitGB: 10,
-    singleUploadLimitMB: 500,
+    singleUploadLimitMB: 2048,
     apkVersion: '1.0.0',
     apkUrl: '',
   });
@@ -158,7 +158,7 @@ export const AdminConfig = () => {
                   onChange={(e) =>
                     setConfig({ ...config, singleUploadLimitMB: parseInt(e.target.value) || 0 })
                   }
-                  placeholder="500"
+                  placeholder="2048"
                   className="text-xs sm:text-sm"
                 />
                 <p className="text-[10px] sm:text-xs text-gray-500 mt-1">

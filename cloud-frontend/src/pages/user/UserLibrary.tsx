@@ -8,6 +8,7 @@ import { Trash2, Download, HardDrive, FolderPlus, Folder, Search, Image, Video, 
 
 export const UserLibrary = () => {
   const [mediaList, setMediaList] = useState<any[]>([]);
+  const [folders, setFolders] = useState<{ name: string; count: number }[]>([]);
   const [filteredMedia, setFilteredMedia] = useState<any[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -71,12 +72,16 @@ export const UserLibrary = () => {
         params.search = searchTerm;
       }
 
-      const response = await mediaAPI.getMedia(params);
+      const [response, foldersResponse] = await Promise.all([
+        mediaAPI.getMedia(params),
+        mediaAPI.getFolders(),
+      ]);
       const mediaData = response.data.data || response.data;
       setMediaList(mediaData);
       setFilteredMedia(mediaData); // No client-side filtering needed
       setTotalMedia(response.data.total || 0);
       setTotalPages(response.data.totalPages || 0);
+      setFolders(foldersResponse.data.data || foldersResponse.data || []);
     } catch (error) {
       console.error('Failed to load media:', error);
     } finally {
@@ -346,8 +351,11 @@ export const UserLibrary = () => {
     return <FileText className="w-4 h-4" />;
   };
 
-  // Get unique folders from media
-  const allFolders = Array.from(new Set(mediaList.map((m) => m.folder).filter(Boolean)));
+  // Folders come from the dedicated endpoint: mediaList is filtered to the
+  // current folder only, so deriving folders from it would hide every other
+  // folder (including newly created ones) from the root folder grid.
+  const allFolders = folders.map((folder) => folder.name);
+  const folderCountMap = new Map(folders.map((folder) => [folder.name, folder.count]));
   
   // Pagination for folders
   const paginatedFolders = allFolders.slice(
@@ -455,7 +463,7 @@ export const UserLibrary = () => {
                         <Folder className="w-6 h-6 sm:w-8 sm:h-8 text-blue-500 mb-1 sm:mb-2" />
                         <div className="text-xs sm:text-sm font-medium truncate">{folder}</div>
                         <div className="text-[10px] sm:text-xs text-gray-500">
-                          {mediaList.filter((m) => m.folder === folder).length} files
+                          {folderCountMap.get(folder) ?? 0} files
                         </div>
                       </div>
                     ))}

@@ -12,7 +12,7 @@ export interface IGlobalConfig extends Document {
 const GlobalConfigSchema = new Schema<IGlobalConfig>(
   {
     monthlyUploadLimitGB: { type: Number, default: 10 },
-    singleUploadLimitMB: { type: Number, default: 500 },
+    singleUploadLimitMB: { type: Number, default: 2048 },
     apkVersion: { type: String, default: '1.0.0' },
     apkUrl: { type: String },
   },

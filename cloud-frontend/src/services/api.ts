@@ -212,6 +212,7 @@ export const mediaAPI = {
   },
   getMedia: (params?: { section?: number; deviceId?: string; page?: number; limit?: number; search?: string; folder?: string; type?: string }) =>
     api.get('/media', { params }),
+  getFolders: () => api.get('/media/folders'),
   deleteMedia: (id: string) => api.delete(`/media/${id}`),
   assignMedia: (id: string, deviceIds: string[], section?: number) =>
     api.post(`/media/${id}/assign`, { deviceIds, section }),
