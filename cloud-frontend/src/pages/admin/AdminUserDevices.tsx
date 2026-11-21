@@ -29,6 +29,8 @@ export const AdminUserDevices = () => {
   const allDevicesPerPage = 10;
   
   const [alertMessage, setAlertMessage] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const isSubUser = !!user && (user.role === 'sub-user' || !!user.parentId);
+  const canAssignDevices = !!user && !isSubUser;
 
   useEffect(() => {
     if (userId) {
@@ -98,6 +100,10 @@ export const AdminUserDevices = () => {
   };
 
   const handleAssign = async (deviceId: string) => {
+    if (!canAssignDevices) {
+      setAlertMessage({ type: 'error', message: 'Devices can only be assigned to the parent account, not a sub-user.' });
+      return;
+    }
     try {
       await deviceAPI.updateDevice(deviceId, { assignedUserId: userId });
       setAlertMessage({ type: 'success', message: 'Device assigned successfully' });
@@ -154,10 +160,16 @@ export const AdminUserDevices = () => {
         <div>
           <h1 className="text-2xl md:text-3xl font-bold text-gray-900">Device Assignment</h1>
           <p className="text-sm text-gray-600">
-            {user?.email} - {assignedDevices.length} devices assigned
+            {user?.email} · {isSubUser ? 'Sub-user' : `${assignedDevices.length} devices assigned`}
           </p>
         </div>
       </div>
+
+      {isSubUser && (
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+          Device assignment is disabled for sub-users. Assign devices to the parent account instead.
+        </div>
+      )}
 
       {/* Alert Message */}
       {alertMessage && (
@@ -332,15 +344,17 @@ export const AdminUserDevices = () => {
                           <span className="text-[10px] text-gray-500">{device.location || '-'}</span>
                         </div>
                       </div>
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        onClick={() => handleAssign(device.deviceId)}
-                        className="ml-2"
-                      >
-                        <Plus className="w-3 h-3 mr-1" />
-                        Assign
-                      </Button>
+                      {canAssignDevices && (
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={() => handleAssign(device.deviceId)}
+                          className="ml-2"
+                        >
+                          <Plus className="w-3 h-3 mr-1" />
+                          Assign
+                        </Button>
+                      )}
                     </div>
                   ))}
                 </div>

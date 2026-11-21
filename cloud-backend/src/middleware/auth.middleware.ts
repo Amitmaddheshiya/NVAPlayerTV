@@ -7,6 +7,17 @@ export interface AuthRequest extends Request {
   userId?: string;
   userRole?: string;
   deviceId?: string;
+  /** Owner account used for device/group/media ownership. Equals userId for normal users, parentId for sub-users. */
+  effectiveUserId?: string;
+  isSubUser?: boolean;
+  permissions?: {
+    devices?: boolean;
+    groups?: boolean;
+    library?: boolean;
+    settings?: boolean;
+    subUsers?: boolean;
+  };
+  resourceAccess?: { devices: string[]; groups: string[] };
 }
 
 export const verifyDeviceToken = async (token: string, expectedDeviceId?: string): Promise<string | null> => {
@@ -48,13 +59,21 @@ export const auth = async (req: AuthRequest, res: Response, next: NextFunction):
     }
 
     const decoded = jwt.verify(token, env.JWT_SECRET) as { userId: string; role: string };
-    const user = await User.findById(decoded.userId).select('role');
+    const user = await User.findById(decoded.userId).select('role parentId permissions resourceAccess');
     if (!user || user.role !== decoded.role) {
       res.status(401).json({ error: 'User session is no longer valid' });
       return;
     }
     req.userId = decoded.userId;
     req.userRole = decoded.role;
+    const isSubUser = user.role === 'sub-user' || !!user.parentId;
+    req.isSubUser = isSubUser;
+    req.effectiveUserId = isSubUser ? String(user.parentId) : decoded.userId;
+    req.permissions = user.permissions as AuthRequest['permissions'];
+    req.resourceAccess = {
+      devices: Array.isArray(user.resourceAccess?.devices) ? user.resourceAccess.devices.map(String) : [],
+      groups: Array.isArray(user.resourceAccess?.groups) ? user.resourceAccess.groups.map(String) : [],
+    };
 
     console.log(`Auth: userId=${req.userId}, role=${req.userRole}`);
     next();
@@ -75,7 +94,7 @@ export const adminOnly = (req: AuthRequest, res: Response, next: NextFunction): 
 };
 
 export const userOrAdmin = (req: AuthRequest, res: Response, next: NextFunction): void => {
-  if (req.userRole !== 'admin' && req.userRole !== 'user') {
+  if (req.userRole !== 'admin' && req.userRole !== 'user' && req.userRole !== 'sub-user') {
     res.status(403).json({ error: 'User or admin access required' });
     return;
   }

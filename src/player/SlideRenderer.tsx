@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Animated, Dimensions, Easing, Image, StyleSheet, Text, View } from "react-native";
 import { WebView } from "react-native-webview";
 import RNFS from "react-native-fs";
@@ -44,6 +44,7 @@ const CLOUD_EMBED_APP_ORIGIN = "https://com.signageplayertv";
 let cloudPlaybackPinSequence = 0;
 const HOLD_LARGE_VIDEO_UNTIL_CACHED = false;
 const VIDEO_PROGRESS_SAVE_INTERVAL_MS = 1000;
+const EMPTY_MEDIA_URLS: string[] = [];
 
 function buildCloudYoutubeEmbedUrl(url: string): string {
   const videoId = extractYoutubeId(url);
@@ -54,7 +55,7 @@ function buildCloudYoutubeEmbedUrl(url: string): string {
 }
 
 function buildCloudSocialEmbedHtml(embedUrl: string, aspect: number, fit: "cover" | "contain" = "cover"): string {
-  const safeEmbedUrl = embedUrl.replace(/&/g, "&amp;").replace(/\"/g, "&quot;");
+  const safeEmbedUrl = embedUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
   return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>html,body{position:fixed;inset:0;margin:0;width:100%;height:100%;overflow:hidden;background:#000}iframe{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);border:0;overflow:hidden}</style></head><body><iframe id="embedded-video-player" src="${safeEmbedUrl}" title="Embedded video player" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe><script>const player=document.getElementById('embedded-video-player');function fitPlayer(){const vw=document.documentElement.clientWidth;const vh=document.documentElement.clientHeight;let w=vw;let h=w/${aspect};if('${fit}'==='cover'?h<vh:h>vh){h=vh;w=h*${aspect};}player.style.width=Math.ceil(w)+'px';player.style.height=Math.ceil(h)+'px';}window.addEventListener('resize',fitPlayer);fitPlayer();</script></body></html>`;
 }
 
@@ -92,6 +93,8 @@ export default function SlideRenderer({
   const [files, setFiles] = useState<any[]>([]);
   const [index, setIndex] = useState(0);
   const [uri, setUri] = useState("");
+  const uriRef = useRef(uri);
+  uriRef.current = uri;
   const [videoReloadToken, setVideoReloadToken] = useState(0);
   const [videoBuffering, setVideoBuffering] = useState(false);
   const [videoFrameReady, setVideoFrameReady] = useState(false);
@@ -180,6 +183,12 @@ export default function SlideRenderer({
   // Invalidates callbacks created for an older playlist/item. This prevents a
   // delayed timer from advancing the newly-applied CMS/USB playlist.
   const playbackTimerGenerationRef = useRef(0);
+  const goNextRef = useRef<() => void>(() => undefined);
+  const scheduleRetryLoadRef = useRef<() => void>(() => undefined);
+  const handleRenderErrorRef = useRef<() => void>(() => undefined);
+  const isNextImageReadyRef = useRef<() => boolean>(() => false);
+  const onPlaybackErrorRef = useRef(onPlaybackError);
+  onPlaybackErrorRef.current = onPlaybackError;
   const lastVideoAdvanceIdentityRef = useRef<string>("");
   const lastCloudAdvanceTokenRef = useRef<string>("");
   const lastCloudAdvanceIndexRef = useRef(0);
@@ -192,8 +201,10 @@ export default function SlideRenderer({
   const durationStoreKey = `playback:durations:section:${sectionIndex}`;
   const lastSectionStateKey = `playback:last:section:${sectionIndex}`;
 
-  const getPlaybackResumeKey = (item: any) =>
-    buildPlaybackResumeKey(sectionIndex, getMediaContentIdentity(item));
+  const getPlaybackResumeKey = useCallback(
+    (item: any) => buildPlaybackResumeKey(sectionIndex, getMediaContentIdentity(item)),
+    [sectionIndex]
+  );
 
   const persistDurationMap = async () => {
     try {
@@ -212,7 +223,7 @@ export default function SlideRenderer({
     }
   };
 
-  const clearAllSavedVideoPositions = async (list: any[]) => {
+  const clearAllSavedVideoPositions = useCallback(async (list: any[]) => {
     if (!Array.isArray(list) || !list.length) return;
     try {
       await Promise.allSettled(
@@ -223,15 +234,15 @@ export default function SlideRenderer({
     } catch {
       // ignore cleanup errors
     }
-  };
+  }, [getPlaybackResumeKey]);
 
-  const clearSectionPlaybackState = async () => {
+  const clearSectionPlaybackState = useCallback(async () => {
     try {
       await AsyncStorage.removeItem(lastSectionStateKey);
     } catch {
       // ignore cleanup errors
     }
-  };
+  }, [lastSectionStateKey]);
 
   const savePlaybackProgress = async (item: any, positionMs: number, durationMs: number) => {
     if (!item || !isVideoFile(item)) return;
@@ -319,7 +330,41 @@ export default function SlideRenderer({
     }, 80);
   };
 
-  const getEstimatedItemDurationMs = (item: any, fallbackSlideMs: number) => {
+  const sectionConfig = config?.sections?.[sectionIndex] || {};
+  const currentFile = files[index] || null;
+  const sourceType = sectionConfig?.contentType || sectionConfig?.sourceType || SOURCE_TYPES.multimedia;
+  const sourceUrl = sectionConfig?.webUrl || sectionConfig?.youtubeUrl || sectionConfig?.sourceUrl || "";
+  const sectionMediaUrls = Array.isArray(sectionConfig?.mediaUrls) ? sectionConfig.mediaUrls : EMPTY_MEDIA_URLS;
+  const sectionMediaItems = sectionConfig?.mediaItems;
+  const playlistNames = Array.isArray(sectionConfig?.playlistNames) ? sectionConfig.playlistNames : undefined;
+  const sectionMediaUrlsKey = JSON.stringify(sectionMediaUrls);
+  const playlistNamesKey = JSON.stringify(playlistNames || []);
+  const sectionMediaItemsKey = JSON.stringify(sectionMediaItems || []);
+  // Preserve the old content-based effect keys without restarting playback
+  // when a parent recreates equivalent config arrays on an unrelated render.
+  const mediaUrlsForLoad = useMemo<string[]>(() => JSON.parse(sectionMediaUrlsKey), [sectionMediaUrlsKey]);
+  const mediaItemsForLoad = useMemo<any[]>(() => JSON.parse(sectionMediaItemsKey), [sectionMediaItemsKey]);
+  const playlistNamesForLoad = useMemo<string[] | undefined>(() => {
+    const names = JSON.parse(playlistNamesKey) as string[];
+    return names.length ? names : undefined;
+  }, [playlistNamesKey]);
+  const sectionSlideDuration = config?.sections?.[sectionIndex]?.slideDuration;
+  const globalSlideDuration = config?.slideDuration;
+  const getSlideDurationMs = useCallback(
+    () => Math.max(1, Number(sectionSlideDuration || globalSlideDuration || 5)) * 1000,
+    [sectionSlideDuration, globalSlideDuration]
+  );
+  const cacheEligibleFiles = files.filter(isCacheEligible);
+  const cacheEligibleTotal = cacheEligibleFiles.length;
+  const cachedCount = cacheEligibleFiles.reduce((count, entry) => {
+    const pathKey = String(entry?.url || "");
+    const progress = pathKey ? Number(cacheProgressByPath[pathKey] || 0) : 0;
+    const hasLocalPath = !!String(entry?.localPath || "").trim();
+    const hasLocalUri = isLocalPlayableUri(String(entry?.remoteUrl || ""));
+    return hasLocalPath || hasLocalUri || progress >= 100 ? count + 1 : count;
+  }, 0);
+  const isListFullyCached = cacheEligibleTotal > 0 && cachedCount >= cacheEligibleTotal;
+  const getEstimatedItemDurationMs = useCallback((item: any, fallbackSlideMs: number) => {
     if (!item) return 0;
     if (isVideoFile(item)) {
       const identity = getMediaContentIdentity(item);
@@ -334,13 +379,7 @@ export default function SlideRenderer({
       }
     }
     return fallbackSlideMs;
-  };
-
-  const sectionConfig = config?.sections?.[sectionIndex] || {};
-  const sourceType = sectionConfig?.contentType || sectionConfig?.sourceType || SOURCE_TYPES.multimedia;
-  const sourceUrl = sectionConfig?.webUrl || sectionConfig?.youtubeUrl || sectionConfig?.sourceUrl || "";
-  const sectionMediaUrls = Array.isArray(sectionConfig?.mediaUrls) ? sectionConfig.mediaUrls : [];
-  const playlistNames = Array.isArray(sectionConfig?.playlistNames) ? sectionConfig.playlistNames : undefined;
+  }, [currentFile]);
   const sourceTemplates = Array.isArray(sectionConfig?.sourceTemplates)
     ? sectionConfig.sourceTemplates
     : sectionConfig?.sourceTemplate
@@ -481,7 +520,7 @@ export default function SlideRenderer({
     return () => {
       cancelled = true;
     };
-  }, [files, sourceType, sectionIndex, lastSectionStateKey]);
+  }, [files, sourceType, sectionIndex, lastSectionStateKey, clearSectionPlaybackState, clearAllSavedVideoPositions]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -536,7 +575,7 @@ export default function SlideRenderer({
     if (skipLoopGuardRef.current >= files.length) return;
     setTimeout(() => {
       if (!isMountedRef.current) return;
-      goNext();
+      goNextRef.current();
     }, 0);
   }, [files, index, sourceType]);
 
@@ -585,10 +624,12 @@ export default function SlideRenderer({
           setFiles((prev) => (areMediaListsEqual(prev, list) ? prev : list));
           setIndex(findMatchingIndex(list, filesRef.current[indexRef.current], indexRef.current));
         }
-      } catch (_e) {
+      } catch {
+        // A transient media lookup failure is retried on the next cycle.
       }
     }, 4000);
   };
+  scheduleRetryLoadRef.current = scheduleRetryLoad;
 
   const handleRenderError = () => {
     const activeFile = files[index];
@@ -676,6 +717,7 @@ export default function SlideRenderer({
     }
     scheduleRetryLoad();
   };
+  handleRenderErrorRef.current = handleRenderError;
 
   const handlePdfError = () => {
     if (pdfRetryCountRef.current < MAX_PDF_RETRY) {
@@ -726,11 +768,10 @@ export default function SlideRenderer({
         // replace a two-item Cloud playlist with a partial list. LAN retains
         // its existing fullscreen media service behavior.
         if (cloudMode || isMultiPaneLayout) {
-          if (sectionMediaUrls.length > 0) {
-            const sectionItems = config?.sections?.[sectionIndex]?.mediaItems;
-            list = sectionMediaUrls.map((url: string) => {
-              const metadata = Array.isArray(sectionItems)
-                ? sectionItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+          if (mediaUrlsForLoad.length > 0) {
+            list = mediaUrlsForLoad.map((url: string) => {
+              const metadata = Array.isArray(mediaItemsForLoad)
+                ? mediaItemsForLoad.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
                 : null;
               const videoExtension = String(metadata?.originalName || metadata?.name || url)
                 .split('?')[0]
@@ -756,8 +797,8 @@ export default function SlideRenderer({
               const cloudItems = list;
               list = await resolveCachedMediaItems(cloudItems);
               if (cancelled || !isMountedRef.current) return;
-              if (cloudItems.some((item: any, index: number) => item.remoteUrl === list[index]?.remoteUrl)) {
-                void prefetchMediaItems(cloudItems).then(async () => {
+              if (cloudItems.some((item: any, playlistIndex: number) => item.remoteUrl === list[playlistIndex]?.remoteUrl)) {
+                prefetchMediaItems(cloudItems).then(async () => {
                   const cachedItems = await resolveCachedMediaItems(cloudItems);
                   if (cancelled || !isMountedRef.current) return;
                   setFiles((prev) => {
@@ -765,7 +806,7 @@ export default function SlideRenderer({
                     const playbackChanged = cachedItems.some((item, i) => item?.localPath !== prev[i]?.localPath || item?.remoteUrl !== prev[i]?.remoteUrl);
                     return playbackChanged ? cachedItems : prev;
                   });
-                });
+                }).catch(() => undefined);
               }
             }
           } else {
@@ -783,7 +824,7 @@ export default function SlideRenderer({
           }
         } else {
           // Fullscreen layout: use legacy getMediaFiles behavior
-          list = await getMediaFiles(sectionIndex, playlistNames);
+          list = await getMediaFiles(sectionIndex, playlistNamesForLoad);
         }
 
         if (cancelled || !isMountedRef.current) return;
@@ -815,8 +856,8 @@ export default function SlideRenderer({
             clearTimeout(pendingAdvanceRef.current);
             pendingAdvanceRef.current = null;
           }
-          void clearSectionPlaybackState();
-          void clearAllSavedVideoPositions(filesRef.current);
+          clearSectionPlaybackState().catch(() => undefined);
+          clearAllSavedVideoPositions(filesRef.current).catch(() => undefined);
           setFiles([]);
           setIndex(0);
           setUri("");
@@ -832,11 +873,11 @@ export default function SlideRenderer({
           setFiles([]);
           setIndex(0);
         }
-        scheduleRetryLoad();
+        scheduleRetryLoadRef.current();
       } catch (error) {
         if (cancelled) return;
         console.log("Media load error:", error);
-        scheduleRetryLoad();
+        scheduleRetryLoadRef.current();
       }
     };
     load();
@@ -845,7 +886,7 @@ export default function SlideRenderer({
       // the newer section playlist after a save or reconnect.
       cancelled = true;
     };
-  }, [sectionIndex, server, mediaVersion, sourceType, sourceUrl, JSON.stringify(playlistNames || []), JSON.stringify(sectionMediaUrls), isMultiPaneLayout, cloudMode]);
+  }, [sectionIndex, server, mediaVersion, sourceType, sourceUrl, playlistNamesForLoad, mediaUrlsForLoad, mediaItemsForLoad, isMultiPaneLayout, cloudMode, clearSectionPlaybackState, clearAllSavedVideoPositions]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.template || sourceTemplates.length <= 1) {
@@ -858,13 +899,14 @@ export default function SlideRenderer({
       setTemplateIndex((prev) => (prev + 1) % sourceTemplates.length);
     }, durationMs);
     return () => clearInterval(timer);
-  }, [sourceType, sourceTemplates.length, sectionIndex, config?.sections, playerPaused]);
+  }, [sourceType, sourceTemplates.length, sectionIndex, config?.sections, playerPaused, getSlideDurationMs]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
     if (!files.length) return;
     videoRetryCountRef.current = 0;
     setVideoReloadToken(0);
+    const currentUri = uriRef.current;
 
     const file = files[index];
     const identity = getMediaIdentity(file);
@@ -942,7 +984,7 @@ export default function SlideRenderer({
     const hasLocalPlayableForNext =
       isLocalPlayableUri(normalizeMediaUri(String(file?.remoteUrl || ""))) ||
       isLocalPlayableUri(nextUri);
-    const currentStreamToken = cloudMode ? getUrlQueryValue(uri, "deviceToken") : "";
+    const currentStreamToken = cloudMode ? getUrlQueryValue(currentUri, "deviceToken") : "";
     const refreshedStreamUrl = cloudMode
       ? normalizeMediaUri(String(file?.streamUrl || ""))
       : "";
@@ -953,7 +995,7 @@ export default function SlideRenderer({
       currentStreamToken &&
       refreshedStreamToken &&
       currentStreamToken !== refreshedStreamToken &&
-      /^https?:\/\//i.test(uri) &&
+      /^https?:\/\//i.test(currentUri) &&
       /^https?:\/\//i.test(refreshedStreamUrl)
     ) {
       // Refresh an hour-lived device stream URL at its natural token renewal
@@ -984,9 +1026,9 @@ export default function SlideRenderer({
     if (
       indexRef.current === index &&
       pinnedContentIdentityRef.current === contentIdentity &&
-      uri &&
+      currentUri &&
       nextUri &&
-      nextUri !== uri &&
+      nextUri !== currentUri &&
       server
     ) {
       return;
@@ -994,10 +1036,10 @@ export default function SlideRenderer({
 
     if (
       isVideo &&
-      uri &&
+      currentUri &&
       nextUri &&
-      nextUri !== uri &&
-      /^https?:\/\//i.test(uri) &&
+      nextUri !== currentUri &&
+      /^https?:\/\//i.test(currentUri) &&
       isLocalPlayableUri(nextUri)
     ) {
       // Keep the active stream stable; switch to local on the next video load only.
@@ -1005,7 +1047,7 @@ export default function SlideRenderer({
     }
 
     pinnedContentIdentityRef.current = contentIdentity;
-    if (!nextUri && uri && pinnedContentIdentityRef.current === contentIdentity) {
+    if (!nextUri && currentUri && pinnedContentIdentityRef.current === contentIdentity) {
       // Avoid dropping to blank when source is temporarily unavailable.
       return;
     }
@@ -1021,7 +1063,7 @@ export default function SlideRenderer({
       lastGoodAnyUriRef.current = nextUri;
     }
     setUri(nextUri || "");
-  }, [files, index, server, sourceType, mediaVersion, cloudMode]);
+  }, [files, index, server, sourceType, mediaVersion, cloudMode, isListFullyCached]);
 
   useEffect(() => {
     if (!playlistRestoreReady) return;
@@ -1077,7 +1119,7 @@ export default function SlideRenderer({
     return () => {
       cancelled = true;
     };
-  }, [files, index, sourceType, sectionIndex, playlistRestoreReady]);
+  }, [files, index, sourceType, sectionIndex, playlistRestoreReady, getPlaybackResumeKey]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) {
@@ -1200,14 +1242,6 @@ export default function SlideRenderer({
     });
   }, [files, index, uri, sourceType, server, mediaVersion, imageVisibleSlot, imageSlotUrls, imageSlotLoaded, cloudMode]);
 
-  const getSlideDurationMs = () => {
-    const raw =
-      config?.sections?.[sectionIndex]?.slideDuration ||
-      config?.slideDuration ||
-      5;
-    return Math.max(1, Number(raw || 5)) * 1000;
-  };
-
   const activeImageFile = files[index];
   const activeImageType = String(activeImageFile?.type || "").toLowerCase();
   const activeIsPdf = activeImageType === "pdf" || /\.pdf$/i.test(activeImageFile?.originalName || activeImageFile?.name || "");
@@ -1238,8 +1272,8 @@ export default function SlideRenderer({
         message: "Image failed to load",
       });
     }
-    if (filesRef.current.length > 1) goNext();
-    else handleRenderError();
+    if (filesRef.current.length > 1) goNextRef.current();
+    else handleRenderErrorRef.current();
   };
 
   useEffect(() => {
@@ -1251,8 +1285,8 @@ export default function SlideRenderer({
       if (normalizeMediaUri(uri) !== watchedUri || !active || isVideoFile(active)) return;
       if (!failedCloudImageUrisRef.current.has(watchedUri)) {
         failedCloudImageUrisRef.current.add(watchedUri);
-        if (typeof onPlaybackError === "function") {
-          onPlaybackError({
+        if (typeof onPlaybackErrorRef.current === "function") {
+          onPlaybackErrorRef.current({
             section: sectionIndex + 1,
             name: active.originalName || active.name || "Image media",
             mediaType: active.type || "image",
@@ -1260,7 +1294,7 @@ export default function SlideRenderer({
           });
         }
       }
-      if (filesRef.current.length > 1) goNext();
+      if (filesRef.current.length > 1) goNextRef.current();
     }, 15000);
     return () => clearTimeout(timeout);
   }, [cloudMode, currentImageUri, cloudImageLoadedUri, playerPaused, uri, files, index, sectionIndex]);
@@ -1277,12 +1311,12 @@ export default function SlideRenderer({
     const watchdog = setInterval(() => {
       if (!filesRef.current.length || filesRef.current.length === 1) return;
       const elapsed = Date.now() - lastIndexChangeAtRef.current;
-      if (elapsed > getSlideDurationMs() * 1.6 && isNextImageReady()) {
-        goNext();
+      if (elapsed > getSlideDurationMs() * 1.6 && isNextImageReadyRef.current()) {
+        goNextRef.current();
       }
     }, 1200);
     return () => clearInterval(watchdog);
-  }, [files, index, sourceType, config, sectionIndex, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused, cloudMode]);
+  }, [files, index, sourceType, config, sectionIndex, imageSlotLoaded, imageSlotUrls, imageVisibleSlot, playerPaused, cloudMode, getSlideDurationMs]);
 
   const getNextIndexForPlayback = () => {
     if (!files.length) return indexRef.current;
@@ -1316,9 +1350,9 @@ export default function SlideRenderer({
       };
       const activeFile = filesRef.current[indexRef.current];
       const activeType = String(activeFile?.type || "").toLowerCase();
-      const activeIsText = activeType === "text" || /\.txt$/i.test(activeFile?.originalName || activeFile?.name || "");
-      const activeIsPdf = activeType === "pdf" || /\.pdf$/i.test(activeFile?.originalName || activeFile?.name || "");
-      if (!isVideoFile(activeFile) && !activeIsText && !activeIsPdf) {
+      const cloudActiveIsText = activeType === "text" || /\.txt$/i.test(activeFile?.originalName || activeFile?.name || "");
+      const cloudActiveIsPdf = activeType === "pdf" || /\.pdf$/i.test(activeFile?.originalName || activeFile?.name || "");
+      if (!isVideoFile(activeFile) && !cloudActiveIsText && !cloudActiveIsPdf) {
         const currentSlot = imageDesiredSlotRef.current;
         const expectedCurrentUri = resolveCloudImageUri(activeFile);
         if (
@@ -1333,6 +1367,7 @@ export default function SlideRenderer({
     }
     return !!imageSlotLoaded[nextSlot];
   };
+  isNextImageReadyRef.current = isNextImageReady;
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -1343,7 +1378,7 @@ export default function SlideRenderer({
     const key = items.map((item) => getMediaStableIdentity(item)).join("|");
     if (!key || key === prefetchKeyRef.current) return;
     prefetchKeyRef.current = key;
-    void prefetchMediaItems(items).then(async () => {
+    prefetchMediaItems(items).then(async () => {
       if (!cloudMode) return;
       const cachedItems = await resolveCachedMediaItems(files);
       setFiles((prev) => {
@@ -1351,7 +1386,7 @@ export default function SlideRenderer({
         const playbackChanged = cachedItems.some((item, i) => item?.localPath !== prev[i]?.localPath || item?.remoteUrl !== prev[i]?.remoteUrl);
         return playbackChanged ? cachedItems : prev;
       });
-    });
+    }).catch(() => undefined);
   }, [files, index, sourceType, cloudMode]);
 
   useEffect(() => {
@@ -1418,7 +1453,7 @@ export default function SlideRenderer({
       const RETRY_DELAY_MS = 500;
       for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
         try {
-          const list = await getMediaFiles(sectionIndex, playlistNames);
+          const list = await getMediaFiles(sectionIndex, playlistNamesForLoad);
           if (cancelled || !isMountedRef.current) return;
           if (Array.isArray(list) && list.length) {
             setFiles((prev) => (areMediaListsEqual(prev, list) ? prev : list));
@@ -1429,7 +1464,7 @@ export default function SlideRenderer({
             );
             if (activeItem) {
               const localUri = normalizeMediaUri(String(activeItem?.remoteUrl || ""));
-              if (isLocalPlayableUri(localUri) && localUri !== uri) {
+              if (isLocalPlayableUri(localUri) && localUri !== uriRef.current) {
                 const localPath = localUri.replace(/^file:\/\//i, "");
                 const exists = /^file:\/\//i.test(localUri) ? await RNFS.exists(localPath) : true;
                 if (exists) {
@@ -1443,12 +1478,12 @@ export default function SlideRenderer({
                     setVideoReloadToken((prev) => prev + 1);
                     return;
                   }
-                  if (!uri) {
+                  if (!uriRef.current) {
                     setUri(localUri);
                   }
                   return;
                 }
-              } else if (localUri && localUri === uri) {
+              } else if (localUri && localUri === uriRef.current) {
                 return;
               }
             }
@@ -1466,7 +1501,7 @@ export default function SlideRenderer({
     return () => {
       cancelled = true;
     };
-  }, [cacheProgress, files, index, sectionIndex, sourceType, cloudMode]);
+  }, [cacheProgress, files, index, sectionIndex, sourceType, cloudMode, playlistNamesForLoad]);
 
   useEffect(() => {
     if (sourceType !== SOURCE_TYPES.multimedia) return;
@@ -1553,9 +1588,9 @@ export default function SlideRenderer({
       cloudVideoStallCountRef.current[activeIdentity] = stallCount;
       if (stallCount >= 3) {
         if (filesRef.current.length > 1) {
-          goNext();
-        } else if (stallCount === 3 && typeof onPlaybackError === "function") {
-          onPlaybackError({
+          goNextRef.current();
+        } else if (stallCount === 3 && typeof onPlaybackErrorRef.current === "function") {
+          onPlaybackErrorRef.current({
             section: sectionIndex + 1,
             name: active.originalName || active.name || "Video media",
             mediaType: active.type || "video",
@@ -1564,7 +1599,7 @@ export default function SlideRenderer({
         }
         return;
       }
-      handleRenderError();
+      handleRenderErrorRef.current();
     }, 5000);
     return () => clearInterval(watchdog);
   }, [cloudMode, playerPaused, sourceType, files, index, uri, videoReloadToken, onPlaybackError, sectionIndex]);
@@ -1595,7 +1630,7 @@ export default function SlideRenderer({
     readyTimeoutRef.current = setTimeout(() => {
       if (!isMountedRef.current) return;
       if (videoReadyRef.current) return;
-      handleRenderError();
+      handleRenderErrorRef.current();
     }, VIDEO_READY_TIMEOUT_MS);
     return () => {
       if (readyTimeoutRef.current) {
@@ -1757,6 +1792,14 @@ export default function SlideRenderer({
     if (!files.length) return;
 
     if (timerRef.current) clearTimeout(timerRef.current);
+    // A section with one asset has nothing to advance to. Do not create a
+    // slide-duration deadline for it: both LAN and Cloud render through this
+    // component, so this keeps the only image/PDF/text item visually stable.
+    if (files.length < 2) {
+      pausedSlideRemainingMsRef.current = null;
+      slideDeadlineRef.current = 0;
+      return;
+    }
     if (playerPaused) return;
     const timerGeneration = ++playbackTimerGenerationRef.current;
     const file = files[index];
@@ -1777,19 +1820,19 @@ export default function SlideRenderer({
         if (playbackTimerGenerationRef.current !== timerGeneration || !isMountedRef.current) return;
         if (isImage) {
           slideDeadlineRef.current = 0;
-          goNext();
+          goNextRef.current();
           return;
         }
         const cloudImageWaitExpired =
           cloudMode &&
           slideDeadlineRef.current > 0 &&
           Date.now() - slideDeadlineRef.current >= 1500;
-        if (isNextImageReady() || cloudImageWaitExpired) {
-          if (cloudImageWaitExpired && !isNextImageReady()) {
+        if (isNextImageReadyRef.current() || cloudImageWaitExpired) {
+          if (cloudImageWaitExpired && !isNextImageReadyRef.current()) {
             console.warn(`[Cloud SlideRenderer] section=${sectionIndex + 1} image preload timed out; advancing playlist`);
           }
           slideDeadlineRef.current = 0;
-          goNext();
+          goNextRef.current();
           return;
         }
         if (cloudMode) {
@@ -1800,7 +1843,7 @@ export default function SlideRenderer({
         timerRef.current = setTimeout(() => {
           if (playbackTimerGenerationRef.current !== timerGeneration || !isMountedRef.current) return;
           slideDeadlineRef.current = 0;
-          goNext();
+          goNextRef.current();
         }, 450);
       };
       timerRef.current = setTimeout(() => {
@@ -1824,12 +1867,6 @@ export default function SlideRenderer({
     if (!files.length) return;
     const targetAt = Number(sectionTimeline?.syncAt || playlistSyncAt || 0);
     if (!targetAt) return;
-    const timelineSignature = [
-      String(sectionTimeline?.cycleId || ""),
-      String(sectionTimeline?.mediaSignature || ""),
-      Number(sectionTimeline?.fileCount || 0),
-    ].join("|");
-
     let cancelled = false;
     const runSync = async () => {
       if (cancelled || !isMountedRef.current) return;
@@ -1868,7 +1905,8 @@ export default function SlideRenderer({
     sourceType,
     files.length,
     sectionIndex,
-    lastSectionStateKey,
+    clearSectionPlaybackState,
+    clearAllSavedVideoPositions,
   ]);
 
   useEffect(() => {
@@ -1947,10 +1985,10 @@ export default function SlideRenderer({
     }
     setIndex(nextIndex);
   };
+  goNextRef.current = goNext;
 
   // Keep playback simple: always advance when a video ends.
 
-  const currentFile = files[index] || null;
   const currentFileType = String(currentFile?.type || "").toLowerCase();
   const sectionHasVideo =
     sourceType === SOURCE_TYPES.multimedia && files.some((entry) => isVideoFile(entry));
@@ -2080,7 +2118,7 @@ export default function SlideRenderer({
           txt = await res.text();
         }
         if (!cancelled) setTextContent(txt || "");
-      } catch (_e) {
+      } catch {
         if (!cancelled) setTextContent("Unable to load text file.");
       }
     };
@@ -2134,21 +2172,10 @@ export default function SlideRenderer({
 
     const active = files[index];
     if (!active) return;
-    const localPlayableUri = normalizeMediaUri(String(active?.remoteUrl || ""));
     const isCached = isLocalPlayableUri(uri);
-    const cacheEligibleFiles = files.filter((entry) => isCacheEligible(entry));
-    const allFilesCached =
-      cacheEligibleFiles.length > 0 &&
-      cacheEligibleFiles.every((entry) => {
-      const pathKey = String(entry?.url || "");
-      const progress = pathKey ? Number(cacheProgressByPath[pathKey] || 0) : 0;
-      const hasLocalPath = !!String(entry?.localPath || "").trim();
-      const entryHasLocalUri = isLocalPlayableUri(String(entry?.remoteUrl || ""));
-      return hasLocalPath || entryHasLocalUri || progress >= 100;
-    });
     const cacheStatus = !uri
       ? ""
-      : isCached || allFilesCached
+      : isCached || isListFullyCached
       ? "Cached"
       : server
       ? "Streaming"
@@ -2198,7 +2225,7 @@ export default function SlideRenderer({
       playlistTotalMs,
       progressOnly: isVideo,
     });
-  }, [files, index, sectionIndex, sourceType, sourceUrl, uri, onPlaybackChange, resumePositionMs, playbackClock, server, cacheProgressByPath]);
+  }, [files, index, sectionIndex, sourceType, sourceUrl, uri, onPlaybackChange, resumePositionMs, playbackClock, server, isListFullyCached, getEstimatedItemDurationMs, getSlideDurationMs]);
 
   useEffect(() => {
     const resetPdfState = () => {
@@ -2296,7 +2323,7 @@ export default function SlideRenderer({
       if (nextLoaded.a === prev.a && nextLoaded.b === prev.b) return prev;
       return nextLoaded;
     });
-  }, [files, index, uri, sourceType, server, mediaVersion, pdfVisibleSlot]);
+  }, [files, index, uri, sourceType, server, mediaVersion, pdfVisibleSlot, pdfReloadToken, pdfSlotLoaded]);
 
   const handlePdfLoadEnd = (slot: "a" | "b") => {
     pdfRetryCountRef.current = 0;
@@ -2353,7 +2380,7 @@ export default function SlideRenderer({
     if (!uri && !isTemplateSource) {
       return (
         <View style={styles.center}>
-          <Text style={{ color: "#fff" }}>No URL Configured</Text>
+          <Text style={styles.whiteText}>No URL Configured</Text>
         </View>
       );
     }
@@ -2486,7 +2513,6 @@ export default function SlideRenderer({
   const nextImageUri = imageSlotUrls[nextImageSlot];
   const outerTranslateX = slideImageTrackEnabled ? 0 : translateX;
   const outerTranslateY = slideImageTrackEnabled ? 0 : translateY;
-  const pdfPage = Number(file?.page || 1);
   const uploadTotal = Number(processingCount?.total || 0);
   const uploadDone = Number(processingCount?.uploaded || 0);
   const showProcessingOverlay =
@@ -2500,19 +2526,6 @@ export default function SlideRenderer({
     hasLocalFile ||
     isLocalPlayableUri(String(file?.remoteUrl || "")) ||
     currentCacheProgress >= 100;
-  const totalFiles = files.length;
-  const cacheEligibleFiles = files.filter((entry) => isCacheEligible(entry));
-  const cacheEligibleTotal = cacheEligibleFiles.length;
-  const cachedCount = cacheEligibleTotal
-    ? cacheEligibleFiles.reduce((count, entry) => {
-        const pathKey = String(entry?.url || "");
-        const progress = pathKey ? Number(cacheProgressByPath[pathKey] || 0) : 0;
-        const hasLocalPath = !!String(entry?.localPath || "").trim();
-        const hasLocalUri = isLocalPlayableUri(String(entry?.remoteUrl || ""));
-        const cached = hasLocalPath || hasLocalUri || progress >= 100;
-        return cached ? count + 1 : count;
-      }, 0)
-    : 0;
   const streamingCount = Math.max(0, cacheEligibleTotal - cachedCount);
   const aggregateProgress = cacheEligibleTotal
     ? cacheEligibleFiles.reduce((sum, entry) => {
@@ -2533,7 +2546,6 @@ export default function SlideRenderer({
     : server
     ? "Streaming"
     : "Offline";
-  const isListFullyCached = cacheEligibleTotal > 0 && cachedCount >= cacheEligibleTotal;
   const showCacheBadge = sourceType === SOURCE_TYPES.multimedia && !!cacheStatus;
   const showCacheProgress =
     cacheStatus === "Streaming" && streamingCount > 0 && aggregateProgress > 0 && aggregateProgress < 100;
@@ -3173,6 +3185,9 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "left",
     marginBottom: 8,
+  },
+  whiteText: {
+    color: "#fff",
   },
   emptyHintBox: {
     marginTop: 0,

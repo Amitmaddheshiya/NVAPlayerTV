@@ -56,6 +56,19 @@ export interface IDevice extends Document {
     source: string;
   }>;
   health?: Record<string, unknown>;
+  // Active push emergency alert (message or media) shown fullscreen on the TV
+  emergencyAlert?: {
+    active: boolean;
+    kind?: 'message' | 'media';
+    type: string;
+    title: string;
+    message: string;
+    mediaUrl?: string;
+    mediaType?: string;
+    sound: boolean;
+    triggeredAt: Date;
+    triggeredBy?: Types.ObjectId;
+  } | null;
   // Track who last configured this device
   lastConfiguredBy?: Types.ObjectId;
   lastConfiguredAt?: Date;
@@ -121,6 +134,7 @@ const DeviceSchema = new Schema<IDevice>(
       source: { type: String, default: 'device' },
     }],
     health: { type: Schema.Types.Mixed, default: () => ({ playbackErrorCount: 0, recentErrors: [] }) },
+    emergencyAlert: { type: Schema.Types.Mixed, default: null },
     // Track who last configured this device
     lastConfiguredBy: { type: Schema.Types.ObjectId, ref: 'User' },
     lastConfiguredAt: { type: Date },

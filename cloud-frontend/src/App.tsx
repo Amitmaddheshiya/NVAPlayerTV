@@ -18,15 +18,30 @@ import { UserLibrary } from './pages/user/UserLibrary';
 import { UserSettings } from './pages/user/UserSettings';
 import { UserDeviceDetail } from './pages/user/UserDeviceDetail';
 import { UserGroupConfigure } from './pages/user/UserGroupConfigure';
+import { UserSubUsers } from './pages/user/UserSubUsers';
+import UserSchedules from './pages/user/UserSchedules';
 
 // Protected Route Component
-const ProtectedRoute = ({ children, requiredRole }: { children: React.ReactNode; requiredRole?: 'admin' | 'user' }) => {
+const ProtectedRoute = ({ children, requiredRole, permission }: { children: React.ReactNode; requiredRole?: 'admin' | 'user'; permission?: 'devices' | 'groups' | 'library' | 'settings' | 'subUsers' }) => {
   const token = localStorage.getItem('token');
   const user = JSON.parse(localStorage.getItem('user') || '{}');
-  const userRole = user.role;
+  const storedRole = user.role;
+  const isSubUser = storedRole === 'sub-user' || !!user.isSubUser;
+  const userRole = storedRole === 'sub-user' ? 'user' : storedRole;
 
   if (!token) {
     return <Navigate to="/login" replace />;
+  }
+
+  // Sub-user permission gate: hidden modules are unreachable even via direct URL.
+  if (permission && userRole === 'user' && isSubUser) {
+    const allowed = permission === 'subUsers' ? false : user.permissions?.[permission] !== false;
+    if (!allowed) {
+      return <Navigate to="/user/dashboard" replace />;
+    }
+  }
+  if (permission === 'subUsers' && userRole === 'user' && (isSubUser || Number(user.subUserLimit || 0) <= 0)) {
+    return <Navigate to="/user/dashboard" replace />;
   }
 
   // If no specific role required, just check if logged in
@@ -111,27 +126,39 @@ function App() {
         />
         <Route
           path="/user/devices"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserDevices /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="devices"><UserLayout><UserDevices /></UserLayout></ProtectedRoute>}
         />
         <Route
           path="/user/groups"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserGroups /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="groups"><UserLayout><UserGroups /></UserLayout></ProtectedRoute>}
         />
         <Route
           path="/user/library"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserLibrary /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="library"><UserLayout><UserLibrary /></UserLayout></ProtectedRoute>}
+        />
+        <Route
+          path="/user/sub-users"
+          element={<ProtectedRoute requiredRole="user" permission="subUsers"><UserLayout><UserSubUsers /></UserLayout></ProtectedRoute>}
         />
         <Route
           path="/user/settings"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserSettings /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="settings"><UserLayout><UserSettings /></UserLayout></ProtectedRoute>}
         />
         <Route
           path="/user/devices/:deviceId"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserDeviceDetail /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="devices"><UserLayout><UserDeviceDetail /></UserLayout></ProtectedRoute>}
         />
         <Route
           path="/user/groups/:groupId/configure"
-          element={<ProtectedRoute requiredRole="user"><UserLayout><UserGroupConfigure /></UserLayout></ProtectedRoute>}
+          element={<ProtectedRoute requiredRole="user" permission="groups"><UserLayout><UserGroupConfigure /></UserLayout></ProtectedRoute>}
+        />
+        <Route
+          path="/user/devices/:deviceId/schedules"
+          element={<ProtectedRoute requiredRole="user" permission="devices"><UserLayout><UserSchedules /></UserLayout></ProtectedRoute>}
+        />
+        <Route
+          path="/user/groups/:groupId/schedules"
+          element={<ProtectedRoute requiredRole="user" permission="groups"><UserLayout><UserSchedules /></UserLayout></ProtectedRoute>}
         />
         
         {/* Legacy Routes (for backward compatibility) - redirect to role-based routes */}

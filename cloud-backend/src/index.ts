@@ -9,8 +9,9 @@ import { initializeSocket, pushDeviceHeartbeat } from './socket/socket';
 import { errorHandler, notFound } from './middleware/error.middleware';
 import { fileAccessAuth } from './middleware/fileAccess.middleware';
 import { rateLimit } from './middleware/rateLimit.middleware';
-import { getRedisClient, closeRedisClient } from './config/redis';
+import { getRedisClient, closeRedisClient, cacheDelPattern } from './config/redis';
 import Device from './models/Device';
+import { syncDeviceSchedule } from './services/schedule.service';
 import { ensureTestAdmin } from './config/testAdmin';
 
 import authRoutes from './routes/auth.routes';
@@ -71,6 +72,20 @@ const PORT = env.PORT;
 void (async () => {
   await connectDB();
   await ensureTestAdmin();
+
+  // Reconcile devices that already carry a schedule payload. This also clears
+  // stale payloads when their templates were deleted while the server was
+  // offline, without holding startup open for every device in the database.
+  try {
+    const devices = await Device.find({ 'config.schedule': { $exists: true } });
+    const results = await Promise.allSettled(devices.map((device) => syncDeviceSchedule(device, { push: false })));
+    const failures = results.filter((result) => result.status === 'rejected').length;
+    if (devices.length) console.log(`[Schedule Repair] Reconciled schedule payloads for ${devices.length} device(s)`);
+    if (failures) console.error(`[Schedule Repair] Failed to reconcile ${failures} device(s)`);
+  } catch (error) {
+    console.error('[Schedule Repair] Failed:', error);
+  }
+
   httpServer.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Environment: ${env.NODE_ENV}`);
@@ -96,6 +111,7 @@ setInterval(async () => {
 
     if (staleDevices.length > 0) {
       await Device.updateMany({ _id: { $in: staleDevices.map((device) => device._id) } }, { status: 'offline' });
+      await cacheDelPattern('devices:*');
       console.log(`[Offline Detection] Marked ${staleDevices.length} devices as offline (no heartbeat for ${OFFLINE_THRESHOLD_MINUTES}+ minutes)`);
       for (const device of staleDevices) {
         pushDeviceHeartbeat({ ...device.toObject(), status: 'offline' });

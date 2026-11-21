@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
@@ -28,6 +28,18 @@ export const UserSettings = () => {
     message: '',
     type: 'info',
   });
+
+  // localStorage 'user' (set at login) does not contain assignedDevices,
+  // so fetch the fresh profile which includes device counts.
+  useEffect(() => {
+    userAPI.getMe()
+      .then((res) => {
+        const fresh = res.data;
+        setUser((prev: any) => ({ ...prev, ...fresh }));
+        localStorage.setItem('user', JSON.stringify({ ...JSON.parse(localStorage.getItem('user') || '{}'), ...fresh }));
+      })
+      .catch(() => { /* keep localStorage fallback */ });
+  }, []);
 
   const handleSave = async () => {
     setSaving(true);
@@ -285,7 +297,7 @@ export const UserSettings = () => {
               <CardContent>
                 <div className="p-2 sm:p-3 md:p-4 bg-green-50 rounded-lg">
                   <div className="text-[10px] sm:text-xs md:text-sm text-green-800">Assigned Devices</div>
-                  <div className="text-lg sm:text-xl md:text-2xl font-bold text-green-600">{user.assignedDevices?.length || 0}</div>
+                  <div className="text-lg sm:text-xl md:text-2xl font-bold text-green-600">{user.totalDevices ?? user.assignedDevices?.length ?? 0}</div>
                 </div>
                 <p className="text-[10px] sm:text-xs md:text-sm text-gray-500 mt-1.5 sm:mt-2 md:mt-3">
                   Contact your administrator to manage device assignments.

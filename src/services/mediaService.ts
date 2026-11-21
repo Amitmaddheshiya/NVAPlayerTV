@@ -266,9 +266,17 @@ export async function setMediaCacheMode(mode: MediaCacheMode): Promise<void> {
     }
   }
   applyMediaCacheMode(mode);
-  await cloudService.initialize();
-  await ensureMediaDirs();
-  await migrateLegacyCloudCache();
+  if (mode === "cloud") {
+    await cloudService.initialize();
+    await ensureMediaDirs("cloud");
+    await migrateLegacyCloudCache();
+    return;
+  }
+
+  // LAN startup must not depend on Cloud credentials or Cloud cache files.
+  // The legacy Cloud migration runs when Cloud mode is selected, after its
+  // directory has been created.
+  await ensureMediaDirs("lan");
 }
 
 /** Register the Cloud media item currently being rendered so low-space cache
@@ -870,7 +878,8 @@ async function downloadIfNeeded(
       });
       invalidateCacheSummary();
       return targetPath;
-    } catch {
+    } catch (downloadError: any) {
+      console.warn('=== MEDIA DOWNLOAD FAILED:', String(remoteUrl || remotePath).slice(0, 160), '| attempt', attempt + 1, '| error:', String(downloadError?.message || downloadError));
       try {
         if (await fileExists(tempPath)) {
           await RNFS.unlink(tempPath);
@@ -1638,6 +1647,14 @@ export async function prefetchMediaItems(
     const manifest = await readManifest(mode, safeGeneration);
     const preflightCachedUrls = new Set<string>();
     if (mode === "cloud" && safeGeneration) {
+      // A config update is staged into a fresh generation so the active
+      // playlist can keep playing. Reuse verified files from the active
+      // generation by copying them locally instead of downloading unchanged
+      // media from the server again.
+      const activeManifest = safeGeneration !== activeCloudCacheGeneration
+        ? await readManifest("cloud", activeCloudCacheGeneration)
+        : null;
+      const reuseCandidates: Array<{ item: MediaItem; entry: ManifestEntry }> = [];
       const assignments = new Map<string, number>();
       requestedItems.forEach((item) => {
         const key = String(item.url || "");
@@ -1655,8 +1672,20 @@ export async function prefetchMediaItems(
         if (cached) {
           result.cached += placementCount;
           preflightCachedUrls.add(String(item.url));
+        } else {
+          const previousEntry = activeManifest?.[String(item.url)];
+          if (previousEntry && await isManifestEntryUsable(
+            previousEntry,
+            Number(item.size || 0),
+            Number(item.mtimeMs || 0),
+            String(item.hash || "")
+          )) {
+            reuseCandidates.push({ item, entry: { ...previousEntry } });
+          }
+          // Copying needs space in the staged generation too, so include
+          // reusable media in the same free-space preflight as downloads.
+          requiredBytes += Math.max(0, Number(item.size || 0));
         }
-        else requiredBytes += Math.max(0, Number(item.size || 0));
       }
       const storageInfo = await RNFS.getFSInfo();
       const freeBytes = Math.max(0, Number(storageInfo?.freeSpace || 0));
@@ -1666,6 +1695,53 @@ export async function prefetchMediaItems(
         result.storageBlock = { freeBytes, requiredBytes, reserveBytes };
         await onProgress?.({ ...result });
         return result;
+      }
+
+      const stagedFiles = getCachePaths("cloud", safeGeneration).files;
+      for (const { item, entry } of reuseCandidates) {
+        const url = String(item.url || "");
+        const remotePath = /^https?:\/\//i.test(url) ? url : `${server}${url}`;
+        const targetPath = localPathFor(
+          remotePath,
+          Number(item.section || 1),
+          String(item.originalName || item.name || "media.bin"),
+          stagedFiles
+        );
+        try {
+          if (await fileExists(targetPath)) await RNFS.unlink(targetPath);
+          await RNFS.copyFile(entry.localPath, targetPath);
+          const stagedEntry: ManifestEntry = {
+            ...entry,
+            url,
+            localPath: targetPath,
+            size: Number(item.size || entry.size || 0),
+            mtimeMs: Number(item.mtimeMs || entry.mtimeMs || 0),
+            hash: String(item.hash || entry.hash || "") || undefined,
+            lastSeenAt: Date.now(),
+          };
+          const copiedFileUsable = await isManifestEntryUsable(
+            stagedEntry,
+            Number(item.size || 0),
+            Number(item.mtimeMs || 0),
+            String(item.hash || "")
+          );
+          if (!copiedFileUsable) throw new Error("staged-copy-verification-failed");
+          manifest[url] = stagedEntry;
+          result.cached += assignments.get(url) || 1;
+          preflightCachedUrls.add(url);
+          emitProgress(url, {
+            total: Number(item.size || entry.size || 0),
+            received: Number(item.size || entry.size || 0),
+            percent: 100,
+            updatedAt: Date.now(),
+          });
+        } catch {
+          try {
+            if (await fileExists(targetPath)) await RNFS.unlink(targetPath);
+          } catch {
+            // keep the normal download path as the fallback
+          }
+        }
       }
     }
     const videoTasks: Array<() => Promise<void>> = [];
@@ -1703,10 +1779,11 @@ export async function prefetchMediaItems(
     }
 
     if (otherTasks.length) {
-      await runTasksWithConcurrency(otherTasks, 2);
+      const prefetchConcurrency = Math.max(2, Math.min(4, getAdaptiveDownloadConcurrency()));
+      await runTasksWithConcurrency(otherTasks, prefetchConcurrency);
     }
     if (videoTasks.length) {
-      await runTasksWithConcurrency(videoTasks, 1);
+      await runTasksWithConcurrency(videoTasks, VIDEO_DOWNLOAD_CONCURRENCY);
     }
 
     await writeManifest(manifest);

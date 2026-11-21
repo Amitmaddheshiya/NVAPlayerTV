@@ -1,17 +1,15 @@
 import React, { useState, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View, TextInput, Alert, Dimensions } from "react-native";
 import type { AppMode } from "../services/setupService";
-import cloudService from "../services/cloudService";
-import socketService from "../services/socketService";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { DEFAULT_TEST_CLOUD_API_URL } from "../services/cloudRuntimeConfig";
 
 type Props = {
-  onSelectMode: (mode: AppMode) => void;
+  onSelectMode: (mode: AppMode) => Promise<void> | void;
 };
 
 export default function SetupScreen({ onSelectMode }: Props) {
   const { width, height } = Dimensions.get("window");
-  const isPortrait = height >= width;
   const isSmallScreen = Math.min(width, height) < 720;
   
   const styles = useMemo(() => StyleSheet.create({
@@ -43,42 +41,42 @@ export default function SetupScreen({ onSelectMode }: Props) {
   const [adminFocused, setAdminFocused] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  const handleTvMode = async () => {
-    // Yes TV Mode - LAN only with embedded CMS (no cloud)
-    onSelectMode('tvMode');
+  const [selectingMode, setSelectingMode] = useState<AppMode | null>(null);
+
+  const selectMode = async (mode: AppMode) => {
+    if (loading) return;
+    setLoading(true);
+    setSelectingMode(mode);
+    try {
+      await onSelectMode(mode);
+    } catch (error) {
+      console.error(`Failed to select ${mode}:`, error);
+      Alert.alert("Setup Error", "The mode could not be saved. Please try again.");
+    } finally {
+      setLoading(false);
+      setSelectingMode(null);
+    }
   };
 
   const handleCloudMode = async () => {
+    if (loading) return;
     setLoading(true);
+    setSelectingMode("cloudMode");
     try {
-      // Auto-connect to predefined SERVER_URL
-      const SERVER_URL = "http://192.168.1.4:3000";
-
-      // Test connection first
-      try {
-        const response = await fetch(`${SERVER_URL}/health`);
-        if (!response.ok) throw new Error('Connection failed');
-      } catch (error) {
-        Alert.alert('Error', 'Cannot connect to backend. Please check if server is running at http://192.168.1.4:3000');
-        setLoading(false);
-        return;
-      }
-
-      // Enable cloud mode
-      await cloudService.setCloudMode(true, SERVER_URL);
-      await AsyncStorage.setItem('@signage_cloud_mode', 'true');
-      await AsyncStorage.setItem('@signage_cloud_api_url', SERVER_URL);
-
-      // Connect socket
-      socketService.connect();
-
-      Alert.alert('Success', 'Cloud mode enabled! Device will connect to backend.');
-      onSelectMode('cloudMode');
+      // Store the endpoint, but do not require connectivity to finish setup.
+      const savedUrl = await AsyncStorage.getItem('@signage_cloud_api_url');
+      const apiUrl = String(savedUrl || DEFAULT_TEST_CLOUD_API_URL).trim().replace(/\/+$/, '');
+      await AsyncStorage.multiSet([
+        ['@signage_cloud_api_url', apiUrl],
+        ['@signage_cloud_mode', 'true'],
+      ]);
+      await onSelectMode('cloudMode');
     } catch (error) {
       console.error('Failed to enable cloud mode:', error);
-      Alert.alert('Error', 'Failed to save settings');
+      Alert.alert('Setup Error', 'Cloud mode could not be saved. Please try again.');
     } finally {
       setLoading(false);
+      setSelectingMode(null);
     }
   };
 
@@ -102,14 +100,15 @@ export default function SetupScreen({ onSelectMode }: Props) {
         </Text>
         <View style={styles.actions}>
           <Pressable
-            onPress={handleTvMode}
+            onPress={() => void selectMode('tvMode')}
             onFocus={() => setTvFocused(true)}
             onBlur={() => setTvFocused(false)}
             style={({ pressed }) => [styles.button, tvFocused ? styles.buttonFocused : null, pressed ? styles.buttonPressed : null]}
             focusable
             hasTVPreferredFocus
+            disabled={loading}
           >
-            <Text style={styles.buttonTitle}>Yes — LAN Mode</Text>
+            <Text style={styles.buttonTitle}>{selectingMode === 'tvMode' ? 'Opening LAN Mode...' : 'Yes — LAN Mode'}</Text>
             <Text style={styles.buttonHint}>Offline playback with embedded CMS</Text>
           </Pressable>
           <Pressable
@@ -118,18 +117,20 @@ export default function SetupScreen({ onSelectMode }: Props) {
             onBlur={() => setCloudFocused(false)}
             style={({ pressed }) => [styles.button, styles.cloudButton, cloudFocused ? styles.buttonFocused : null, pressed ? styles.buttonPressed : null]}
             focusable
+            disabled={loading}
           >
-            <Text style={styles.buttonTitle}>Cloud Mode</Text>
+            <Text style={styles.buttonTitle}>{selectingMode === 'cloudMode' ? 'Opening Cloud Mode...' : 'Cloud Mode'}</Text>
             <Text style={styles.buttonHint}>Remote management via cloud</Text>
           </Pressable>
           <Pressable
-            onPress={() => onSelectMode("adminOnlyMode")}
+            onPress={() => void selectMode("adminOnlyMode")}
             onFocus={() => setAdminFocused(true)}
             onBlur={() => setAdminFocused(false)}
             style={({ pressed }) => [styles.button, adminFocused ? styles.buttonFocused : null, pressed ? styles.buttonPressed : null]}
             focusable
+            disabled={loading}
           >
-            <Text style={styles.buttonTitle}>No — Admin Only</Text>
+            <Text style={styles.buttonTitle}>{selectingMode === 'adminOnlyMode' ? 'Opening Admin Only...' : 'No — Admin Only'}</Text>
             <Text style={styles.buttonHint}>Open and manage a TV CMS</Text>
           </Pressable>
         </View>

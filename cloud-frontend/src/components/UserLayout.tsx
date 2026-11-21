@@ -1,6 +1,6 @@
 import { type ReactNode, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Layout, LayoutDashboard, Monitor, Layers, Library, Settings, LogOut, Menu, X } from 'lucide-react';
+import { Layout, LayoutDashboard, Monitor, Layers, Library, Settings, LogOut, Menu, X, Users } from 'lucide-react';
 
 interface UserLayoutProps {
   children: ReactNode;
@@ -11,21 +11,28 @@ export const UserLayout = ({ children }: UserLayoutProps) => {
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
+  const user = JSON.parse(localStorage.getItem('user') || '{}');
+  const isSubUser = user.role === 'sub-user' || !!user.isSubUser;
+  const permissions = user.permissions || {};
+  const canAccess = (key: string) => !isSubUser || permissions[key] !== false;
+
   const menuItems = [
     { path: '/user/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/user/devices', icon: Monitor, label: 'Devices' },
-    { path: '/user/groups', icon: Layers, label: 'Groups' },
-    { path: '/user/library', icon: Library, label: 'Library' },
-    { path: '/user/settings', icon: Settings, label: 'Settings' },
-  ];
+    { path: '/user/devices', icon: Monitor, label: 'Devices', permission: 'devices' },
+    { path: '/user/groups', icon: Layers, label: 'Groups', permission: 'groups' },
+    { path: '/user/library', icon: Library, label: 'Library', permission: 'library' },
+    { path: '/user/sub-users', icon: Users, label: 'Sub-users', subUsersOnly: true },
+    { path: '/user/settings', icon: Settings, label: 'Settings', permission: 'settings' },
+  ].filter((item: any) => {
+    if (item.subUsersOnly) return !isSubUser && Number(user.subUserLimit || 0) > 0;
+    return !item.permission || canAccess(item.permission);
+  });
 
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     navigate('/login');
   };
-
-  const user = JSON.parse(localStorage.getItem('user') || '{}');
 
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col">

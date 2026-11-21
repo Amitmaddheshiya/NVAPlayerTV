@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { BackHandler, Pressable, StyleSheet, Text, TextInput, View, Alert } from "react-native";
+import { BackHandler, NativeEventEmitter, NativeModules, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { WebView } from "react-native-webview";
-import { getAdminCmsUrl, saveAdminCmsUrl, getAppMode } from "../services/setupService";
+import { getAdminCmsUrl, saveAdminCmsUrl } from "../services/setupService";
 import {
   getCmsAccessInfo,
   setAutoReopenEnabled,
@@ -82,7 +82,7 @@ function buildAdminOnlyCmsScript(deviceId: string, deviceUrl: string): string {
   `;
 }
 
-export default function AdminOnlyScreen() {
+export default function AdminOnlyScreen({ onBack }: { onBack: () => void }) {
   const [urlInput, setUrlInput] = useState("");
   const [deviceCmsUrl, setDeviceCmsUrl] = useState("http://127.0.0.1:8080");
   const [deviceId, setDeviceId] = useState("");
@@ -90,23 +90,9 @@ export default function AdminOnlyScreen() {
   const [error, setError] = useState("");
   const [openFocused, setOpenFocused] = useState(false);
   const [backFocused, setBackFocused] = useState(false);
-  const [appMode, setAppMode] = useState<string | null>(null);
+  const [setupBackFocused, setSetupBackFocused] = useState(false);
 
   useEffect(() => {
-    getAppMode().then((mode) => setAppMode(mode));
-  }, []);
-
-  useEffect(() => {
-    // Block CMS access when in cloud mode
-    if (appMode === 'cloudMode') {
-      Alert.alert(
-        'CMS Access Blocked',
-        'App is running in Cloud Mode. Admin Only mode is not available in Cloud Mode. Please use the cloud backend to manage content.',
-        [{ text: 'OK', onPress: () => BackHandler.exitApp() }]
-      );
-      return;
-    }
-
     getAdminCmsUrl().then((url) => setUrlInput(url)).catch(() => undefined);
     startEmbeddedCmsServer();
     const refreshDeviceUrl = () => {
@@ -121,12 +107,32 @@ export default function AdminOnlyScreen() {
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (!activeUrl) return false;
-      setActiveUrl("");
+      if (activeUrl) {
+        setActiveUrl("");
+      } else {
+        onBack();
+      }
       return true;
     });
     return () => subscription.remove();
-  }, [activeUrl]);
+  }, [activeUrl, onBack]);
+
+  useEffect(() => {
+    const deviceModule = NativeModules.DeviceIdModule;
+    if (!deviceModule) return;
+    const emitter = new NativeEventEmitter(deviceModule);
+    const subscription = emitter.addListener("tvRemoteKey", (event: any) => {
+      if (String(event?.eventType || "").toLowerCase() !== "back") return;
+      const keyAction = Number(event?.eventKeyAction ?? -1);
+      if (keyAction !== -1 && keyAction !== 1) return;
+      if (activeUrl) {
+        setActiveUrl("");
+      } else {
+        onBack();
+      }
+    });
+    return () => subscription.remove();
+  }, [activeUrl, onBack]);
 
   const openCms = async () => {
     // Empty input intentionally opens the embedded CMS on this device.
@@ -207,6 +213,15 @@ export default function AdminOnlyScreen() {
         <Text style={styles.description}>
           Scan the QR code shown on the TV or enter its CMS address below. Example: 192.168.1.25:8080
         </Text>
+        <Pressable
+          onPress={onBack}
+          onFocus={() => setSetupBackFocused(true)}
+          onBlur={() => setSetupBackFocused(false)}
+          style={[styles.modeBackButton, setupBackFocused ? styles.focused : null]}
+          focusable
+        >
+          <Text style={styles.buttonText}>Back to Mode Selection</Text>
+        </Pressable>
         <TextInput
           value={urlInput}
           onChangeText={(value) => { setUrlInput(value); setError(""); }}
@@ -244,6 +259,7 @@ const styles = StyleSheet.create({
   error: { marginTop: 8, color: "#ffafaa", fontSize: 13 },
   openButton: { marginTop: 16, alignSelf: "flex-start", minWidth: 200, alignItems: "center", paddingHorizontal: 18, paddingVertical: 14, backgroundColor: "#1d8fff", borderRadius: 10, borderWidth: 2, borderColor: "rgba(129,207,255,0.55)" },
   backButton: { minWidth: 80, alignItems: "center", paddingHorizontal: 14, paddingVertical: 11, backgroundColor: "#1d8fff", borderRadius: 10, borderWidth: 2, borderColor: "rgba(129,207,255,0.55)" },
+  modeBackButton: { marginTop: 16, alignSelf: "flex-start", minWidth: 220, alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: "#1d8fff", borderRadius: 10, borderWidth: 2, borderColor: "rgba(129,207,255,0.55)" },
   focused: { backgroundColor: "#43a6ff", borderColor: "#d3f5ff", transform: [{ scale: 1.04 }] },
   buttonText: { color: "#fff", fontSize: 15, fontWeight: "800" },
   header: { minHeight: 70, flexDirection: "row", alignItems: "center", paddingHorizontal: 14, gap: 12, backgroundColor: "#17202c" },

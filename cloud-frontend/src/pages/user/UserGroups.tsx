@@ -105,11 +105,11 @@ export const UserGroups = () => {
         message: editingGroup ? 'Group updated successfully' : 'Group created successfully',
         type: 'success',
       });
-    } catch (error) {
+    } catch (error: any) {
       setAlertState({
         isOpen: true,
         title: 'Error',
-        message: 'Failed to save group. Please try again.',
+        message: error?.response?.data?.error || 'Failed to save group. Please try again.',
         type: 'error',
       });
     }

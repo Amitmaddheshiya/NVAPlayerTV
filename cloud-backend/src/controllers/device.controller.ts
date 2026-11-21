@@ -6,11 +6,18 @@ import Media from '../models/Media';
 import Group from '../models/Group';
 import User from '../models/User';
 import AuditLog from '../models/AuditLog';
-import { getSocketInstance, pushDeviceHeartbeat, revokeDeviceSockets } from '../socket/socket';
+import { getSocketInstance, pushDeviceHeartbeat, pushEmergencyClearToDevice, pushEmergencyToDevice, pushEmergencyToUser, revokeDeviceSockets } from '../socket/socket';
 import { AuthRequest } from '../middleware/auth.middleware';
 import env from '../config/env';
 import { getMediaPathFromUrl } from '../utils/mediaUrl';
+import { processConfigForStorage } from '../utils/configProcessor';
+import { applyScheduleToConfig } from '../services/schedule.service';
+import ScheduleTemplate from '../models/Schedule';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
+import { countConfiguredMedia, getConfiguredMediaBytes } from '../utils/configMedia';
+
+const hasDeviceScope = (req: AuthRequest, deviceId: string): boolean =>
+  !req.isSubUser || (req.resourceAccess?.devices || []).includes(String(deviceId));
 
 export const getDeviceStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -69,9 +76,10 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
       ];
     }
 
-    // Non-admin users can only see their assigned devices
+    // Non-admin users can only see their assigned devices (sub-users see parent's devices)
     if (req.userRole !== 'admin' && req.userId) {
-      filter.assignedUserId = req.userId;
+      filter.assignedUserId = req.effectiveUserId || req.userId;
+      if (req.isSubUser) filter.deviceId = { $in: req.resourceAccess?.devices || [] };
     }
 
     // Admin can optionally include unassigned devices
@@ -100,14 +108,15 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
 
     let summary: any;
     if (req.userRole !== 'admin') {
-      const assigned = await Device.find({ assignedUserId: req.userId }).select('deviceId status').lean();
+      const ownerId = req.effectiveUserId || req.userId;
+      const assigned = await Device.find({ assignedUserId: ownerId }).select('deviceId status').lean();
       const assignedIds = assigned.map((device: any) => String(device.deviceId));
       const groups = assignedIds.length
         ? await Group.find({ $or: [
-            { ownerId: req.userId },
+            { ownerId },
             { ownerId: { $exists: false }, devices: { $in: assignedIds } },
           ] }).select('devices').lean()
-        : await Group.find({ ownerId: req.userId }).select('devices').lean();
+        : await Group.find({ ownerId }).select('devices').lean();
       const groupedIds = new Set(groups.flatMap((group: any) => group.devices || []));
       summary = {
         totalDevices: assigned.length,
@@ -175,7 +184,7 @@ export const getDevice = async (req: AuthRequest, res: Response): Promise<void> 
     });
 
     // Non-admin users can only access their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       console.log('Access denied: Device not assigned to user');
       res.status(403).json({ error: 'Access denied: Device not assigned to your account' });
       return;
@@ -195,11 +204,16 @@ export const getDeviceConfigHistory = async (req: AuthRequest, res: Response): P
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && device.assignedUserId?.toString() !== req.userId) {
+    if (req.userRole !== 'admin' && (device.assignedUserId?.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-    res.json({ entries: [...(device.configHistory || [])].reverse() });
+    // History is written newest-first, but sort explicitly so legacy records
+    // and any future write path always return newest-first to every client.
+    const entries = [...(device.configHistory || [])].sort(
+      (a: any, b: any) => Number(new Date(b?.savedAt || 0)) - Number(new Date(a?.savedAt || 0))
+    );
+    res.json({ entries });
   } catch (error) {
     console.error('Get device config history error:', error);
     res.status(500).json({ error: 'Failed to fetch configuration history' });
@@ -213,7 +227,7 @@ export const retryCloudSync = async (req: AuthRequest, res: Response): Promise<v
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && device.assignedUserId?.toString() !== req.userId) {
+    if (req.userRole !== 'admin' && (device.assignedUserId?.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -230,10 +244,8 @@ export const retryCloudSync = async (req: AuthRequest, res: Response): Promise<v
     const configVersion = Number(device.cacheInfo.configVersion || 0) + 1;
     device.cacheInfo.configVersion = configVersion;
     device.cacheInfo.lastSyncTime = new Date();
-    const sections = Array.isArray(device.config?.sections) ? device.config.sections : [];
     const previousSync = (device.health as any)?.cloudSync || {};
-    const mediaTotal = sections.reduce((count: number, section: any) =>
-      count + (section?.contentType === 'multimedia' && Array.isArray(section?.mediaUrls) ? section.mediaUrls.length : 0), 0);
+    const mediaTotal = countConfiguredMedia(device.config);
     device.set('health.cloudSync', {
       configVersion,
       status: 'pending',
@@ -275,7 +287,7 @@ export const heartbeat = async (req: Request, res: Response): Promise<void> => {
       { deviceId },
       { $set: update },
       { new: true, runValidators: true }
-    ).select('deviceId name assignedUserId status lastSeen appVersion storage cacheInfo.configVersion config');
+    ).select('deviceId name assignedUserId status lastSeen appVersion storage cacheInfo.configVersion config emergencyAlert');
 
     if (!device) {
       // Device not found - reject connection for security
@@ -287,6 +299,10 @@ export const heartbeat = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Device lists (including their online/offline summaries) are cached by
+    // query for 60 seconds. Heartbeats update status and lastSeen, so clear
+    // those snapshots before the next dashboard/device-page request.
+    await cacheDelPattern('devices:*');
     pushDeviceHeartbeat(device);
 
     // Send the full configuration only when the player's persisted version is stale.
@@ -295,6 +311,7 @@ export const heartbeat = async (req: Request, res: Response): Promise<void> => {
     res.json({
       success: true,
       configVersion,
+      emergencyAlert: device.emergencyAlert || null,
       ...(hasNewConfig && device.config ? { config: device.config } : {}),
     });
   } catch (error) {
@@ -371,7 +388,7 @@ export const reportCloudSyncStatus = async (req: AuthRequest, res: Response): Pr
       deviceId,
       activated: true,
       'cacheInfo.configVersion': configVersion,
-    }).select('health.cloudSync config.sections').lean();
+    }).select('health.cloudSync config.sections config.schedule').lean();
     if (!currentSnapshot) {
       const current = await Device.findOne({ deviceId }).select('cacheInfo.configVersion activated');
       res.status(current?.activated ? 409 : 404).json({
@@ -381,15 +398,16 @@ export const reportCloudSyncStatus = async (req: AuthRequest, res: Response): Pr
       return;
     }
     const savedSync = (currentSnapshot as any).health?.cloudSync || {};
-    const currentConfigSections = Array.isArray((currentSnapshot as any).config?.sections)
-      ? (currentSnapshot as any).config.sections
-      : [];
-    const configuredMediaCount = currentConfigSections.reduce((total: number, section: any) =>
-      total + (section?.contentType === 'multimedia' && Array.isArray(section?.mediaUrls) ? section.mediaUrls.length : 0), 0);
+    const currentConfig = (currentSnapshot as any).config || {};
+    // The TV caches media from the base sections AND every schedule profile,
+    // so the expected total must include both or sync reports get rejected.
+    const configuredMediaCount = countConfiguredMedia(currentConfig);
     const syncSnapshotIsCurrent = Number(savedSync.configVersion) === configVersion;
+    const savedMediaTotal = Math.max(0, Math.trunc(Number(savedSync.mediaTotal ?? 0)));
     const expectedMediaTotal = Math.max(0, Math.trunc(Number(
-      syncSnapshotIsCurrent ? savedSync.mediaTotal ?? configuredMediaCount : configuredMediaCount
+      syncSnapshotIsCurrent && savedMediaTotal > 0 ? savedMediaTotal : configuredMediaCount
     )));
+    const currentConfigSections = Array.isArray(currentConfig.sections) ? currentConfig.sections : [];
     const onlineOnlySections = syncSnapshotIsCurrent
       ? Math.max(0, Math.trunc(Number(savedSync.onlineOnlySections || 0)))
       : currentConfigSections.filter((section: any) =>
@@ -457,7 +475,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     console.log(`=== CONFIG UPDATE: Device found: ${device.name} ===`);
 
     // Non-admin users can only update their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       console.log(`=== CONFIG UPDATE: Access denied for user ${req.userId} ===`);
       res.status(403).json({ error: 'Access denied' });
       return;
@@ -468,102 +486,29 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    // Store previous config for audit
+    // Store previous config for audit (schedule payload is derived, not user content)
     const previousConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
+    if (previousConfig) delete previousConfig.schedule;
 
-    // Keep media type/name/size beside URL-only section assignments. The player
-    // cannot infer (for example) that an opaque file ID is an MP4 from its URL.
-    const configuredMediaUrls = (Array.isArray(config.sections) ? config.sections : [])
-      .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : [])
-      .map((value: string) => getMediaPathFromUrl(value))
-      .filter((path: string | null): path is string => !!path);
-    const uniqueMediaPaths = [...new Set(configuredMediaUrls)];
-    const configuredMedia = uniqueMediaPaths.length
-      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size hash updatedAt createdAt uploadedBy').lean()
-      : [];
-    if (configuredMedia.length !== uniqueMediaPaths.length) {
-      res.status(400).json({ error: 'Configuration contains a media file that no longer exists' });
+    // Validate media and convert the submitted config into the stored shape
+    // (absolute URLs, mediaItems metadata, cleaned fields, legacy mediaUrls).
+    const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId));
+    if (processed.error || !processed.config) {
+      res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
       return;
     }
-    if (req.userRole !== 'admin' && configuredMedia.some((media: any) => media.uploadedBy?.toString() !== req.userId)) {
-      res.status(403).json({ error: 'Configuration can only use media uploaded to your account' });
-      return;
-    }
-    const mediaByPath = new Map(configuredMedia.map((media: any) => [String(media.path), media]));
 
-    if (previousConfig && JSON.stringify(previousConfig) !== JSON.stringify(config)) {
+    if (previousConfig && JSON.stringify(previousConfig) !== JSON.stringify(processed.config)) {
       device.configHistory = [
         { config: previousConfig, configVersion: Number(device.cacheInfo?.configVersion || 0), savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined, source: 'device' },
         ...(device.configHistory || []),
       ].slice(0, 20) as any;
     }
-    device.config = config;
-
-    // Process sections to convert media URLs to absolute and clean up irrelevant fields
-    let allMediaUrls: string[] = [];
-    if (config.sections && Array.isArray(config.sections)) {
-      device.config.sections = config.sections.map((section: any) => {
-        const cleaned = { ...section };
-
-        // Clean up irrelevant fields based on contentType
-        if (cleaned.contentType === 'multimedia') {
-          cleaned.webUrl = '';
-          cleaned.youtubeUrl = '';
-          if (cleaned.mediaUrls && Array.isArray(cleaned.mediaUrls)) {
-            const absoluteUrls = cleaned.mediaUrls.map((url: string) => {
-              if (url.startsWith('/api/media/file/')) {
-                return `${env.SERVER_URL}${url}`;
-              }
-              return url;
-            });
-            cleaned.mediaUrls = absoluteUrls;
-            cleaned.mediaItems = absoluteUrls.map((url: string) => {
-              const mediaPath = getMediaPathFromUrl(url);
-              const media: any = mediaPath ? mediaByPath.get(mediaPath) : null;
-              return media ? {
-                url,
-                name: media.filename || media.originalName,
-                originalName: media.originalName,
-                type: media.mimeType,
-                size: Number(media.size || 0),
-                hash: media.hash,
-                mtimeMs: Number(media.updatedAt?.getTime?.() || media.createdAt?.getTime?.() || 0),
-              } : { url };
-            });
-            allMediaUrls.push(...absoluteUrls);
-          }
-        } else if (cleaned.contentType === 'web') {
-          cleaned.mediaUrls = [];
-          cleaned.youtubeUrl = '';
-        } else if (cleaned.contentType === 'youtube') {
-          cleaned.mediaUrls = [];
-          cleaned.webUrl = '';
-        }
-
-        return cleaned;
-      });
-
-      // For fullscreen layout, create mediaUrls array for backward compatibility
-      if (config.layout === 'fullscreen' && config.sections && config.sections.length > 0) {
-        const firstSection = config.sections[0];
-        if (firstSection.contentType === 'multimedia' && firstSection.mediaUrls) {
-          device.config.mediaUrls = firstSection.mediaUrls;
-        } else {
-          device.config.mediaUrls = [];
-        }
-      } else {
-        // For split/grid layouts, mediaUrls must be empty - TV app reads from sections array only
-        device.config.mediaUrls = [];
-      }
-    } else {
-      // If no sections, clear mediaUrls completely
-      device.config.mediaUrls = [];
-    }
-
-    // Ensure grid2Layout is saved
-    if (config.grid2Layout) {
-      device.config.grid2Layout = config.grid2Layout;
-    }
+    device.config = processed.config;
+    // Re-attach the resolved schedule payload (config.schedule) so template
+    // schedules survive manual config saves.
+    await applyScheduleToConfig(device);
+    const expectedMediaCount = countConfiguredMedia(device.config);
 
     // Track who configured the device
     device.lastConfiguredBy = req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined;
@@ -578,16 +523,13 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     };
     device.cacheInfo.configVersion += 1;
     device.cacheInfo.lastSyncTime = new Date();
-    // Count playlist placements across sections. A shared asset is downloaded
-    // once but is still selected in each section and should count in each.
-    const expectedMediaCount = configuredMediaUrls.length;
     device.set('health.cloudSync', {
       configVersion: device.cacheInfo.configVersion,
       status: 'pending',
       mediaTotal: expectedMediaCount,
       mediaCached: 0,
-      requiredStorageBytes: configuredMedia.reduce((total: number, media: any) => total + Math.max(0, Number(media.size || 0)), 0),
-      onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
+      requiredStorageBytes: getConfiguredMediaBytes(device.config),
+      onlineOnlySections: (Array.isArray(device.config.sections) ? device.config.sections : []).filter((section: any) =>
         (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
         (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
       ).length,
@@ -598,8 +540,8 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     // Update cached media tracking
     const cachedMediaArray: any[] = [];
     let totalCacheSize = 0;
-    if (config.sections && Array.isArray(config.sections)) {
-      config.sections.forEach((section: any, sectionIndex: number) => {
+    if (device.config.sections && Array.isArray(device.config.sections)) {
+      device.config.sections.forEach((section: any, sectionIndex: number) => {
         if (section.contentType === 'multimedia' && section.mediaUrls) {
           section.mediaUrls.forEach((url: string) => {
             // Try to find media by URL
@@ -647,8 +589,12 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     // holding the Save response or delaying the live config event.
     void (async () => {
       try {
-        const mediaDocs = allMediaUrls.length
-          ? await Media.find({ url: { $in: allMediaUrls } })
+        const selectedUrls = new Set(
+          (Array.isArray(device.config.sections) ? device.config.sections : [])
+            .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : [])
+        );
+        const mediaDocs = selectedUrls.size
+          ? await Media.find({ url: { $in: [...selectedUrls] } })
           : [];
         await Promise.all(
           mediaDocs.map(media =>
@@ -657,8 +603,6 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
             })
           )
         );
-
-        const selectedUrls = new Set(allMediaUrls);
         const allDeviceMedia = await Media.find({ assignedDevices: deviceId });
         await Promise.all(
           allDeviceMedia
@@ -679,7 +623,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
             details: {
               deviceName: device.name,
               layout: config.layout,
-              mediaCount: allMediaUrls.length,
+              mediaCount: selectedUrls.size,
               previousConfig: previousConfig ? { layout: previousConfig.layout } : null,
             },
             ipAddress: req.ip,
@@ -709,7 +653,7 @@ export const sendCommand = async (req: AuthRequest, res: Response): Promise<void
     }
 
     // Non-admin users can only send commands to their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -735,7 +679,7 @@ export const deleteDevice = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Non-admin users can only delete their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -754,6 +698,8 @@ export const deleteDevice = async (req: AuthRequest, res: Response): Promise<voi
       });
     }
 
+    // Remove schedule templates targeting this device before deleting it
+    await ScheduleTemplate.deleteMany({ targetType: 'device', targetId: deviceId });
     await Device.findOneAndDelete({ deviceId });
     revokeDeviceSockets(deviceId);
 
@@ -791,6 +737,10 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
       const user = await User.findById(assignedUserId);
       if (!user) {
         res.status(400).json({ error: 'Invalid user ID provided' });
+        return;
+      }
+      if (user.role === 'sub-user' || user.parentId) {
+        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
         return;
       }
     }
@@ -869,7 +819,7 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Non-admin users can only update their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -879,6 +829,10 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
       const user = await User.findById(updates.assignedUserId);
       if (!user) {
         res.status(400).json({ error: 'Invalid user ID provided' });
+        return;
+      }
+      if (user.role === 'sub-user' || user.parentId) {
+        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
         return;
       }
     }
@@ -929,8 +883,13 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         ].slice(0, 20) as any;
       }
       await Group.updateMany({ devices: deviceId }, { $pull: { devices: deviceId } });
+      // Direct device schedules belong to the previous assignment. Remove
+      // them before the device is exposed to its next account.
+      await ScheduleTemplate.deleteMany({ targetType: 'device', targetId: deviceId });
       await Media.updateMany({ assignedDevices: deviceId }, { $pull: { assignedDevices: deviceId } });
-      device.config = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;
+      const resetConfig = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;
+      delete resetConfig.schedule;
+      device.config = resetConfig;
       if (device.cacheInfo) {
         device.cacheInfo.configVersion += 1;
         device.cacheInfo.lastSyncTime = new Date();
@@ -1008,15 +967,119 @@ export const getDeviceConfigForDevice = async (req: AuthRequest, res: Response):
       res.status(403).json({ error: 'Device token does not match requested device' });
       return;
     }
-    const device = await Device.findOne({ deviceId: req.deviceId, activated: true }).select('config cacheInfo.configVersion');
+    const device = await Device.findOne({ deviceId: req.deviceId, activated: true }).select('config cacheInfo.configVersion emergencyAlert');
     if (!device) {
       res.status(404).json({ error: 'Device not found or inactive' });
       return;
     }
-    res.json({ config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
+    res.json({ config: device.config, configVersion: device.cacheInfo?.configVersion || 0, emergencyAlert: device.emergencyAlert || null });
   } catch (error) {
     console.error('Get device config error:', error);
     res.status(500).json({ error: 'Failed to fetch device configuration' });
+  }
+};
+
+export const buildEmergencyAlert = async (
+  body: any,
+  mediaOwnerId?: string,
+  triggeredById?: string
+): Promise<{ alert?: any; error?: string }> => {
+  const mediaUrl = String(body?.mediaUrl || '').trim();
+  const message = String(body?.message || '').trim();
+  const title = String(body?.title || 'EMERGENCY ALERT').trim() || 'EMERGENCY ALERT';
+  const kind: 'message' | 'media' = mediaUrl ? 'media' : 'message';
+
+  if (kind === 'message' && !message) {
+    return { error: 'Message is required when no media file is selected' };
+  }
+
+  let mediaType = '';
+  if (kind === 'media') {
+    const mediaPath = getMediaPathFromUrl(mediaUrl);
+    if (!mediaPath) {
+      return { error: 'Media URL is not a valid cloud media file' };
+    }
+    const media = await Media.findOne({ path: mediaPath }).select('mimeType uploadedBy').lean();
+    if (!media) {
+      return { error: 'Selected media file was not found' };
+    }
+    if (mediaOwnerId && String(media.uploadedBy || '') !== String(mediaOwnerId)) {
+      return { error: 'You can only use media files uploaded by your account' };
+    }
+    mediaType = String((media as any).mimeType || '');
+  }
+
+  return {
+    alert: {
+      active: true,
+      kind,
+      type: String(body?.type || 'GENERAL').trim().slice(0, 32) || 'GENERAL',
+      title: title.slice(0, 120),
+      message: message.slice(0, 1000),
+      mediaUrl: kind === 'media' ? mediaUrl.slice(0, 2000) : undefined,
+      mediaType: kind === 'media' ? mediaType.slice(0, 64) : undefined,
+      sound: Boolean(body?.sound),
+      triggeredAt: new Date(),
+      triggeredBy: triggeredById ? new mongoose.Types.ObjectId(triggeredById) : undefined,
+    },
+  };
+};
+
+export const triggerEmergency = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const deviceId = req.params.id;
+    const device = await Device.findOne({ deviceId });
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const { alert, error } = await buildEmergencyAlert(req.body, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId), req.userId);
+    if (!alert) {
+      res.status(400).json({ error: error || 'Invalid emergency alert payload' });
+      return;
+    }
+
+    device.emergencyAlert = alert;
+    await device.save();
+
+    pushEmergencyToDevice(deviceId, { ...alert, deviceId });
+    pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId, action: 'triggered', alert });
+
+    res.json({ success: true, alert });
+  } catch (error) {
+    console.error('Trigger emergency error:', error);
+    res.status(500).json({ error: 'Failed to trigger emergency alert' });
+  }
+};
+
+export const clearEmergency = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const deviceId = req.params.id;
+    const device = await Device.findOne({ deviceId });
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    device.emergencyAlert = null;
+    await device.save();
+
+    pushEmergencyClearToDevice(deviceId);
+    pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId, action: 'cleared' });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Clear emergency error:', error);
+    res.status(500).json({ error: 'Failed to clear emergency alert' });
   }
 };
 
@@ -1031,7 +1094,7 @@ export const getDeviceMedia = async (req: AuthRequest, res: Response): Promise<v
     }
 
     // Non-admin users can only access their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }

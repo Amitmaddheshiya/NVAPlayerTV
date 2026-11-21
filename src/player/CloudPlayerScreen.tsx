@@ -1,14 +1,23 @@
 import React from "react";
-import { Text, View, useWindowDimensions } from "react-native";
-import Video, { BufferingStrategyType } from "react-native-video";
-import { WebView } from "react-native-webview";
+import { StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import Video from "react-native-video";
 import SlideRenderer from "./SlideRenderer";
 import Ticker from "./Ticker";
 import ClockWidget from "./ClockWidget";
 import WeatherWidget from "./WeatherWidget";
 import EmergencyAlertWidget from "./EmergencyAlertWidget";
 
-const GRID_GAP = 0;
+const styles = StyleSheet.create({
+  rotationRoot: { flex: 1, backgroundColor: "#000000", overflow: "hidden" },
+  rotatedFrame: { position: "absolute" },
+  loadingRoot: { flex: 1, backgroundColor: "#000000", justifyContent: "center", alignItems: "center" },
+  loadingText: { color: "#ffffff", fontSize: 18 },
+  fill: { flex: 1 },
+  sectionArea: { flex: 1, position: "relative", overflow: "hidden" },
+});
+
+const baseSectionFrame: any = { position: "absolute", overflow: "hidden" };
+const hiddenSectionFrame: any = { ...baseSectionFrame, display: "none" };
 
 function getRotationDegrees(value: any) {
   const legacy: Record<string, number> = { horizontal: 0, vertical: 90, "reverse-horizontal": 180, "reverse-vertical": 270 };
@@ -23,17 +32,17 @@ function CloudRotationFrame({ config, backgroundColor, children }: any) {
   const quarterTurn = rotation === 90 || rotation === 270;
   const frameWidth = quarterTurn ? height : width;
   const frameHeight = quarterTurn ? width : height;
+  const rotatedFrameStyle = {
+    width: frameWidth,
+    height: frameHeight,
+    top: (height - frameHeight) / 2,
+    left: (width - frameWidth) / 2,
+    transform: [{ rotate: `${rotation}deg` }],
+    backgroundColor: backgroundColor || "#000000",
+  };
   return (
-    <View style={{ flex: 1, backgroundColor: "#000000", overflow: "hidden" }}>
-      <View style={{
-        width: frameWidth,
-        height: frameHeight,
-        position: "absolute",
-        top: (height - frameHeight) / 2,
-        left: (width - frameWidth) / 2,
-        transform: [{ rotate: `${rotation}deg` }],
-        backgroundColor: backgroundColor || "#000000",
-      }}>
+    <View style={styles.rotationRoot}>
+      <View style={[styles.rotatedFrame, rotatedFrameStyle]}>
         {children}
       </View>
     </View>
@@ -43,16 +52,106 @@ function CloudRotationFrame({ config, backgroundColor, children }: any) {
 function parseRatio(value: any, count: number): number[] {
   const parts = String(value || "")
     .split(":")
-    .map((n) => Number(n))
+    .map(Number)
     .filter((n) => Number.isFinite(n) && n > 0);
   if (parts.length !== count) return count === 3 ? [1, 1, 1] : [1, 1];
   return parts;
 }
 
+function share(values: number[], index: number) {
+  const total = values.reduce((sum, value) => sum + value, 0) || values.length || 1;
+  return values[index] / total * 100;
+}
+
+function offset(values: number[], index: number) {
+  return values.slice(0, index).reduce((sum, value) => sum + value, 0) /
+    (values.reduce((sum, value) => sum + value, 0) || values.length || 1) * 100;
+}
+
+function getFullScreenSectionFrame(sectionIndex: number) {
+  if (sectionIndex !== 0) return hiddenSectionFrame;
+  return { ...baseSectionFrame, top: "0%", left: "0%", width: "100%", height: "100%" };
+}
+
+function getSplitSectionFrame(config: any, sectionIndex: number) {
+  if (sectionIndex > 1) return hiddenSectionFrame;
+  const ratios = parseRatio(config?.gridRatio, 2);
+  const firstShare = share(ratios, 0);
+  const horizontal = (config?.grid2Layout || "horizontal") === "horizontal";
+  if (horizontal) {
+    return {
+      ...baseSectionFrame,
+      top: "0%",
+      left: `${sectionIndex ? firstShare : 0}%`,
+      width: `${share(ratios, sectionIndex)}%`,
+      height: "100%",
+    };
+  }
+  return {
+    ...baseSectionFrame,
+    top: `${sectionIndex ? firstShare : 0}%`,
+    left: "0%",
+    width: "100%",
+    height: `${share(ratios, sectionIndex)}%`,
+  };
+}
+
+function getHorizontalGridFrame(ratios: number[], sectionIndex: number) {
+  return {
+    ...baseSectionFrame,
+    top: "0%",
+    left: `${offset(ratios, sectionIndex)}%`,
+    width: `${share(ratios, sectionIndex)}%`,
+    height: "100%",
+  };
+}
+
+function getStackedGridFrame(ratios: number[], sectionIndex: number) {
+  return {
+    ...baseSectionFrame,
+    top: `${offset(ratios, sectionIndex)}%`,
+    left: "0%",
+    width: "100%",
+    height: `${share(ratios, sectionIndex)}%`,
+  };
+}
+
+function getTopTwoGridFrame(ratios: number[], sectionIndex: number) {
+  const topHeight = share(ratios, 0);
+  if (sectionIndex === 2) {
+    return { ...baseSectionFrame, top: `${topHeight}%`, left: "0%", width: "100%", height: `${share(ratios, 1)}%` };
+  }
+  return { ...baseSectionFrame, top: "0%", left: sectionIndex === 0 ? "0%" : "50%", width: "50%", height: `${topHeight}%` };
+}
+
+function getTopOneGridFrame(ratios: number[], sectionIndex: number) {
+  const topHeight = share(ratios, 0);
+  if (sectionIndex === 0) {
+    return { ...baseSectionFrame, top: "0%", left: "0%", width: "100%", height: `${topHeight}%` };
+  }
+  return { ...baseSectionFrame, top: `${topHeight}%`, left: sectionIndex === 1 ? "0%" : "50%", width: "50%", height: `${share(ratios, 1)}%` };
+}
+
+function getGridSectionFrame(config: any, sectionIndex: number) {
+  const arrangement = config?.grid3Layout || "stack-v";
+  const ratioCount = arrangement === "stack-h" || arrangement === "stack-v" ? 3 : 2;
+  const ratios = parseRatio(config?.gridRatio, ratioCount);
+  if (arrangement === "stack-h") return getHorizontalGridFrame(ratios, sectionIndex);
+  if (arrangement === "top-two-bottom-one") return getTopTwoGridFrame(ratios, sectionIndex);
+  if (arrangement === "top-one-bottom-two") return getTopOneGridFrame(ratios, sectionIndex);
+  return getStackedGridFrame(ratios, sectionIndex);
+}
+
+function getSectionFrame(config: any, sectionIndex: number) {
+  const layout = config?.layout || "fullscreen";
+  if (layout === "split") return getSplitSectionFrame(config, sectionIndex);
+  if (layout === "grid") return getGridSectionFrame(config, sectionIndex);
+  return getFullScreenSectionFrame(sectionIndex);
+}
+
 export default function CloudPlayerScreen({
   config,
   mediaVersion,
-  sectionMediaVersion,
   playlistSyncAt,
   contentResetVersion,
   sectionPlaybackTimeline,
@@ -63,396 +162,76 @@ export default function CloudPlayerScreen({
   emergencyAlert,
   onClearEmergencyAlert,
 }: any) {
-  // Show loading state if config is null
   if (!config) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#000000", justifyContent: "center", alignItems: "center" }}>
-        <Text style={{ color: "#ffffff", fontSize: 18 }}>Loading cloud configuration...</Text>
+      <View style={styles.loadingRoot}>
+        <Text style={styles.loadingText}>Loading cloud configuration...</Text>
       </View>
     );
   }
 
-  // Cloud mode - no embedded CMS, only cloud config
   const scheduleOn = !(config?.__scheduleRuntime?.enabled && !config?.__scheduleRuntime?.active);
-  const getSectionKey = (sectionIndex: number) => {
-    const timeline = sectionPlaybackTimeline?.[sectionIndex + 1] || null;
-    const cycle = String(timeline?.cycleId || timeline?.syncAt || "none");
-    const sectionVersion = Number(sectionMediaVersion?.[sectionIndex + 1] || 0);
-    // Keep a section mounted during ordinary config/media refreshes. Its existing
-    // content remains visible while SlideRenderer loads the new playlist.
-    return `section-${sectionIndex}-${config?.layout || "fullscreen"}-${config?.grid2Layout || ""}-${config?.grid3Layout || ""}-${Number(contentResetVersion || 0)}-${sectionVersion}-${cycle}`;
-  };
-  const grid3Layout = config?.grid3Layout || "stack-v";
-  const grid2Layout = config?.grid2Layout || "horizontal";
-  const gridRatio = config?.gridRatio || "1:1:1";
+  if (!scheduleOn) {
+    const fallbackMode = config?.schedule?.fallbackMode || "black";
+    const fallbackBgColor = config?.schedule?.fallbackBgColor || "#000000";
+    const fallbackMediaUrl = config?.schedule?.fallbackImageUrl || "";
+    return (
+      <CloudRotationFrame config={config} backgroundColor={fallbackBgColor}>
+        {fallbackMode === "media" && fallbackMediaUrl ? (
+          <Video source={{ uri: fallbackMediaUrl }} style={styles.fill} resizeMode="cover" repeat />
+        ) : null}
+      </CloudRotationFrame>
+    );
+  }
+
   const ticker = config?.ticker?.text ? <Ticker ticker={config.ticker} /> : null;
-  
-  const renderGrid3 = () => {
-    if (grid3Layout === "stack-h") {
-      const [a, b, c] = parseRatio(gridRatio, 3);
-      return (
-        <View style={{ flex: 1, flexDirection: "row", gap: GRID_GAP }}>
-          <View style={{ flex: a, marginRight: GRID_GAP / 2 }}>
-            <SlideRenderer
-              key={getSectionKey(0)}
-              sectionIndex={0}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-              processingMessage={uploadProcessingBySection?.[1] || ""}
-              processingCount={uploadCountsBySection?.[1] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-          <View style={{ flex: b, marginHorizontal: GRID_GAP / 2 }}>
-            <SlideRenderer
-              key={getSectionKey(1)}
-              sectionIndex={1}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-              processingMessage={uploadProcessingBySection?.[2] || ""}
-              processingCount={uploadCountsBySection?.[2] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-          <View style={{ flex: c, marginLeft: GRID_GAP / 2 }}>
-            <SlideRenderer
-              key={getSectionKey(2)}
-              sectionIndex={2}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[3] || null}
-              processingMessage={uploadProcessingBySection?.[3] || ""}
-              processingCount={uploadCountsBySection?.[3] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-        </View>
-      );
-    }
+  const clockConfig = config?.clock || { enabled: false };
+  const weatherConfig = config?.weather || { enabled: false };
 
-    if (grid3Layout === "top-two-bottom-one") {
-      const [top, bottom] = parseRatio(gridRatio, 2);
-      return (
-        <View style={{ flex: 1, gap: GRID_GAP }}>
-          <View style={{ flex: top, flexDirection: "row", gap: GRID_GAP }}>
-            <View style={{ flex: 1, marginRight: GRID_GAP / 2 }}>
+  return (
+    <CloudRotationFrame config={config} backgroundColor={config?.bgColor}>
+      {ticker && config.ticker?.position === "top" ? ticker : null}
+      <View style={styles.sectionArea}>
+        {[0, 1, 2].map((sectionIndex) => {
+          const sectionFrame = getSectionFrame(config, sectionIndex);
+          const hidden = sectionFrame.display === "none";
+          const sectionConfig = hidden ? { ...config, __playerPaused: true } : config;
+          const timeline = sectionPlaybackTimeline?.[sectionIndex + 1] || null;
+          // These section renderers stay mounted through schedule/layout
+          // changes. Their cached playlist and current frame survive while
+          // the next layout and section content are resolved.
+          return (
+            <View key={`cloud-section-frame-${sectionIndex}`} style={sectionFrame} collapsable={false}>
               <SlideRenderer
-                key={getSectionKey(0)}
-              sectionIndex={0}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-              processingMessage={uploadProcessingBySection?.[1] || ""}
-              processingCount={uploadCountsBySection?.[1] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-            </View>
-            <View style={{ flex: 1, marginLeft: GRID_GAP / 2 }}>
-              <SlideRenderer
-                key={getSectionKey(1)}
-              sectionIndex={1}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-              processingMessage={uploadProcessingBySection?.[2] || ""}
-              processingCount={uploadCountsBySection?.[2] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-            </View>
-          </View>
-          <View style={{ flex: bottom }}>
-            <SlideRenderer
-              key={getSectionKey(2)}
-              sectionIndex={2}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[3] || null}
-              processingMessage={uploadProcessingBySection?.[3] || ""}
-              processingCount={uploadCountsBySection?.[3] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-        </View>
-      );
-    }
-
-    if (grid3Layout === "top-one-bottom-two") {
-      const [top, bottom] = parseRatio(gridRatio, 2);
-      return (
-        <View style={{ flex: 1, gap: GRID_GAP }}>
-          <View style={{ flex: top }}>
-            <SlideRenderer
-              key={getSectionKey(0)}
-              sectionIndex={0}
-              config={config}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-              processingMessage={uploadProcessingBySection?.[1] || ""}
-              processingCount={uploadCountsBySection?.[1] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-          <View style={{ flex: bottom, flexDirection: "row", gap: GRID_GAP }}>
-            <View style={{ flex: 1, marginRight: GRID_GAP / 2 }}>
-              <SlideRenderer
-                key={getSectionKey(1)}
-                sectionIndex={1}
-                config={config}
+                key={`cloud-section-${sectionIndex}-${Number(contentResetVersion || 0)}`}
+                config={sectionConfig}
+                sectionIndex={sectionIndex}
                 mediaVersion={mediaVersion}
                 playlistSyncAt={playlistSyncAt}
                 contentResetVersion={contentResetVersion}
-                sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-                processingMessage={uploadProcessingBySection?.[2] || ""}
-                processingCount={uploadCountsBySection?.[2] || null}
+                sectionTimeline={timeline}
+                processingMessage={uploadProcessingBySection?.[sectionIndex + 1] || ""}
+                processingCount={uploadCountsBySection?.[sectionIndex + 1] || null}
                 onPlaybackChange={onPlaybackChange}
                 onPlaybackError={onPlaybackError}
                 cloudMode={true}
               />
             </View>
-            <View style={{ flex: 1, marginLeft: GRID_GAP / 2 }}>
-              <SlideRenderer
-                key={getSectionKey(2)}
-                sectionIndex={2}
-                config={config}
-                mediaVersion={mediaVersion}
-                playlistSyncAt={playlistSyncAt}
-                contentResetVersion={contentResetVersion}
-                sectionTimeline={sectionPlaybackTimeline?.[3] || null}
-                processingMessage={uploadProcessingBySection?.[3] || ""}
-              processingCount={uploadCountsBySection?.[3] || null}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-            </View>
-          </View>
-        </View>
-      );
-    }
-
-    const [a, b, c] = parseRatio(gridRatio, 3);
-    return (
-      <View style={{ flex: 1 }}>
-        <View style={{ flex: a, marginBottom: GRID_GAP / 2 }}>
-          <SlideRenderer
-            key={getSectionKey(0)}
-            sectionIndex={0}
-            config={config}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-            processingMessage={uploadProcessingBySection?.[1] || ""}
-            processingCount={uploadCountsBySection?.[1] || null}
-            onPlaybackChange={onPlaybackChange}
-            onPlaybackError={onPlaybackError}
-            cloudMode={true}
-          />
-        </View>
-        <View style={{ flex: b, marginVertical: GRID_GAP / 2 }}>
-          <SlideRenderer
-            key={getSectionKey(1)}
-            sectionIndex={1}
-            config={config}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-            processingMessage={uploadProcessingBySection?.[2] || ""}
-            processingCount={uploadCountsBySection?.[2] || null}
-            onPlaybackChange={onPlaybackChange}
-            onPlaybackError={onPlaybackError}
-            cloudMode={true}
-          />
-        </View>
-        <View style={{ flex: c, marginTop: GRID_GAP / 2 }}>
-          <SlideRenderer
-            key={getSectionKey(2)}
-            sectionIndex={2}
-            config={config}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[3] || null}
-            processingMessage={uploadProcessingBySection?.[3] || ""}
-            processingCount={uploadCountsBySection?.[3] || null}
-            onPlaybackChange={onPlaybackChange}
-            onPlaybackError={onPlaybackError}
-            cloudMode={true}
-          />
-        </View>
-      </View>
-    );
-  };
-
-  const renderGrid2 = () => {
-    const [left, right] = parseRatio(gridRatio, 2);
-    const isHorizontal = grid2Layout === "horizontal";
-
-    if (!isHorizontal) {
-      return (
-        <View style={{ flex: 1, flexDirection: "column", gap: GRID_GAP }}>
-          <View style={{ flex: left, marginBottom: GRID_GAP / 2 }}>
-            <SlideRenderer
-              key={getSectionKey(0)}
-              config={config}
-              sectionIndex={0}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-              processingMessage={uploadProcessingBySection?.[1] || ""}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-          <View style={{ flex: right, marginTop: GRID_GAP / 2 }}>
-            <SlideRenderer
-              key={getSectionKey(1)}
-              config={config}
-              sectionIndex={1}
-              mediaVersion={mediaVersion}
-              playlistSyncAt={playlistSyncAt}
-              contentResetVersion={contentResetVersion}
-              sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-              processingMessage={uploadProcessingBySection?.[2] || ""}
-              onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-            />
-          </View>
-        </View>
-      );
-    }
-
-    return (
-      <View style={{ flex: 1, flexDirection: "row", gap: GRID_GAP }}>
-        <View style={{ flex: left, marginRight: GRID_GAP / 2 }}>
-          <SlideRenderer
-            key={getSectionKey(0)}
-            config={config}
-            sectionIndex={0}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-            processingMessage={uploadProcessingBySection?.[1] || ""}
-            onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-          />
-        </View>
-        <View style={{ flex: right, marginLeft: GRID_GAP / 2 }}>
-          <SlideRenderer
-            key={getSectionKey(1)}
-            config={config}
-            sectionIndex={1}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[2] || null}
-            processingMessage={uploadProcessingBySection?.[2] || ""}
-            onPlaybackChange={onPlaybackChange}
-              onPlaybackError={onPlaybackError}
-              cloudMode={true}
-          />
-        </View>
-      </View>
-    );
-  };
-
-  if (!scheduleOn) {
-    const fallbackMode = config?.schedule?.fallbackMode || "black";
-    const fallbackBgColor = config?.schedule?.fallbackBgColor || "#000000";
-    const fallbackMediaUrl = config?.schedule?.fallbackImageUrl || "";
-    
-    if (fallbackMode === "media" && fallbackMediaUrl) {
-      return (
-        <CloudRotationFrame config={config} backgroundColor={fallbackBgColor}>
-          <Video
-            source={{ uri: fallbackMediaUrl }}
-            style={{ flex: 1 }}
-            resizeMode="cover"
-            repeat
-          />
-        </CloudRotationFrame>
-      );
-    }
-    
-    return (
-      <CloudRotationFrame config={config} backgroundColor={fallbackBgColor} />
-    );
-  }
-
-  const clockConfig = config?.clock || { enabled: false };
-  const weatherConfig = config?.weather || { enabled: false };
-  const layout = config?.layout || "fullscreen";
-
-  return (
-    <CloudRotationFrame config={config} backgroundColor={config?.bgColor}>
-      {ticker && config.ticker?.position === "top" ? ticker : null}
-      <View style={{ flex: 1 }}>
-        {layout === "fullscreen" && (
-          <SlideRenderer
-            key={getSectionKey(0)}
-            config={config}
-            sectionIndex={0}
-            mediaVersion={mediaVersion}
-            playlistSyncAt={playlistSyncAt}
-            contentResetVersion={contentResetVersion}
-            sectionTimeline={sectionPlaybackTimeline?.[1] || null}
-            processingMessage={uploadProcessingBySection?.[1] || ""}
-            processingCount={uploadCountsBySection?.[1] || null}
-            onPlaybackChange={onPlaybackChange}
-            onPlaybackError={onPlaybackError}
-            cloudMode={true}
-          />
-        )}
-        {layout === "split" && renderGrid2()}
-        {layout === "grid" && renderGrid3()}
+          );
+        })}
       </View>
       {ticker && config.ticker?.position !== "top" ? ticker : null}
-
-      {/* Widgets */}
       {clockConfig.enabled && <ClockWidget config={clockConfig} />}
       {weatherConfig.enabled && <WeatherWidget config={weatherConfig} />}
       <EmergencyAlertWidget
         alert={{
           active: emergencyAlert?.active || false,
+          kind: emergencyAlert?.kind || "message",
           type: emergencyAlert?.type || "info",
           title: emergencyAlert?.title || "",
           message: emergencyAlert?.message || "",
+          mediaUrl: emergencyAlert?.mediaUrl || "",
+          mediaType: emergencyAlert?.mediaType || "",
           sound: emergencyAlert?.sound || false,
         }}
         onClear={onClearEmergencyAlert || (() => {})}

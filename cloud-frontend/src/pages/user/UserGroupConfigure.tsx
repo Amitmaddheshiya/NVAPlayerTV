@@ -9,8 +9,9 @@ import { LayoutGrid } from '../../components/LayoutGrid';
 import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
 import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
 import { LibraryModal } from '../../components/LibraryModal';
+import { EmergencyAlertBox } from '../../components/EmergencyAlertBox';
 import { Alert } from '../../components/ui/Alert';
-import { ArrowLeft, Save, Monitor, Layers, Settings, History, RotateCcw } from 'lucide-react';
+import { ArrowLeft, Save, Monitor, Layers, Settings, History, RotateCcw, CalendarClock } from 'lucide-react';
 import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
 
 export const UserGroupConfigure = () => {
@@ -138,7 +139,7 @@ export const UserGroupConfigure = () => {
       if (!latestById.size) return;
       setDevices((previous) => previous.map((device) => {
         const latest = latestById.get(String(device.deviceId));
-        return latest ? { ...device, status: latest.status, lastSeen: latest.lastSeen, appVersion: latest.appVersion, storage: latest.storage, health: latest.health } : device;
+        return latest ? { ...device, status: latest.status, lastSeen: latest.lastSeen, appVersion: latest.appVersion, storage: latest.storage, health: latest.health, emergencyAlert: latest.emergencyAlert } : device;
       }));
     };
     void refreshDeviceSync();
@@ -177,7 +178,10 @@ export const UserGroupConfigure = () => {
 
   const loadGroup = async () => {
     try {
-      const response = await groupAPI.getGroups();
+      // This page is often opened from a direct group URL. The API is
+      // paginated (10 rows by default), so search the full manageable range
+      // instead of silently rendering an empty page for older groups.
+      const response = await groupAPI.getGroups({ page: 1, limit: 1000 });
       const groups = response.data.data || response.data;
       const groupData = groups.find((g: any) => g._id === groupId);
       setGroup(groupData);
@@ -471,6 +475,9 @@ export const UserGroupConfigure = () => {
             </span>
             <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
               <History className="mr-1 h-3 w-3" />History
+            </Button>
+            <Button onClick={() => navigate(`/user/groups/${groupId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
+              <CalendarClock className="mr-1 h-3 w-3" />Schedule
             </Button>
             <Button onClick={handleClearConfig} variant="secondary" className="text-[10px] sm:text-xs">
               Clear
@@ -858,6 +865,15 @@ export const UserGroupConfigure = () => {
                 />
               </CardContent>
             </Card>
+
+            {/* Emergency Content */}
+            <EmergencyAlertBox
+              mode="group"
+              targetId={groupId!}
+              targetLabel={group?.name}
+              activeAlert={devices.find((d: any) => d.emergencyAlert?.active)?.emergencyAlert || null}
+              onStatusChange={() => { void loadDevices(); }}
+            />
           </div>
         </div>
       </main>

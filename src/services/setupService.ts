@@ -55,6 +55,22 @@ export async function saveAppMode(mode: AppMode): Promise<void> {
   await AsyncStorage.multiSet([
     [APP_MODE_KEY, mode],
     [SETUP_COMPLETE_KEY, "true"],
+    // This is retained for older callers, but it must agree with the
+    // authoritative app-mode value so a previous Cloud selection cannot
+    // influence a later LAN or Admin-only session.
+    ["@signage_cloud_mode", mode === "cloudMode" ? "true" : "false"],
+  ]);
+}
+
+export async function resetAppMode(): Promise<void> {
+  try {
+    await DeviceIdModule?.clearAppMode?.();
+  } catch {
+    // Clear AsyncStorage even when an older native module lacks this method.
+  }
+  await Promise.all([
+    AsyncStorage.multiRemove([APP_MODE_KEY, SETUP_COMPLETE_KEY]),
+    AsyncStorage.setItem("@signage_cloud_mode", "false"),
   ]);
 }
 

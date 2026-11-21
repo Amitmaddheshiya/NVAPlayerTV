@@ -5,6 +5,7 @@ import env from '../config/env';
 import Device from '../models/Device';
 import User from '../models/User';
 import { verifyDeviceToken } from '../middleware/auth.middleware';
+import { cacheDelPattern } from '../config/redis';
 
 let io: SocketIOServer;
 
@@ -27,10 +28,10 @@ export const initializeSocket = (httpServer: HTTPServer): void => {
           const verifiedDeviceId = await verifyDeviceToken(token, decoded.deviceId);
           if (!verifiedDeviceId) throw new Error('Device is inactive or unauthorized');
           socket.data.identity = { role: 'device', deviceId: verifiedDeviceId };
-        } else if ((decoded.role === 'admin' || decoded.role === 'user') && decoded.userId) {
-          const user = await User.findById(decoded.userId).select('role');
+        } else if ((decoded.role === 'admin' || decoded.role === 'user' || decoded.role === 'sub-user') && decoded.userId) {
+          const user = await User.findById(decoded.userId).select('role parentId');
           if (!user || user.role !== decoded.role) throw new Error('User is inactive or unauthorized');
-          socket.data.identity = { role: user.role, userId: String(user._id) };
+          socket.data.identity = { role: user.role, userId: String(user._id), parentId: user.parentId ? String(user.parentId) : undefined };
         } else {
           throw new Error('Invalid socket identity');
         }
@@ -42,20 +43,48 @@ export const initializeSocket = (httpServer: HTTPServer): void => {
   });
 
   io.on('connection', (socket) => {
-    const identity = socket.data.identity as { role: string; userId?: string; deviceId?: string };
+    const identity = socket.data.identity as { role: string; userId?: string; deviceId?: string; parentId?: string };
     if (identity.role === 'admin') socket.join('admin');
-    if (identity.role === 'user' && identity.userId) socket.join(`user:${identity.userId}`);
+    if ((identity.role === 'user' || identity.role === 'sub-user') && identity.userId) {
+      socket.join(`user:${identity.userId}`);
+      // Sub-users share the parent account's device/group event stream.
+      if (identity.parentId) socket.join(`user:${identity.parentId}`);
+    }
     if (identity.role === 'device' && identity.deviceId) socket.join(`device:${identity.deviceId}`);
+
+    socket.on('emergency:dismissed', () => {
+      if (identity.role !== 'device' || !identity.deviceId) return;
+      const deviceId = identity.deviceId;
+      void (async () => {
+        try {
+          const device = await Device.findOneAndUpdate(
+            { deviceId },
+            { $set: { emergencyAlert: null } },
+            { new: true, projection: { assignedUserId: 1, deviceId: 1 } }
+          ).lean();
+          const payload = { deviceId, action: 'dismissed' };
+          if (device?.assignedUserId) {
+            io.to(`user:${device.assignedUserId}`).emit('emergency:status', payload);
+          }
+          io.to('admin').emit('emergency:status', payload);
+        } catch (error) {
+          console.error(`Error handling emergency dismiss for device ${deviceId}:`, error);
+        }
+      })();
+    });
 
     socket.on('disconnect', async () => {
       if (identity.role !== 'device' || !identity.deviceId) return;
       try {
         const room = io.sockets.adapter.rooms.get(`device:${identity.deviceId}`);
         if (!room?.size) {
-          await Device.findOneAndUpdate(
+          const device = await Device.findOneAndUpdate(
             { deviceId: identity.deviceId },
-            { status: 'offline', lastSeen: new Date() }
-          );
+            { status: 'offline', lastSeen: new Date() },
+            { new: true }
+          ).select('deviceId name assignedUserId status lastSeen appVersion storage');
+          await cacheDelPattern('devices:*');
+          if (device) pushDeviceHeartbeat(device);
         }
       } catch (error) {
         console.error(`Error updating device ${identity.deviceId} status:`, error);
@@ -85,6 +114,21 @@ export const pushDeviceHeartbeat = (device: any): void => {
 export const pushConfigToDevice = (deviceId: string, config: any, configVersion = 0): void => {
   if (!io) return;
   io.to(`device:${deviceId}`).emit('config:update', { config, configVersion });
+};
+
+export const pushEmergencyToDevice = (deviceId: string, alert: any): void => {
+  if (!io) return;
+  io.to(`device:${deviceId}`).emit('emergency:alert', alert);
+};
+
+export const pushEmergencyClearToDevice = (deviceId: string): void => {
+  if (!io) return;
+  io.to(`device:${deviceId}`).emit('emergency:alert:clear');
+};
+
+export const pushEmergencyToUser = (userId: string | undefined, payload: any): void => {
+  if (!io || !userId) return;
+  io.to(`user:${userId}`).emit('emergency:status', payload);
 };
 
 export const revokeDeviceSockets = (deviceId: string): void => {

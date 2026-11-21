@@ -139,8 +139,9 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
       return;
     }
     const deviceId = String(req.body?.deviceId || '');
+    const ownerId = req.effectiveUserId || req.userId;
     if (deviceId && req.userRole !== 'admin') {
-      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: req.userId }).select('_id');
+      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: ownerId }).select('_id');
       if (!assignedDevice) {
         res.status(403).json({ error: 'Media can only be uploaded to a device assigned to your account' });
         return;
@@ -166,7 +167,7 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
       return;
     }
     if (req.userRole !== 'admin') {
-      const user = await User.findById(req.userId);
+      const user = await User.findById(ownerId);
       if (user) {
         const month = new Date().toISOString().slice(0, 7);
         const used = user.uploadUsageMonth === month ? Number(user.currentMonthUpload || 0) : 0;

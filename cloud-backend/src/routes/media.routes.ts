@@ -13,6 +13,7 @@ import {
   getMediaStats,
 } from '../controllers/media.controller';
 import { adminOnly, auth, deviceAuth } from '../middleware/auth.middleware';
+import { requirePermission } from '../middleware/permission.middleware';
 import {
   completeChunkedUpload,
   cancelChunkedUpload,
@@ -103,17 +104,17 @@ const uploadChunkFile = (req: any, res: any, next: any) => {
   });
 };
 
-router.post('/upload', auth, uploadMediaFile, uploadMediaAndCleanup);
-router.post('/uploads/init', auth, initializeChunkedUpload);
-router.get('/uploads/:uploadId', auth, getChunkedUploadStatus);
-router.delete('/uploads/:uploadId', auth, cancelChunkedUpload);
-router.put('/uploads/:uploadId/chunks/:index', auth, uploadChunkFile, handleUploadChunk);
-router.post('/uploads/:uploadId/complete', auth, completeChunkedUpload);
+router.post('/upload', auth, requirePermission('library'), uploadMediaFile, uploadMediaAndCleanup);
+router.post('/uploads/init', auth, requirePermission('library'), initializeChunkedUpload);
+router.get('/uploads/:uploadId', auth, requirePermission('library'), getChunkedUploadStatus);
+router.delete('/uploads/:uploadId', auth, requirePermission('library'), cancelChunkedUpload);
+router.put('/uploads/:uploadId/chunks/:index', auth, requirePermission('library'), uploadChunkFile, handleUploadChunk);
+router.post('/uploads/:uploadId/complete', auth, requirePermission('library'), completeChunkedUpload);
 router.get('/stats', auth, adminOnly, getMediaStats);
-router.get('/', auth, getMedia);
+router.get('/', auth, requirePermission('library'), getMedia);
 router.get('/media-list', deviceAuth, getMediaList);
-router.delete('/:id', auth, deleteMedia);
-router.post('/:id/assign', auth, assignMedia);
-router.put('/:id', auth, updateMedia);
+router.delete('/:id', auth, requirePermission('library'), deleteMedia);
+router.post('/:id/assign', auth, requirePermission('library'), assignMedia);
+router.put('/:id', auth, requirePermission('library'), updateMedia);
 
 export default router;

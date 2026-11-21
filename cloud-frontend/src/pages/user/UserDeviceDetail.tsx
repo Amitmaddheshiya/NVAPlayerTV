@@ -3,13 +3,11 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { mediaAPI, deviceAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
-import { Input } from '../../components/ui/Input';
-import { Select } from '../../components/ui/Select';
-import { LayoutGrid } from '../../components/LayoutGrid';
-import { CloudOrientationPicker, normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
-import { CloudSectionRatioControl, normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
-import { LibraryModal } from '../../components/LibraryModal';
-import { ArrowLeft, Settings, Save, CheckCircle2, XCircle, AlertTriangle, Info, X, History, RotateCcw } from 'lucide-react';
+import { normalizeCloudOrientation } from '../../components/CloudOrientationPicker';
+import { normalizeCloudGridRatio } from '../../components/CloudSectionRatioControl';
+import { CloudConfigEditor, getCloudSectionCount } from '../../components/CloudConfigEditor';
+import { EmergencyAlertBox } from '../../components/EmergencyAlertBox';
+import { ArrowLeft, Save, CheckCircle2, XCircle, AlertTriangle, Info, X, History, RotateCcw, CalendarClock } from 'lucide-react';
 import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
 
 type DialogState = {
@@ -55,8 +53,6 @@ export const UserDeviceDetail = () => {
   const [configHistory, setConfigHistory] = useState<any[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [retryingSync, setRetryingSync] = useState(false);
-  const [libraryModalOpen, setLibraryModalOpen] = useState(false);
-  const [currentSectionIndex, setCurrentSectionIndex] = useState<number | null>(null);
   const navigate = useNavigate();
 
   const defaultConfig = {
@@ -135,6 +131,7 @@ export const UserDeviceDetail = () => {
           storage: latest.storage,
           cacheInfo: latest.cacheInfo,
           health: latest.health,
+          emergencyAlert: latest.emergencyAlert,
         } : latest);
       } catch {
         // Keep the last known status visible during short network interruptions.
@@ -143,32 +140,6 @@ export const UserDeviceDetail = () => {
     const timer = window.setInterval(refreshSyncStatus, 10_000);
     return () => window.clearInterval(timer);
   }, [deviceId]);
-
-  // Ensure sections are properly initialized when layout changes
-  useEffect(() => {
-    const sectionCount = getSectionCount();
-    setConfig((prevConfig) => {
-      const currentSections = prevConfig.sections || [];
-      const newSections = [...currentSections];
-      
-      // Add missing sections
-      while (newSections.length < sectionCount) {
-        newSections.push({
-          id: newSections.length + 1,
-          contentType: 'multimedia' as 'multimedia' | 'web' | 'youtube',
-          mediaUrls: [],
-          webUrl: '',
-          youtubeUrl: '',
-          slideDuration: 5,
-        });
-      }
-      
-      return {
-        ...prevConfig,
-        sections: newSections,
-      };
-    });
-  }, [config.layout]);
 
   const loadDevice = async () => {
     try {
@@ -317,7 +288,12 @@ export const UserDeviceDetail = () => {
   const openConfigHistory = async () => {
     try {
       const response = await deviceAPI.getConfigHistory(deviceId!);
-      setConfigHistory(response.data?.entries || []);
+      const entries = Array.isArray(response.data?.entries) ? response.data.entries : [];
+      // Keep the popup newest-first even if it receives history produced by
+      // an older server while a deployment is rolling out.
+      setConfigHistory(entries.sort((a: any, b: any) =>
+        new Date(b?.savedAt || 0).getTime() - new Date(a?.savedAt || 0).getTime()
+      ));
       setHistoryOpen(true);
     } catch (error) {
       setDialog({ type: 'error', title: 'History unavailable', message: getRequestErrorMessage(error, 'Could not load configuration history.') });
@@ -358,39 +334,7 @@ export const UserDeviceDetail = () => {
     }
   };
 
-  const updateSection = (sectionId: number, updates: any) => {
-    setConfig((prevConfig) => ({
-      ...prevConfig,
-      sections: prevConfig.sections.map((s, idx) => {
-        // Match by array index (0-based) instead of ID for proper isolation
-        if (idx === sectionId - 1) {
-          const updated: any = { ...s, ...updates };
-          
-          // Clear irrelevant fields based on contentType
-          if (updates.contentType === 'multimedia') {
-            updated.webUrl = '';
-            updated.youtubeUrl = '';
-          } else if (updates.contentType === 'web') {
-            updated.mediaUrls = [];
-            updated.youtubeUrl = '';
-          } else if (updates.contentType === 'youtube') {
-            updated.mediaUrls = [];
-            updated.webUrl = '';
-          }
-          
-          return updated;
-        }
-        return s;
-      }),
-    }));
-  };
-
-  const getSectionCount = () => {
-    if (config.layout === 'fullscreen') return 1;
-    if (config.layout === 'split') return 2;
-    if (config.layout === 'grid') return 3;
-    return 1;
-  };
+  const getSectionCount = () => getCloudSectionCount(config.layout);
 
   if (loading) {
     return <div className="flex items-center justify-center min-h-screen">Loading...</div>;
@@ -400,8 +344,6 @@ export const UserDeviceDetail = () => {
     return <div className="flex items-center justify-center min-h-screen">Device not found</div>;
   }
 
-  const sectionCount = getSectionCount();
-  const tickerFontSize = Math.min(100, Math.max(10, Number(config.ticker.fontSize) || 24));
   const cloudSync = device.health?.cloudSync;
   const cloudSyncReady = cloudSync?.status === 'ready' && cloudSync.mediaCached === cloudSync.mediaTotal;
   const onlineOnlySections = Math.max(0, Number(cloudSync?.onlineOnlySections || 0));
@@ -438,6 +380,9 @@ export const UserDeviceDetail = () => {
             </Button>
             <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
               <History className="mr-1 h-3 w-3" />History
+            </Button>
+            <Button onClick={() => navigate(`/user/devices/${deviceId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
+              <CalendarClock className="mr-1 h-3 w-3" />Schedule
             </Button>
             <Button onClick={handleSaveConfig} disabled={savingConfig} className="bg-blue-600 hover:bg-blue-700 text-[10px] sm:text-xs">
               <Save className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
@@ -477,7 +422,7 @@ export const UserDeviceDetail = () => {
             </div>
           </div>
           <div className="mt-2 flex gap-2">
-            {device.health.cloudSync.status === 'failed' && (
+            {(device.health.cloudSync.status === 'failed' || device.health.cloudSync.status === 'pending') && (
               <Button variant="secondary" disabled={retryingSync} onClick={retryDeviceSync} className="text-[10px] sm:text-xs">
                 <RotateCcw className="mr-1 h-3 w-3" />{retryingSync ? 'Retrying…' : 'Retry sync'}
               </Button>
@@ -487,291 +432,47 @@ export const UserDeviceDetail = () => {
       )}
 
       <main className="max-w-[95vw] sm:max-w-[1120px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 xl:px-6 py-2 sm:py-3">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 sm:gap-3">
-          {/* Left Column - Configuration */}
-          <div className="lg:col-span-2 space-y-2 sm:space-y-3">
-            {/* Layout Selection */}
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="flex items-center gap-2 text-[10px] sm:text-xs md:text-sm">
-                  <Settings className="w-3 h-3 sm:w-4 sm:h-4 md:w-5 md:h-5" />
-                  Layout Selection
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="p-3 sm:p-4">
-                <LayoutGrid
-                  layout={config.layout as 'fullscreen' | 'split' | 'grid'}
-                  grid2Layout={config.grid2Layout as 'horizontal' | 'vertical'}
-                  grid3Layout={config.grid3Layout as 'stack-v' | 'stack-h' | 'top-two-bottom-one' | 'top-one-bottom-two'}
-                  onSelectLayout={(layout) => setConfig({ ...config, layout })}
-                  onSelectGrid2Layout={(grid2Layout) => setConfig({ ...config, grid2Layout })}
-                  onSelectGrid3Layout={(grid3Layout) => setConfig({ ...config, grid3Layout })}
-                />
-                <CloudSectionRatioControl
-                  layout={config.layout}
-                  grid2Layout={config.grid2Layout}
-                  grid3Layout={config.grid3Layout}
-                  value={config.gridRatio}
-                  onChange={(gridRatio) => setConfig({ ...config, gridRatio })}
-                />
-              </CardContent>
-            </Card>
-
-            {/* Section Configuration */}
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Section Configuration</CardTitle>
-              </CardHeader>
-              <CardContent className={`p-3 sm:p-4 space-y-2 sm:space-y-3 xl:grid xl:gap-3 xl:space-y-0 ${sectionCount === 3 ? 'xl:grid-cols-3' : sectionCount === 2 ? 'xl:grid-cols-2' : 'xl:grid-cols-1'}`}>
-                {Array.from({ length: sectionCount }).map((_, index) => {
-                  const section = config.sections[index] || {
-                    id: index + 1,
-                    contentType: 'multimedia' as 'multimedia' | 'web' | 'youtube',
-                    mediaUrls: [],
-                    webUrl: '',
-                    youtubeUrl: '',
-                    slideDuration: 5,
-                  };
-                  const actualSectionId = index + 1;
-                  const currentContentType: string = section.contentType;
-                  return (
-                    <div key={actualSectionId} className="border rounded-lg p-2 sm:p-3">
-                      <h3 className="text-[10px] sm:text-xs md:text-sm font-medium mb-2 sm:mb-3">Section {actualSectionId}</h3>
-                      
-                      {/* Content Type Selection */}
-                      <div className="mb-2 sm:mb-3">
-                        <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Content Type</label>
-                        <Select
-                          options={[
-                            { value: 'multimedia', label: 'Multimedia (Files)' },
-                            { value: 'web', label: 'Website (URL)' },
-                            { value: 'youtube', label: 'YouTube (URL)' },
-                          ]}
-                          value={currentContentType}
-                          onChange={(e) => updateSection(actualSectionId, { contentType: e.target.value as any })}
-                        />
-                      </div>
-
-                      {/* Multimedia Content */}
-                      {currentContentType === 'multimedia' && (
-                        <div className="mb-2 sm:mb-3">
-                          <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Select Media Files</label>
-                          <Button
-                            variant="secondary"
-                            onClick={() => {
-                              setCurrentSectionIndex(index);
-                              setLibraryModalOpen(true);
-                            }}
-                            className="w-full text-[10px] sm:text-xs"
-                          >
-                            Choose Files from Library ({section.mediaUrls.length} selected)
-                          </Button>
-                          {section.mediaUrls.length > 0 && (
-                            <div className="mt-1.5 sm:mt-2 space-y-1 max-h-24 sm:max-h-32 overflow-y-auto">
-                              {section.mediaUrls.map((url: string, idx: number) => {
-                                const media = mediaList.find((m) => m.url === url);
-                                return (
-                                  <div key={idx} className="text-[10px] sm:text-xs bg-blue-50 p-1.5 sm:p-2 rounded flex justify-between items-center">
-                                    <span className="truncate flex-1">{media?.originalName || url}</span>
-                                    <Button
-                                      variant="danger"
-                                      size="sm"
-                                      onClick={() => {
-                                        const newUrls = section.mediaUrls.filter((u: string) => u !== url);
-                                        updateSection(actualSectionId, { mediaUrls: newUrls });
-                                      }}
-                                    >
-                                      ×
-                                    </Button>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Web URL */}
-                      {currentContentType === 'web' && (
-                        <div className="mb-2 sm:mb-3">
-                          <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Website URL</label>
-                          <Input
-                            placeholder="https://example.com"
-                            value={section.webUrl}
-                            onChange={(e) => updateSection(actualSectionId, { webUrl: e.target.value })}
-                            className="text-[10px] sm:text-xs"
-                          />
-                        </div>
-                      )}
-
-                      {/* YouTube URL */}
-                      {currentContentType === 'youtube' && (
-                        <div className="mb-2 sm:mb-3">
-                          <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">YouTube URL</label>
-                          <Input
-                            placeholder="https://youtube.com/watch?v=..."
-                            value={section.youtubeUrl}
-                            onChange={(e) => updateSection(actualSectionId, { youtubeUrl: e.target.value })}
-                            className="text-[10px] sm:text-xs"
-                          />
-                        </div>
-                      )}
-
-                      {/* Slide Duration */}
-                      <div>
-                        <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Slide Duration (sec)</label>
-                        <Input
-                          type="number"
-                          value={section.slideDuration}
-                          onChange={(e) => updateSection(actualSectionId, { slideDuration: parseInt(e.target.value) })}
-                          min="1"
-                          className="text-[10px] sm:text-xs"
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </CardContent>
-            </Card>
-
-            {/* Ticker Settings */}
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Ticker Settings</CardTitle>
-              </CardHeader>
-              <CardContent className="p-3 sm:p-4 space-y-2 sm:space-y-3">
-                <Input
-                  label="Ticker Text"
-                  placeholder="Enter scrolling text..."
-                  value={config.ticker.text}
-                  onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, text: e.target.value } })}
-                  className="text-[10px] sm:text-xs"
-                />
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-3">
-                  <div>
-                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Text Color</label>
-                    <Input
-                      type="color"
-                      value={config.ticker.color}
-                      onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, color: e.target.value } })}
-                      className="h-6 sm:h-8 md:h-10"
-                    />
+        <CloudConfigEditor
+          config={config}
+          setConfig={setConfig}
+          mediaList={mediaList}
+          rightExtra={
+            <>
+              <Card>
+                <CardHeader className="p-3 sm:p-4">
+                  <CardTitle className="text-[10px] sm:text-xs md:text-sm">Device Info</CardTitle>
+                </CardHeader>
+                <CardContent className="p-3 sm:p-4 space-y-1.5 sm:space-y-2">
+                  <div className="flex justify-between text-[10px] sm:text-xs">
+                    <span className="text-gray-600">Version</span>
+                    <span className="font-medium">{device.appVersion || '-'}</span>
                   </div>
-                  <div>
-                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Bg Color</label>
-                    <Input
-                      type="color"
-                      value={config.ticker.bgColor}
-                      onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, bgColor: e.target.value } })}
-                      className="h-6 sm:h-8 md:h-10"
-                    />
+                  <div className="flex justify-between text-[10px] sm:text-xs">
+                    <span className="text-gray-600">Storage</span>
+                    <span className="font-medium">{device.storage ? ((device.storage.used / device.storage.total) * 100).toFixed(1) + '%' : '-'}</span>
                   </div>
-                  <div>
-                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Speed</label>
-                    <Input
-                      type="number"
-                      value={config.ticker.speed}
-                      onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, speed: parseInt(e.target.value) } })}
-                      min="1"
-                      max="20"
-                      className="text-[10px] sm:text-xs"
-                    />
+                  <div className="flex justify-between text-[10px] sm:text-xs">
+                    <span className="text-gray-600">Last Seen</span>
+                    <span className="font-medium text-[9px] sm:text-[10px]">{new Date(device.lastSeen).toLocaleString()}</span>
                   </div>
-                  <div>
-                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Font Size</label>
-                    <div className="flex h-8 sm:h-10 items-center justify-between rounded-md border border-gray-300 bg-white">
-                      <button type="button" aria-label="Decrease ticker font size" disabled={tickerFontSize <= 10}
-                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.max(10, tickerFontSize - 2) } })}
-                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">−</button>
-                      <span className="min-w-10 text-center text-xs font-medium">{tickerFontSize}px</span>
-                      <button type="button" aria-label="Increase ticker font size" disabled={tickerFontSize >= 100}
-                        onClick={() => setConfig({ ...config, ticker: { ...config.ticker, fontSize: Math.min(100, tickerFontSize + 2) } })}
-                        className="h-full px-3 text-lg font-semibold text-gray-700 disabled:opacity-40">+</button>
-                    </div>
-                    <span className="text-[9px] text-gray-500">10–100 px</span>
+                  <div className="flex justify-between text-[10px] sm:text-xs">
+                    <span className="text-gray-600">Location</span>
+                    <span className="font-medium">{device.location || 'Not set'}</span>
                   </div>
-                  <div>
-                    <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Position</label>
-                    <Select
-                      options={[
-                        { value: 'top', label: 'Top' },
-                        { value: 'bottom', label: 'Bottom' },
-                      ]}
-                      value={config.ticker.position}
-                      onChange={(e) => setConfig({ ...config, ticker: { ...config.ticker, position: e.target.value } })}
-                    />
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+                </CardContent>
+              </Card>
 
-          {/* Right Column - Device Info */}
-          <div className="space-y-2 sm:space-y-3">
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Live TV Preview</CardTitle>
-              </CardHeader>
-              <CardContent className="p-1.5 sm:p-2">
-                <CloudOrientationPicker value={config.orientation} onChange={(orientation) => setConfig({ ...config, orientation })} config={config} mediaList={mediaList} />
-              </CardContent>
-            </Card>
-            {/* Device Info */}
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Device Info</CardTitle>
-              </CardHeader>
-              <CardContent className="p-3 sm:p-4 space-y-1.5 sm:space-y-2">
-                <div className="flex justify-between text-[10px] sm:text-xs">
-                  <span className="text-gray-600">Version</span>
-                  <span className="font-medium">{device.appVersion || '-'}</span>
-                </div>
-                <div className="flex justify-between text-[10px] sm:text-xs">
-                  <span className="text-gray-600">Storage</span>
-                  <span className="font-medium">{device.storage ? ((device.storage.used / device.storage.total) * 100).toFixed(1) + '%' : '-'}</span>
-                </div>
-                <div className="flex justify-between text-[10px] sm:text-xs">
-                  <span className="text-gray-600">Last Seen</span>
-                  <span className="font-medium text-[9px] sm:text-[10px]">{new Date(device.lastSeen).toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between text-[10px] sm:text-xs">
-                  <span className="text-gray-600">Location</span>
-                  <span className="font-medium">{device.location || 'Not set'}</span>
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Cache Settings */}
-            <Card>
-              <CardHeader className="p-3 sm:p-4">
-                <CardTitle className="text-[10px] sm:text-xs md:text-sm">Cache Settings</CardTitle>
-              </CardHeader>
-              <CardContent className="p-3 sm:p-4">
-                <label className="block text-[10px] sm:text-xs font-medium text-gray-700 mb-1">Video Cache (MB)</label>
-                <Input
-                  type="number"
-                  value={config.cache.videoMB}
-                  onChange={(e) => setConfig({ ...config, cache: { ...config.cache, videoMB: parseInt(e.target.value) } })}
-                  min="512"
-                  max="8192"
-                  className="text-[10px] sm:text-xs"
-                />
-              </CardContent>
-            </Card>
-          </div>
-        </div>
-      </main>
-
-      <LibraryModal
-        isOpen={libraryModalOpen}
-        onClose={() => setLibraryModalOpen(false)}
-        onSelect={(selectedUrls) => {
-          if (currentSectionIndex !== null) {
-            updateSection(currentSectionIndex + 1, { mediaUrls: selectedUrls });
+              <EmergencyAlertBox
+                mode="device"
+                targetId={deviceId!}
+                targetLabel={device.name}
+                activeAlert={(device as any).emergencyAlert}
+                onStatusChange={() => { void loadDevice(); }}
+              />
+            </>
           }
-        }}
-        selectedUrls={currentSectionIndex !== null ? config.sections[currentSectionIndex]?.mediaUrls || [] : []}
-      />
+        />
+      </main>
 
       {historyOpen && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/45 p-4">

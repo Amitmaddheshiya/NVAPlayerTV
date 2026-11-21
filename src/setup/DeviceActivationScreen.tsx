@@ -1,16 +1,16 @@
 import React, { useEffect, useState } from "react";
-import { View, Text, StyleSheet, Dimensions } from "react-native";
+import { View, Text, StyleSheet, Dimensions, Pressable } from "react-native";
 import { NativeModules } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const DEVICE_ACTIVATED_KEY = "@device_activated";
 
 const { width, height } = Dimensions.get("window");
-const isPortrait = height > width;
 const isSmallScreen = Math.min(width, height) < 720;
 
-export default function DeviceActivationScreen() {
+export default function DeviceActivationScreen({ onBack }: { onBack: () => void }) {
   const [deviceId, setDeviceId] = useState<string>("Loading...");
+  const [backFocused, setBackFocused] = useState(false);
 
   useEffect(() => {
     const loadDeviceId = () => {
@@ -56,6 +56,16 @@ export default function DeviceActivationScreen() {
         <Text style={styles.note}>
           Note: Once activated, this screen will not appear again.
         </Text>
+        <Pressable
+          onPress={onBack}
+          onFocus={() => setBackFocused(true)}
+          onBlur={() => setBackFocused(false)}
+          style={[styles.backButton, backFocused ? styles.backButtonFocused : null]}
+          focusable
+          hasTVPreferredFocus
+        >
+          <Text style={styles.backButtonText}>Back to Mode Selection</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -167,5 +177,25 @@ const styles = StyleSheet.create({
     fontSize: isSmallScreen ? 11 : 12,
     textAlign: "center",
     fontStyle: "italic",
+  },
+  backButton: {
+    marginTop: 20,
+    minWidth: 230,
+    alignItems: "center",
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: "rgba(129, 207, 255, 0.55)",
+    backgroundColor: "#1d8fff",
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  backButtonFocused: {
+    backgroundColor: "#43a6ff",
+    borderColor: "#d3f5ff",
+  },
+  backButtonText: {
+    color: "#ffffff",
+    fontSize: 15,
+    fontWeight: "700",
   },
 });

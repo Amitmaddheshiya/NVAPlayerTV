@@ -27,7 +27,10 @@ export async function reportCloudConfigSync(report: CloudConfigSyncReport): Prom
     const apiUrl = cloudService.getApiUrl();
     const deviceId = cloudService.getDeviceId();
     const token = await cloudService.ensureDeviceAuthToken();
-    if (!apiUrl || !deviceId || !token) return false;
+    if (!apiUrl || !deviceId || !token) {
+      console.log('=== CLOUD SYNC REPORT: skipped, apiUrl=' + apiUrl + ' deviceId=' + deviceId + ' token=' + (token ? 'present' : 'EMPTY'));
+      return false;
+    }
     const response = await fetch(`${apiUrl}/api/devices/${deviceId}/sync-status`, {
       method: "POST",
       headers: {
@@ -36,6 +39,9 @@ export async function reportCloudConfigSync(report: CloudConfigSyncReport): Prom
       },
       body: JSON.stringify(report),
     });
+    if (!response.ok) {
+      console.log('=== CLOUD SYNC REPORT: server rejected, status=' + response.status + ' body=' + (await response.text().catch(() => '?')).slice(0, 200));
+    }
     return response.ok;
   } catch (error) {
     console.warn("Cloud config sync status report failed", error);
@@ -72,11 +78,19 @@ export async function loadConfig(setConfig: Function) {
       if (cloudConfigStr) {
         const storedConfig = JSON.parse(cloudConfigStr);
         if (storedConfig && typeof storedConfig === "object") {
-          const savedMediaUrls = Array.isArray(storedConfig.sections)
-            ? storedConfig.sections.flatMap((section: any) =>
+          const sectionMediaUrls = (sections: any) => Array.isArray(sections)
+            ? sections.flatMap((section: any) =>
                 section?.contentType === "multimedia" && Array.isArray(section.mediaUrls) ? section.mediaUrls : []
               )
-            : Array.isArray(storedConfig.mediaUrls) ? storedConfig.mediaUrls : [];
+            : [];
+          const savedMediaUrls = [
+            ...(Array.isArray(storedConfig.sections)
+              ? sectionMediaUrls(storedConfig.sections)
+              : Array.isArray(storedConfig.mediaUrls) ? storedConfig.mediaUrls : []),
+            ...(Array.isArray(storedConfig.schedule?.profiles)
+              ? storedConfig.schedule.profiles.flatMap((profile: any) => sectionMediaUrls(profile?.config?.sections))
+              : []),
+          ];
           setCloudConfigMediaUrls(savedMediaUrls);
           const deviceId = cloudService.getDeviceId();
           const withDeviceAccess = (value: string) => addCloudDeviceAccess(value, deviceId);
@@ -104,6 +118,39 @@ export async function loadConfig(setConfig: Function) {
                     : section?.mediaItems,
                 }))
               : storedConfig.sections,
+            schedule: storedConfig.schedule && typeof storedConfig.schedule === 'object'
+              ? {
+                  ...storedConfig.schedule,
+                  profiles: Array.isArray(storedConfig.schedule.profiles)
+                    ? storedConfig.schedule.profiles.map((profile: any) => ({
+                        ...profile,
+                        config: profile?.config && typeof profile.config === 'object'
+                          ? {
+                              ...profile.config,
+                              clock: profile.config.widgets?.clock ?? profile.config.clock,
+                              weather: profile.config.widgets?.weather ?? profile.config.weather,
+                              sections: Array.isArray(profile.config.sections)
+                                ? profile.config.sections.map((section: any) => ({
+                                    ...section,
+                                    mediaUrls: Array.isArray(section?.mediaUrls)
+                                      ? section.mediaUrls.map(withDeviceAccess)
+                                      : section?.mediaUrls,
+                                    mediaItems: Array.isArray(section?.mediaUrls)
+                                      ? section.mediaUrls.map((url: string) => {
+                                          const metadata = Array.isArray(section?.mediaItems)
+                                            ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url || '').split('?')[0])
+                                            : null;
+                                          return { ...metadata, url, streamUrl: undefined };
+                                        })
+                                      : section?.mediaItems,
+                                  }))
+                                : profile.config.sections,
+                            }
+                          : profile?.config,
+                      }))
+                    : storedConfig.schedule.profiles,
+                }
+              : storedConfig.schedule,
           };
           setConfig(cloudConfig);
 
@@ -111,26 +158,32 @@ export async function loadConfig(setConfig: Function) {
           if (cloudConfig.sections && Array.isArray(cloudConfig.sections)) {
             console.log('Restoring Cloud playback override; section count:', cloudConfig.sections.length);
             const mediaItems: any[] = [];
-            cloudConfig.sections.forEach((section: any, index: number) => {
-              if (section.contentType === 'multimedia' && section.mediaUrls) {
-                section.mediaUrls.forEach((url: string, urlIndex: number) => {
-                  const metadata = Array.isArray(section.mediaItems)
-                    ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
-                    : null;
-                  mediaItems.push({
-                    ...metadata,
-                    url,
-                    streamUrl: undefined,
-                    remoteUrl: withDeviceAccess(url),
-                    name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
-                    originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
-                    type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
-                    size: Number(metadata?.size || 0),
-                    section: index + 1, // Preserve actual section number
+            const collectItems = (sections: any) => {
+              if (!Array.isArray(sections)) return;
+              sections.forEach((section: any, index: number) => {
+                if (section.contentType === 'multimedia' && section.mediaUrls) {
+                  section.mediaUrls.forEach((url: string, urlIndex: number) => {
+                    const metadata = Array.isArray(section.mediaItems)
+                      ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+                      : null;
+                    mediaItems.push({
+                      ...metadata,
+                      url,
+                      streamUrl: undefined,
+                      remoteUrl: withDeviceAccess(url),
+                      name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
+                      originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
+                      type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
+                      size: Number(metadata?.size || 0),
+                      section: index + 1,
+                    });
                   });
-                });
-              }
-            });
+                }
+              });
+            };
+            collectItems(cloudConfig.sections);
+            (Array.isArray(cloudConfig.schedule?.profiles) ? cloudConfig.schedule.profiles : [])
+              .forEach((profile: any) => collectItems(profile?.config?.sections));
             if (mediaItems.length > 0) {
               console.log('Setting Cloud playback override; media count:', mediaItems.length);
               setPlaybackOverride('cloud-config', mediaItems);

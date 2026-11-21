@@ -36,12 +36,15 @@ export const AdminUsers = () => {
     phone: '',
     businessName: '',
     role: 'user',
+    subUserLimit: 0,
   });
 
   const [currentPage, setCurrentPage] = useState(1);
   const usersPerPage = 15;
   const [totalUsers, setTotalUsers] = useState(0);
   const [totalPages, setTotalPages] = useState(0);
+
+  const isSubUser = (user: any) => user?.role === 'sub-user' || !!user?.parentId;
 
   useEffect(() => {
     loadUsers();
@@ -105,13 +108,14 @@ export const AdminUsers = () => {
         phone: '',
         businessName: '',
         role: 'user',
+        subUserLimit: 0,
       });
       loadUsers();
-    } catch (error) {
+    } catch (error: any) {
       setAlertState({
         isOpen: true,
         title: 'Save Failed',
-        message: 'Failed to save user. Please try again.',
+        message: error?.response?.data?.error || 'Failed to save user. Please try again.',
         type: 'error',
       });
     }
@@ -124,7 +128,8 @@ export const AdminUsers = () => {
       password: '',
       phone: user.phone || '',
       businessName: user.businessName || '',
-      role: user.role,
+      role: isSubUser(user) ? 'sub-user' : user.role,
+      subUserLimit: user.subUserLimit || 0,
     });
     setShowForm(true);
   };
@@ -210,6 +215,7 @@ export const AdminUsers = () => {
                   { value: 'all', label: 'All Roles' },
                   { value: 'admin', label: 'Admin' },
                   { value: 'user', label: 'User' },
+                  { value: 'sub-user', label: 'Sub-user' },
                 ]}
                 value={roleFilter}
                 onChange={(e) => setRoleFilter(e.target.value)}
@@ -233,7 +239,6 @@ export const AdminUsers = () => {
                   value={formData.email}
                   onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                   required
-                  disabled={!!editingUser}
                   className="text-xs sm:text-sm"
                 />
                 <Input
@@ -260,13 +265,27 @@ export const AdminUsers = () => {
                 />
                 <Select
                   label="Role"
-                  options={[
-                    { value: 'user', label: 'User' },
-                    { value: 'admin', label: 'Admin' },
-                  ]}
+                  options={editingUser && isSubUser(editingUser)
+                    ? [{ value: 'sub-user', label: 'Sub-user' }]
+                    : [
+                      { value: 'user', label: 'User' },
+                      { value: 'admin', label: 'Admin' },
+                    ]}
                   value={formData.role}
                   onChange={(e) => setFormData({ ...formData, role: e.target.value })}
+                  disabled={!!(editingUser && isSubUser(editingUser))}
                 />
+                {formData.role === 'user' && !(editingUser && isSubUser(editingUser)) && (
+                  <Input
+                    label="Sub-user Limit"
+                    type="number"
+                    min={0}
+                    value={formData.subUserLimit}
+                    onChange={(e) => setFormData({ ...formData, subUserLimit: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+                    placeholder="0 = no sub-users"
+                    className="text-xs sm:text-sm"
+                  />
+                )}
               </div>
               <div className="flex gap-2">
                 <Button type="submit" className="text-xs sm:text-sm">
@@ -319,6 +338,11 @@ export const AdminUsers = () => {
                           <Shield className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
                           Admin
                         </span>
+                      ) : isSubUser(user) ? (
+                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-amber-100 text-amber-800">
+                          <ShieldAlert className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
+                          Sub-user
+                        </span>
                       ) : (
                         <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-blue-100 text-blue-800">
                           <ShieldAlert className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
@@ -358,13 +382,15 @@ export const AdminUsers = () => {
                         <Button size="sm" variant="secondary" onClick={() => handleEdit(user)}>
                           <Edit className="w-3 h-3 sm:w-4 sm:h-4" />
                         </Button>
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => handleDeviceAssignment(user)}
-                        >
-                          <Monitor className="w-3 h-3 sm:w-4 sm:h-4" />
-                        </Button>
+                        {!isSubUser(user) && (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => handleDeviceAssignment(user)}
+                          >
+                            <Monitor className="w-3 h-3 sm:w-4 sm:h-4" />
+                          </Button>
+                        )}
                         {user.role !== 'admin' && (
                           <Button
                             size="sm"

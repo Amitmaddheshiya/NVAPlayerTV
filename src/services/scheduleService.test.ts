@@ -23,6 +23,60 @@ describe("scheduleService", () => {
     expect(result.config.layout).toBe("grid2");
   });
 
+  it("activates a full-day profile on every local weekday", () => {
+    const config = {
+      ...base,
+      schedule: {
+        enabled: true,
+        profiles: [profile("all-day", "grid")],
+        entries: [{ id: "all-day", profileId: "all-day", start: "00:00", end: "00:00", days: [0, 1, 2, 3, 4, 5, 6] }],
+      },
+    };
+    expect(resolveScheduledConfig(config, at(0, 0)).config.layout).toBe("grid");
+    expect(resolveScheduledConfig(config, at(6, 23, 59)).config.layout).toBe("grid");
+  });
+
+  it("activates a day-wise full-day profile only on selected weekdays", () => {
+    const config = {
+      ...base,
+      schedule: {
+        enabled: true,
+        profiles: [profile("weekend", "grid")],
+        entries: [{ id: "weekend", profileId: "weekend", start: "00:00", end: "00:00", days: [0, 6] }],
+      },
+    };
+    expect(resolveScheduledConfig(config, at(0, 12)).config.layout).toBe("grid");
+    expect(resolveScheduledConfig(config, at(1, 12)).config.layout).toBe("fullscreen");
+    expect(resolveScheduledConfig(config, at(6, 12)).config.layout).toBe("grid");
+  });
+
+  it("matches date-wise rules only on their selected date", () => {
+    const config = {
+      ...base,
+      schedule: {
+        enabled: true,
+        profiles: [profile("special-date", "grid")],
+        entries: [{ id: "special-date", profileId: "special-date", dates: ["2026-08-02"], start: "09:00", end: "17:00" }],
+      },
+    };
+    expect(resolveScheduledConfig(config, at(0, 12)).config.layout).toBe("grid");
+    expect(resolveScheduledConfig(config, at(1, 12)).config.layout).toBe("fullscreen");
+  });
+
+  it("keeps a date-wise overnight rule active after midnight on the next date", () => {
+    const config = {
+      ...base,
+      schedule: {
+        enabled: true,
+        profiles: [profile("overnight-date", "grid")],
+        entries: [{ id: "overnight-date", profileId: "overnight-date", dates: ["2026-08-02"], start: "22:00", end: "02:00" }],
+      },
+    };
+    expect(resolveScheduledConfig(config, at(0, 23)).config.layout).toBe("grid");
+    expect(resolveScheduledConfig(config, at(1, 1)).config.layout).toBe("grid");
+    expect(resolveScheduledConfig(config, at(1, 3)).config.layout).toBe("fullscreen");
+  });
+
   it("keeps a midnight-crossing slot active on the following day", () => {
     const result = resolveScheduledConfig(base, at(1, 1));
     expect(result.activeEntry?.id).toBe("night");

@@ -49,13 +49,26 @@ export const fileAccessAuth = async (req: Request, res: Response, next: NextFunc
       const requestedDeviceId = String(req.query.deviceId || decoded.deviceId || '');
       const deviceId = await verifyDeviceToken(token, requestedDeviceId);
       if (!deviceId) return res.status(401).json({ error: 'Device is inactive or unauthorized' });
-      const device = await Device.findOne({ deviceId, activated: true }).select('config');
+      const device = await Device.findOne({ deviceId, activated: true }).select('config emergencyAlert');
       const configuredUrls = [
         ...(Array.isArray(device?.config?.mediaUrls) ? device.config.mediaUrls : []),
         ...(Array.isArray(device?.config?.sections) ? device.config.sections.flatMap((section: any) =>
           section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : []
         ) : []),
+        // Scheduled profile media is downloaded and cached alongside the base
+        // playlist. Authorize those URLs using the same device configuration
+        // snapshot so a schedule-only asset is not rejected with HTTP 403.
+        ...(Array.isArray((device?.config as any)?.schedule?.profiles)
+          ? (device!.config as any).schedule.profiles.flatMap((profile: any) => [
+              ...(Array.isArray(profile?.config?.mediaUrls) ? profile.config.mediaUrls : []),
+              ...(Array.isArray(profile?.config?.sections) ? profile.config.sections.flatMap((section: any) =>
+                section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : []
+              ) : []),
+            ])
+          : []),
       ];
+      const emergencyMediaUrl = (device as any)?.emergencyAlert?.active ? String((device as any).emergencyAlert.mediaUrl || '') : '';
+      if (emergencyMediaUrl) configuredUrls.push(emergencyMediaUrl);
       const configuredPaths = configuredUrls.map((url: string) => getMediaPathFromUrl(url)).filter(Boolean);
       if (!configuredPaths.includes(media.path)) {
         return res.status(403).json({ error: 'Device is not configured to access this file' });
@@ -65,15 +78,17 @@ export const fileAccessAuth = async (req: Request, res: Response, next: NextFunc
       return next();
     }
 
-    if (decoded?.role !== 'admin' && decoded?.role !== 'user') {
+    if (decoded?.role !== 'admin' && decoded?.role !== 'user' && decoded?.role !== 'sub-user') {
       return res.status(401).json({ error: 'Invalid token role' });
     }
-    const user = await User.findById(decoded.userId).select('role');
+    const user = await User.findById(decoded.userId).select('role parentId');
     if (!user || user.role !== decoded.role) return res.status(401).json({ error: 'User session is no longer valid' });
-    if (decoded.role !== 'admin' && media.uploadedBy?.toString() !== decoded.userId) {
+    const effectiveUserId = user.parentId ? String(user.parentId) : String(user._id);
+    if (decoded.role !== 'admin' && media.uploadedBy?.toString() !== effectiveUserId) {
       return res.status(403).json({ error: 'Access denied - you do not have permission to access this file' });
     }
     (req as any).userId = decoded.userId;
+    (req as any).effectiveUserId = effectiveUserId;
     (req as any).userRole = decoded.role;
     next();
   } catch (error) {

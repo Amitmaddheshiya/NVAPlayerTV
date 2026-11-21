@@ -3,6 +3,7 @@ import User from '../models/User';
 import Device from '../models/Device';
 import Media from '../models/Media';
 import Group from '../models/Group';
+import ScheduleTemplate from '../models/Schedule';
 import GlobalConfig from '../models/GlobalConfig';
 import { getStorageService } from '../config/storage';
 import { getSocketInstance } from '../socket/socket';
@@ -10,6 +11,12 @@ import { getMediaPathFromUrl } from '../utils/mediaUrl';
 import bcrypt from 'bcryptjs';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { cacheGet, cacheSet, cacheDel, cacheDelPattern } from '../config/redis';
+
+const isSubUserAccount = (user: any): boolean => user?.role === 'sub-user' || !!user?.parentId;
+const presentUser = (user: any): any => {
+  const value = typeof user?.toObject === 'function' ? user.toObject() : user;
+  return value ? { ...value, role: isSubUserAccount(value) ? 'sub-user' : value.role } : value;
+};
 
 export const getUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -26,7 +33,12 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     }
 
     // Role filter
-    if (role) {
+    if (role === 'sub-user') {
+      filter.$and = [{ $or: [{ role: 'sub-user' }, { parentId: { $exists: true, $ne: null } }] }];
+    } else if (role === 'user') {
+      // Legacy child accounts may still have role=user; keep them in the Sub-user filter.
+      filter.$and = [{ role: 'user' }, { parentId: null }];
+    } else if (role) {
       filter.role = role;
     }
 
@@ -42,7 +54,8 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     const cached = await cacheGet(cacheKey);
     if (cached) {
       console.log('[Cache HIT] Users from cache');
-      res.json(JSON.parse(cached));
+      const cachedResponse = JSON.parse(cached);
+      res.json({ ...cachedResponse, data: (cachedResponse.data || []).map(presentUser) });
       return;
     }
 
@@ -59,21 +72,16 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     const totalPages = Math.ceil(total / limitNum);
 
     // Cache the result (TTL: 60 seconds)
-    await cacheSet(cacheKey, JSON.stringify({
-      data: users,
+    const response = {
+      data: users.map(presentUser),
       total,
       page: pageNum,
       limit: limitNum,
       totalPages
-    }), 60);
+    };
+    await cacheSet(cacheKey, JSON.stringify(response), 60);
 
-    res.json({
-      data: users,
-      total,
-      page: pageNum,
-      limit: limitNum,
-      totalPages
-    });
+    res.json(response);
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({ error: 'Failed to fetch users' });
@@ -88,7 +96,7 @@ export const getUser = async (req: AuthRequest, res: Response): Promise<void> =>
     const cached = await cacheGet(cacheKey);
     if (cached) {
       console.log('[Cache HIT] User from cache');
-      res.json(JSON.parse(cached));
+      res.json(presentUser(JSON.parse(cached)));
       return;
     }
 
@@ -99,9 +107,10 @@ export const getUser = async (req: AuthRequest, res: Response): Promise<void> =>
     }
 
     // Cache the result (TTL: 300 seconds = 5 minutes)
-    await cacheSet(cacheKey, JSON.stringify(user), 300);
+    const response = presentUser(user);
+    await cacheSet(cacheKey, JSON.stringify(response), 300);
 
-    res.json(user);
+    res.json(response);
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Failed to fetch user' });
@@ -121,13 +130,15 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
       user.currentMonthUpload = 0;
       await user.save();
     }
+    const ownerId = req.effectiveUserId || req.userId;
     const [totalDevices, onlineDevices, config] = await Promise.all([
-      Device.countDocuments({ assignedUserId: req.userId }),
-      Device.countDocuments({ assignedUserId: req.userId, status: 'online' }),
+      Device.countDocuments({ assignedUserId: ownerId }),
+      Device.countDocuments({ assignedUserId: ownerId, status: 'online' }),
       GlobalConfig.findOne().select('monthlyUploadLimitGB'),
     ]);
     res.json({
-      ...user.toObject(),
+      ...presentUser(user),
+      isSubUser: isSubUserAccount(user),
       totalDevices,
       onlineDevices,
       offlineDevices: Math.max(0, totalDevices - onlineDevices),
@@ -141,7 +152,7 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
 
 export const createUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { email, password, phone, businessName, role } = req.body;
+    const { email, password, phone, businessName, role, subUserLimit } = req.body;
 
     // Validation
     if (!email || !password) {
@@ -178,6 +189,7 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
       phone,
       businessName,
       role: role || 'user',
+      subUserLimit: role === 'admin' ? 0 : Math.max(0, parseInt(subUserLimit, 10) || 0),
     });
 
     await user.save();
@@ -197,30 +209,65 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
 
 export const updateUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { email, password, phone, businessName, role } = req.body;
+    const { email, password, phone, businessName, role, subUserLimit } = req.body;
+    const existingUser = await User.findById(req.params.id);
+    if (!existingUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    if (role && !['admin', 'user', 'sub-user'].includes(role)) {
+      res.status(400).json({ error: 'Invalid role. Must be admin, user, or sub-user' });
+      return;
+    }
+    if (isSubUserAccount(existingUser) && role && role !== 'sub-user') {
+      res.status(400).json({ error: 'A sub-user cannot be changed to another role. Manage this account from its parent account.' });
+      return;
+    }
+    if (role === 'sub-user' && !existingUser.parentId) {
+      res.status(400).json({ error: 'Sub-user role can only be set through the parent account.' });
+      return;
+    }
     const updateData: any = {};
 
-    if (email) updateData.email = email;
+    if (email !== undefined) {
+      const normalizedEmail = String(email).trim().toLowerCase();
+      if (!normalizedEmail || !/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+        res.status(400).json({ error: 'Enter a valid email address' });
+        return;
+      }
+      const duplicate = await User.findOne({
+        email: normalizedEmail,
+        _id: { $ne: existingUser._id },
+      }).select('_id');
+      if (duplicate) {
+        res.status(400).json({ error: 'A user with this email already exists' });
+        return;
+      }
+      updateData.email = normalizedEmail;
+    }
     if (phone) updateData.phone = phone;
     if (businessName) updateData.businessName = businessName;
     if (role) updateData.role = role;
+    if (subUserLimit !== undefined) updateData.subUserLimit = Math.max(0, parseInt(subUserLimit, 10) || 0);
     if (password) {
       updateData.password = await bcrypt.hash(password, 10);
     }
 
+    // Normalize legacy child accounts the next time an admin edits them.
+    if (existingUser.parentId) updateData.role = 'sub-user';
     const user = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).select('-password');
-    if (!user) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
 
     // Invalidate user cache on update
     await cacheDelPattern('users:*');
     await cacheDel(`user:${req.params.id}`);
 
-    res.json(user);
+    res.json(presentUser(user));
   } catch (error) {
     console.error('Update user error:', error);
+    if ((error as any)?.code === 11000) {
+      res.status(400).json({ error: 'A user with this email already exists' });
+      return;
+    }
     res.status(500).json({ error: 'Failed to update user' });
   }
 };
@@ -266,6 +313,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
 
     for (const device of assignedDevices) {
       device.config = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;
+      delete (device.config as any).schedule;
       if (device.cacheInfo) {
         device.cacheInfo.configVersion += 1;
         device.cacheInfo.lastSyncTime = new Date();
@@ -274,6 +322,10 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
       await device.save();
       io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
     }
+
+    // Remove schedule templates owned by this account (and its sub-users)
+    const subUserIds = await User.find({ parentId: req.params.id }).select('_id').lean();
+    await ScheduleTemplate.deleteMany({ ownerId: { $in: [req.params.id, ...subUserIds.map((u: any) => u._id)] } });
 
     // Unassign devices and detach them from groups owned by this account.
     await Device.updateMany(
@@ -286,7 +338,8 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
     }
     await Group.deleteMany({ ownerId: req.params.id });
 
-    // Delete the user
+    // Delete the user (and any sub-users they created)
+    await User.deleteMany({ parentId: req.params.id });
     await User.findByIdAndDelete(req.params.id);
 
     // Invalidate user cache on delete
@@ -316,6 +369,10 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
       res.status(404).json({ error: 'User not found' });
       return;
     }
+    if (isSubUserAccount(user)) {
+      res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
+      return;
+    }
 
     const requestedDevices = normalizedDeviceIds.length
       ? await Device.find({ deviceId: { $in: normalizedDeviceIds } }).select('deviceId assignedUserId').lean()
@@ -327,6 +384,12 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
     const transferredDeviceIds = requestedDevices
       .filter((device: any) => device.assignedUserId && String(device.assignedUserId) !== userId)
       .map((device: any) => String(device.deviceId));
+
+    const removedDeviceIds = (user.assignedDevices || []).filter((id: string) => !normalizedDeviceIds.includes(id));
+    const affectedScheduleDeviceIds = [...new Set([...transferredDeviceIds, ...removedDeviceIds])];
+    if (affectedScheduleDeviceIds.length) {
+      await ScheduleTemplate.deleteMany({ targetType: 'device', targetId: { $in: affectedScheduleDeviceIds } });
+    }
 
     // Remove transferred IDs from previous owners' denormalized assignment lists.
     if (normalizedDeviceIds.length) {
@@ -361,6 +424,7 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
           mediaUrls: [],
           ticker: { text: '' },
         } as any;
+        delete (device.config as any).schedule;
         if (device.cacheInfo) {
           device.cacheInfo.configVersion += 1;
           device.cacheInfo.lastSyncTime = new Date();
@@ -481,5 +545,205 @@ export const changePassword = async (req: AuthRequest, res: Response): Promise<v
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({ error: 'Failed to change password' });
+  }
+};
+
+// ---------- Sub-users (managed by a parent 'user' account) ----------
+
+const SUB_USER_PERMISSION_KEYS = ['devices', 'groups', 'library', 'settings'] as const;
+
+const isParentUser = (req: AuthRequest): boolean => req.userRole === 'user' && !req.isSubUser;
+
+const sanitizePermissions = (input: any) => {
+  const permissions: Record<string, boolean> = {};
+  for (const key of SUB_USER_PERMISSION_KEYS) {
+    permissions[key] = input?.[key] !== false;
+  }
+  // Sub-users can never manage sub-users themselves.
+  permissions.subUsers = false;
+  return permissions;
+};
+
+const sanitizeResourceAccess = (input: any): { devices: string[]; groups: string[] } => {
+  const normalizeIds = (value: any): string[] => Array.from(new Set<string>(
+    (Array.isArray(value) ? value : [])
+      .map((id: any) => String(id || '').trim())
+      .filter(Boolean)
+  ));
+  return { devices: normalizeIds(input?.devices), groups: normalizeIds(input?.groups) };
+};
+
+const validateResourceAccess = async (parentId: string, access: { devices: string[]; groups: string[] }): Promise<string | null> => {
+  const [devices, groups] = await Promise.all([
+    access.devices.length
+      ? Device.find({ deviceId: { $in: access.devices }, assignedUserId: parentId }).select('deviceId').lean()
+      : [],
+    access.groups.length
+      ? Group.find({ _id: { $in: access.groups }, ownerId: parentId }).select('_id').lean()
+      : [],
+  ]);
+  if (devices.length !== access.devices.length) return 'One or more selected devices do not belong to your account';
+  if (groups.length !== access.groups.length) return 'One or more selected groups do not belong to your account';
+  return null;
+};
+
+export const getSubUsers = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!isParentUser(req)) {
+      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+      return;
+    }
+    const parent = await User.findById(req.userId).select('subUserLimit');
+    const subUsers = await User.find({ parentId: req.userId }).select('-password').sort({ createdAt: -1 });
+    res.json({ data: subUsers.map(presentUser), limit: parent?.subUserLimit || 0, count: subUsers.length });
+  } catch (error) {
+    console.error('Get sub-users error:', error);
+    res.status(500).json({ error: 'Failed to fetch sub-users' });
+  }
+};
+
+export const createSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!isParentUser(req)) {
+      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+      return;
+    }
+    const { email, password, permissions, resourceAccess } = req.body;
+
+    if (!email || !password) {
+      res.status(400).json({ error: 'Email and password are required' });
+      return;
+    }
+    if (!String(email).includes('@')) {
+      res.status(400).json({ error: 'Invalid email format' });
+      return;
+    }
+    if (String(password).length < 6) {
+      res.status(400).json({ error: 'Password must be at least 6 characters' });
+      return;
+    }
+
+    const parent = await User.findById(req.userId);
+    if (!parent) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+    const limit = Number(parent.subUserLimit || 0);
+    const existingCount = await User.countDocuments({ parentId: req.userId });
+    if (limit <= 0 || existingCount >= limit) {
+      res.status(400).json({ error: `Sub-user limit reached (${existingCount}/${limit}). Ask admin to increase the limit.` });
+      return;
+    }
+    const safeResourceAccess = sanitizeResourceAccess(resourceAccess);
+    const resourceAccessError = await validateResourceAccess(String(parent._id), safeResourceAccess);
+    if (resourceAccessError) {
+      res.status(403).json({ error: resourceAccessError });
+      return;
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const existingUser = await User.findOne({ email: normalizedEmail });
+    if (existingUser) {
+      res.status(400).json({ error: 'A user with this email already exists' });
+      return;
+    }
+
+    const subUser = new User({
+      email: normalizedEmail,
+      password: await bcrypt.hash(password, 10),
+      role: 'sub-user',
+      parentId: req.userId,
+      permissions: sanitizePermissions(permissions),
+      resourceAccess: safeResourceAccess,
+      subUserLimit: 0,
+    });
+    await subUser.save();
+
+    await cacheDelPattern('users:*');
+    res.status(201).json({ id: subUser._id, email: subUser.email, role: 'sub-user', permissions: subUser.permissions });
+  } catch (error) {
+    console.error('Create sub-user error:', error);
+    res.status(500).json({ error: 'Failed to create sub-user' });
+  }
+};
+
+export const updateSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!isParentUser(req)) {
+      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+      return;
+    }
+    const subUser = await User.findOne({ _id: req.params.id, parentId: req.userId });
+    if (!subUser) {
+      res.status(404).json({ error: 'Sub-user not found' });
+      return;
+    }
+
+    const { email, password, permissions, resourceAccess } = req.body;
+    subUser.role = 'sub-user';
+    if (email !== undefined) {
+      const normalizedEmail = String(email).trim().toLowerCase();
+      if (!normalizedEmail.includes('@')) {
+        res.status(400).json({ error: 'Invalid email format' });
+        return;
+      }
+      const duplicate = await User.findOne({ email: normalizedEmail, _id: { $ne: subUser._id } });
+      if (duplicate) {
+        res.status(400).json({ error: 'A user with this email already exists' });
+        return;
+      }
+      subUser.email = normalizedEmail;
+    }
+    if (password) {
+      if (String(password).length < 6) {
+        res.status(400).json({ error: 'Password must be at least 6 characters' });
+        return;
+      }
+      subUser.password = await bcrypt.hash(password, 10);
+    }
+    if (permissions !== undefined) {
+      subUser.permissions = sanitizePermissions(permissions);
+    }
+    if (resourceAccess !== undefined) {
+      const safeResourceAccess = sanitizeResourceAccess(resourceAccess);
+      const resourceAccessError = await validateResourceAccess(String(req.userId), safeResourceAccess);
+      if (resourceAccessError) {
+        res.status(403).json({ error: resourceAccessError });
+        return;
+      }
+      subUser.resourceAccess = safeResourceAccess as any;
+    }
+    await subUser.save();
+
+    await cacheDelPattern('users:*');
+    res.json({ id: subUser._id, email: subUser.email, role: 'sub-user', permissions: subUser.permissions });
+  } catch (error) {
+    console.error('Update sub-user error:', error);
+    if ((error as any)?.code === 11000) {
+      res.status(400).json({ error: 'A user with this email already exists' });
+      return;
+    }
+    res.status(500).json({ error: 'Failed to update sub-user' });
+  }
+};
+
+export const deleteSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!isParentUser(req)) {
+      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+      return;
+    }
+    const subUser = await User.findOne({ _id: req.params.id, parentId: req.userId });
+    if (!subUser) {
+      res.status(404).json({ error: 'Sub-user not found' });
+      return;
+    }
+    // Sub-user uploads are attributed to the parent account, so no media cleanup is needed here.
+    await User.findByIdAndDelete(subUser._id);
+    await cacheDelPattern('users:*');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete sub-user error:', error);
+    res.status(500).json({ error: 'Failed to delete sub-user' });
   }
 };

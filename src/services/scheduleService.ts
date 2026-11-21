@@ -6,6 +6,8 @@ type ScheduleEntry = {
   start?: string;
   end?: string;
   days?: number[];
+  /** Optional 'YYYY-MM-DD' list; when present the entry only matches those dates. */
+  dates?: string[];
 };
 
 function timeToMinutes(value: unknown): number | null {
@@ -21,13 +23,26 @@ function isEntryActive(entry: ScheduleEntry, now: Date): boolean {
   const start = timeToMinutes(entry?.start || "00:00");
   const end = timeToMinutes(entry?.end || "23:59");
   if (start === null || end === null) return false;
+  const current = now.getHours() * 60 + now.getMinutes();
+
+  // Date-wise entries start on a listed calendar date. An overnight range
+  // continues after midnight into the following local calendar date.
+  const dates = Array.isArray(entry?.dates) ? entry.dates.filter((d) => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) : [];
+  if (dates.length) {
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    if (start === end) return dates.includes(todayStr);
+    const yesterdayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    const yesterdayStr = `${yesterdayDate.getFullYear()}-${String(yesterdayDate.getMonth() + 1).padStart(2, "0")}-${String(yesterdayDate.getDate()).padStart(2, "0")}`;
+    if (start < end) return dates.includes(todayStr) && current >= start && current < end;
+    return (dates.includes(todayStr) && current >= start) || (dates.includes(yesterdayStr) && current < end);
+  }
+
   const days = Array.isArray(entry?.days) && entry.days.length
     ? entry.days.map(Number).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
     : [0, 1, 2, 3, 4, 5, 6];
   if (!days.length) return false;
   const today = now.getDay();
   const yesterday = (today + 6) % 7;
-  const current = now.getHours() * 60 + now.getMinutes();
   if (start === end) return days.includes(today);
   if (start < end) return days.includes(today) && current >= start && current < end;
   return (days.includes(today) && current >= start) || (days.includes(yesterday) && current < end);
@@ -56,7 +71,8 @@ export function resolveScheduledConfig(baseConfig: any, now = new Date()) {
     .sort((a: ScheduleEntry, b: ScheduleEntry) => Number(b?.priority || 0) - Number(a?.priority || 0) || String(a?.id || "").localeCompare(String(b?.id || "")))[0] || null;
   if (!active) return { config: baseConfig, enabled: true, activeEntry: null };
   const profiles = Array.isArray(schedule.profiles) ? schedule.profiles : [];
-  const profile = profiles.find((item: any) => String(item?.id || "") === String(active?.profileId || ""));
+  const profileKey = String(active?.profileId || active?.id || "");
+  const profile = profiles.find((item: any) => String(item?.id || "") === profileKey);
   return { config: profile?.config ? mergeProfile(baseConfig, profile.config) : baseConfig, enabled: true, activeEntry: active, profile: profile || null };
 }
 

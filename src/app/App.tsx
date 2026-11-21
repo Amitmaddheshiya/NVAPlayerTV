@@ -84,7 +84,7 @@ import {
   openOverlayPermissionSettings,
   openNextMissingSpecialPermission,
 } from "../services/storagePermissionService";
-import { getAppMode, saveAppMode, type AppMode } from "../services/setupService";
+import { getAppMode, resetAppMode, saveAppMode, type AppMode } from "../services/setupService";
 import cloudService from "../services/cloudService";
 import socketService from "../services/socketService";
 import offlineService from "../services/offlineService";
@@ -227,41 +227,116 @@ async function unlinkPathIfExists(targetPath: string) {
   }
 }
 
+function decorateCloudSectionForPlayback(section: any, deviceId: string) {
+  const mediaUrls = Array.isArray(section?.mediaUrls) ? section.mediaUrls : [];
+  const sourceItems = Array.isArray(section?.mediaItems) ? section.mediaItems : [];
+  return {
+    ...section,
+    mediaUrls: mediaUrls.map((url: string) => addCloudDeviceAccess(url, deviceId)),
+    mediaItems: mediaUrls.map((url: string) => {
+      const metadata = sourceItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url || '').split('?')[0]);
+      return {
+        ...metadata,
+        url,
+        streamUrl: undefined,
+      };
+    }),
+  };
+}
+
 function decorateCloudConfigForPlayback(source: any, deviceId: string) {
+  const decorateSections = (sections: any) =>
+    Array.isArray(sections) ? sections.map((section: any) => decorateCloudSectionForPlayback(section, deviceId)) : sections;
+  const schedule = source?.schedule && typeof source.schedule === 'object'
+    ? {
+        ...source.schedule,
+        profiles: Array.isArray(source.schedule.profiles)
+          ? source.schedule.profiles.map((profile: any) => ({
+              ...profile,
+              config: profile?.config && typeof profile.config === 'object'
+                ? {
+                    ...profile.config,
+                    clock: profile.config.widgets?.clock ?? profile.config.clock,
+                    weather: profile.config.widgets?.weather ?? profile.config.weather,
+                    sections: decorateSections(profile.config.sections),
+                  }
+                : profile?.config,
+            }))
+          : source.schedule.profiles,
+      }
+    : source?.schedule;
   return {
     ...source,
     clock: source?.widgets?.clock ?? source?.clock,
     weather: source?.widgets?.weather ?? source?.weather,
-    sections: Array.isArray(source?.sections)
-      ? source.sections.map((section: any) => {
-          const mediaUrls = Array.isArray(section?.mediaUrls) ? section.mediaUrls : [];
-          const sourceItems = Array.isArray(section?.mediaItems) ? section.mediaItems : [];
-          return {
-            ...section,
-            mediaUrls: mediaUrls.map((url: string) => addCloudDeviceAccess(url, deviceId)),
-            mediaItems: mediaUrls.map((url: string) => {
-              const metadata = sourceItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url || '').split('?')[0]);
-              return {
-                ...metadata,
-                url,
-                streamUrl: undefined,
-              };
-            }),
-          };
-        })
-      : source?.sections,
+    sections: decorateSections(source?.sections),
+    schedule,
   };
 }
 
+function getSectionMediaUrls(source: any): string[] {
+  if (!Array.isArray(source?.sections)) return [];
+  return source.sections.flatMap((section: any) =>
+    section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls)
+      ? section.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean)
+      : []
+  );
+}
+
 function getCloudConfigMediaUrls(source: any): string[] {
-  if (Array.isArray(source?.sections)) {
-    return source.sections.flatMap((section: any) =>
-      section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls)
-        ? section.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean)
-        : []
-    );
-  }
-  return Array.isArray(source?.mediaUrls) ? source.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean) : [];
+  const urls = Array.isArray(source?.sections)
+    ? getSectionMediaUrls(source)
+    : Array.isArray(source?.mediaUrls)
+      ? source.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean)
+      : [];
+  const profiles = Array.isArray(source?.schedule?.profiles) ? source.schedule.profiles : [];
+  profiles.forEach((profile: any) => {
+    const profileUrls = Array.isArray(profile?.config?.sections)
+      ? getSectionMediaUrls(profile.config)
+      : Array.isArray(profile?.config?.mediaUrls)
+        ? profile.config.mediaUrls.map((url: unknown) => String(url || '')).filter(Boolean)
+        : [];
+    urls.push(...profileUrls);
+  });
+  return urls;
+}
+
+function collectCloudConfigMediaItems(config: any): any[] {
+  const mediaItems: any[] = [];
+  const collectFromSections = (sections: any) => {
+    if (!Array.isArray(sections)) return;
+    sections.forEach((section: any, index: number) => {
+      if (section.contentType === 'multimedia' && section.mediaUrls) {
+        section.mediaUrls.forEach((url: string, urlIndex: number) => {
+          const metadata = Array.isArray(section.mediaItems)
+            ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
+            : null;
+          mediaItems.push({
+            ...metadata,
+            url: url,
+            streamUrl: undefined,
+            remoteUrl: url,
+            name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
+            originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
+            type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
+            size: Number(metadata?.size || 0),
+            section: index + 1,
+          });
+        });
+      }
+    });
+  };
+  const collectFromConfig = (source: any) => {
+    if (Array.isArray(source?.sections)) {
+      collectFromSections(source.sections);
+    } else if (Array.isArray(source?.mediaUrls)) {
+      collectFromSections([{ contentType: 'multimedia', mediaUrls: source.mediaUrls, mediaItems: source.mediaItems }]);
+    }
+  };
+  collectFromConfig(config);
+  const profiles = Array.isArray(config?.schedule?.profiles) ? config.schedule.profiles : [];
+  profiles.forEach((profile: any) => collectFromConfig(profile?.config));
+  return mediaItems;
 }
 
 const PRESERVED_ASYNC_KEYS = new Set([
@@ -277,6 +352,8 @@ const CLOUD_APPLIED_CONFIG_KEY = '@cloud_applied_config';
 const CLOUD_APPLIED_VERSION_KEY = '@cloud_applied_config_version';
 const CLOUD_PENDING_CONFIG_KEY = '@cloud_pending_config';
 const CLOUD_PENDING_VERSION_KEY = '@cloud_pending_config_version';
+const CLOUD_EMERGENCY_ALERT_KEY = '@cloud_emergency_alert';
+const CLOUD_EMERGENCY_ALERT_DISMISSED_KEY = '@cloud_emergency_alert_dismissed';
 const cloudPlaybackErrorReportAt = new Map<string, number>();
 
 function reportCloudPlaybackError(payload: any): void {
@@ -322,6 +399,7 @@ export default function App() {
   const spinValue = useRef(new Animated.Value(0)).current;
   const pulseValue = useRef(new Animated.Value(0)).current;
   const deviceIdRef = useRef("unknown");
+  const resettingModeRef = useRef(false);
   const lastAppliedCloudConfigRef = useRef<{ version: number; signature: string } | null>(null);
   const cloudConfigApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const cloudConfigQueuedVersionRef = useRef(0);
@@ -334,6 +412,7 @@ export default function App() {
   const [licenseBusy, setLicenseBusy] = useState(false);
   const [licenseInputFocused, setLicenseInputFocused] = useState(false);
   const [licenseButtonFocused, setLicenseButtonFocused] = useState(false);
+  const [modeBackFocused, setModeBackFocused] = useState(false);
   const licenseInputRef = useRef<TextInput>(null);
   const [lastError, setLastError] = useState<RuntimeErrorInfo | null>(null);
   const [sourceSnapshot, setSourceSnapshot] = useState<SourceSnapshot>(INITIAL_SOURCE_SNAPSHOT);
@@ -352,12 +431,24 @@ export default function App() {
     3: 0,
   });
   const [sectionPlaybackTimeline, setSectionPlaybackTimeline] = useState<Record<number, any>>({});
-  const [emergencyAlert, setEmergencyAlert] = useState<{ active: boolean; type: string; title: string; message: string; sound: boolean }>({
+  const [emergencyAlert, setEmergencyAlert] = useState<{
+    active: boolean;
+    kind?: 'message' | 'media';
+    type: string;
+    title: string;
+    message: string;
+    mediaUrl?: string;
+    mediaType?: string;
+    sound: boolean;
+    triggeredAt?: string;
+  }>({
     active: false,
+    kind: 'message',
     type: "FIRE",
     title: "EMERGENCY ALERT",
     message: "PLEASE EVACUATE IMMEDIATELY!",
     sound: false,
+    triggeredAt: "",
   });
   // Transient only: this is intentionally reset whenever the app reloads.
   const [playerPaused, setPlayerPaused] = useState(false);
@@ -387,20 +478,41 @@ export default function App() {
   const documentConversionHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!config?.schedule?.enabled) return;
-    // Re-evaluate exactly after each minute boundary, not just after a polling
-    // interval. This makes a 09:00 slot switch at 09:00.
+    // Re-evaluate after config changes, app resume, and each local minute
+    // boundary so changed templates cannot wait on a stale clock snapshot.
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastResolution = '';
+    const refreshScheduleClock = (reason: string) => {
+      const now = Date.now();
+      const resolved = resolveScheduledConfig(config, new Date(now));
+      const state = [
+        String(resolved.activeEntry?.id || ''),
+        String(resolved.profile?.id || ''),
+        String(resolved.config?.layout || ''),
+      ].join('|');
+      if (state !== lastResolution || reason !== 'minute') {
+        console.log(`[SCHEDULE_RUNTIME] reason=${reason} now=${new Date(now).toString()} entries=${config.schedule.entries?.length || 0} active=${resolved.activeEntry?.id || 'none'} profile=${resolved.profile?.id || 'none'} layout=${resolved.config?.layout || 'unknown'}`);
+        lastResolution = state;
+      }
+      setScheduleClockTick(now);
+    };
     const scheduleNextMinute = () => {
       const delay = 60000 - (Date.now() % 60000) + 40;
       timer = setTimeout(() => {
-        setScheduleClockTick(Date.now());
+        refreshScheduleClock('minute');
         scheduleNextMinute();
       }, delay);
     };
-    setScheduleClockTick(Date.now());
+    refreshScheduleClock('config');
     scheduleNextMinute();
-    return () => { if (timer) clearTimeout(timer); };
-  }, [config?.schedule?.enabled]);
+    const appStateSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refreshScheduleClock('resume');
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      appStateSub.remove();
+    };
+  }, [config?.schedule]);
 
   const errorClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const offlineNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -465,6 +577,54 @@ export default function App() {
     sourceManagerRef.current.setCmsOnlyMode(cmsOnlyPlayback);
   }, [cmsOnlyPlayback]);
 
+  const normalizeEmergencyAlert = useCallback(async (alert: any) => {
+    if (!alert || typeof alert !== 'object') return null;
+    const triggeredAt = String(alert.triggeredAt || alert.triggered_at || '');
+    try {
+      const dismissedAt = await AsyncStorage.getItem(CLOUD_EMERGENCY_ALERT_DISMISSED_KEY);
+      if (dismissedAt && triggeredAt && dismissedAt === triggeredAt) return null;
+    } catch {}
+    let mediaUrl = String(alert.mediaUrl || alert.media_url || '');
+    if (mediaUrl) {
+      try {
+        const deviceToken = await cloudService.ensureDeviceAuthToken();
+        mediaUrl = addCloudDeviceAccess(mediaUrl, cloudService.getDeviceId(), deviceToken || undefined);
+      } catch {}
+    }
+    return {
+      active: true,
+      kind: ((alert.kind === 'media' || mediaUrl) ? 'media' : 'message') as 'media' | 'message',
+      type: String(alert.type || 'GENERAL'),
+      title: String(alert.title || 'EMERGENCY ALERT'),
+      message: String(alert.message || ''),
+      mediaUrl,
+      mediaType: String(alert.mediaType || alert.media_type || ''),
+      sound: Boolean(alert.sound),
+      triggeredAt,
+    };
+  }, []);
+
+  const applyEmergencyAlert = useCallback(async (alert: any) => {
+    const normalized = await normalizeEmergencyAlert(alert);
+    if (!normalized) return;
+    setEmergencyAlert(normalized);
+    try {
+      await AsyncStorage.setItem(CLOUD_EMERGENCY_ALERT_KEY, JSON.stringify(alert));
+    } catch {}
+  }, [normalizeEmergencyAlert]);
+
+  const clearEmergencyAlertState = useCallback((notifySocket = false) => {
+    setEmergencyAlert((prev) => {
+      const triggeredAt = String(prev?.triggeredAt || '');
+      if (triggeredAt) {
+        void AsyncStorage.setItem(CLOUD_EMERGENCY_ALERT_DISMISSED_KEY, triggeredAt).catch(() => {});
+      }
+      return { ...prev, active: false };
+    });
+    void AsyncStorage.removeItem(CLOUD_EMERGENCY_ALERT_KEY).catch(() => {});
+    if (notifySocket) socketService.emitEmergencyDismissed();
+  }, []);
+
   useEffect(() => {
     // Set up event listeners for socket events
     const setupEventListeners = () => {
@@ -475,7 +635,8 @@ export default function App() {
         if (queuedVersion > 0) cloudConfigQueuedVersionRef.current = queuedVersion;
         cloudConfigApplyQueueRef.current = cloudConfigApplyQueueRef.current.then(async () => {
         if (!incomingConfig || typeof incomingConfig !== 'object') return;
-        if (await getAppMode() !== 'cloudMode') return;
+        const appModeNow = await getAppMode();
+        if (appModeNow !== 'cloudMode') { console.log('=== CLOUD CONFIG: skipped, appMode =', appModeNow); return; }
         const incomingVersion = Number(incomingConfig.configVersion || 0);
         const sourceConfig = incomingConfig.config && typeof incomingConfig.config === 'object'
           ? incomingConfig.config
@@ -485,36 +646,15 @@ export default function App() {
         const config = decorateCloudConfigForPlayback(sourceConfig, deviceId);
         const serializedConfig = JSON.stringify(config);
         const lastApplied = lastAppliedCloudConfigRef.current;
-        if (lastApplied && incomingVersion > 0 && incomingVersion < lastApplied.version) return;
+        if (lastApplied && incomingVersion > 0 && incomingVersion < lastApplied.version) { console.log('=== CLOUD CONFIG: skipped, older than lastApplied', incomingVersion, lastApplied.version); return; }
         const [storedAppliedVersionText, activeGeneration] = await Promise.all([
           AsyncStorage.getItem(CLOUD_APPLIED_VERSION_KEY),
           AsyncStorage.getItem(CLOUD_ACTIVE_CACHE_GENERATION_KEY),
         ]);
         const storedAppliedVersion = Number(storedAppliedVersionText || 0);
-        if (incomingVersion > 0 && incomingVersion < storedAppliedVersion) return;
-        const mediaItems: any[] = [];
-        if (config.sections && Array.isArray(config.sections)) {
-          config.sections.forEach((section: any, index: number) => {
-            if (section.contentType === 'multimedia' && section.mediaUrls) {
-              section.mediaUrls.forEach((url: string, urlIndex: number) => {
-                const metadata = Array.isArray(section.mediaItems)
-                  ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
-                  : null;
-                mediaItems.push({
-                  ...metadata,
-                  url: url,
-                  streamUrl: undefined,
-                  remoteUrl: url,
-                  name: metadata?.name || url.split('/').pop() || `media_${urlIndex}`,
-                  originalName: metadata?.originalName || url.split('/').pop() || `media_${urlIndex}`,
-                  type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
-                  size: Number(metadata?.size || 0),
-                  section: index + 1, // Preserve actual section number
-                });
-              });
-            }
-          });
-        }
+        if (incomingVersion > 0 && incomingVersion < storedAppliedVersion) { console.log('=== CLOUD CONFIG: skipped, older than storedApplied', incomingVersion, storedAppliedVersion); return; }
+        console.log('=== CLOUD CONFIG: processing v' + incomingVersion + ' (storedApplied=' + storedAppliedVersion + ')');
+        const mediaItems = collectCloudConfigMediaItems(config);
         if (incomingVersion > 0 && incomingVersion === storedAppliedVersion) {
           const alreadyCached = await verifyCachedMediaItems(mediaItems, activeGeneration || undefined);
           if (alreadyCached.failed === 0) {
@@ -535,6 +675,8 @@ export default function App() {
               message: 'Configuration is applied from the verified offline cache',
             });
             if (readyReported) await AsyncStorage.multiRemove([CLOUD_PENDING_CONFIG_KEY, CLOUD_PENDING_VERSION_KEY, '@cloud_pending_cache_generation']);
+          } else {
+            console.log('=== CLOUD CONFIG: same version but cache incomplete, failed=' + alreadyCached.failed + '/' + alreadyCached.total);
           }
           return;
         }
@@ -561,13 +703,14 @@ export default function App() {
         } catch {
           previousSourceConfig = null;
         }
-        await reportCloudConfigSync({
+        const pendingReported = await reportCloudConfigSync({
           configVersion: incomingVersion,
           status: 'pending',
           mediaTotal: mediaItems.length,
           mediaCached: 0,
           message: 'Downloading the saved playlist to the device',
         });
+        console.log('=== CLOUD CONFIG: pending report sent, ok=' + pendingReported + ' media=' + mediaItems.length);
         // Download into an isolated generation. Playback and its manifest stay
         // on the previous committed generation until verification succeeds.
         let progressReportQueue: Promise<unknown> = Promise.resolve();
@@ -584,6 +727,7 @@ export default function App() {
             await progressReportQueue;
           }
         }, generation);
+        console.log('=== CLOUD CONFIG: prefetch done, cached=' + downloadResult.cached + ' failed=' + downloadResult.failed + ' total=' + downloadResult.total + ' storageBlock=' + !!downloadResult.storageBlock);
         if (downloadResult.storageBlock) {
           const { freeBytes, requiredBytes, reserveBytes } = downloadResult.storageBlock;
           const formatStorage = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
@@ -603,6 +747,7 @@ export default function App() {
         // A successful HTTP transfer is not enough to call the TV offline-ready.
         // Recheck every placement against its expected size/hash in the manifest.
         const cacheResult = await verifyCachedMediaItems(mediaItems, generation);
+        console.log('=== CLOUD CONFIG: verify done, cached=' + cacheResult.cached + ' failed=' + cacheResult.failed + ' total=' + cacheResult.total);
         if (downloadResult.failed > 0 && cacheResult.failed === 0) {
           console.warn('Cloud download reported failures but all assets passed final cache verification');
         }
@@ -620,7 +765,7 @@ export default function App() {
           return;
         }
         const latestVersion = Number(await AsyncStorage.getItem(CLOUD_PENDING_VERSION_KEY) || incomingVersion);
-        if ((incomingVersion > 0 && latestVersion > incomingVersion) || cloudConfigQueuedVersionRef.current > incomingVersion) return;
+        if ((incomingVersion > 0 && latestVersion > incomingVersion) || cloudConfigQueuedVersionRef.current > incomingVersion) { console.log('=== CLOUD CONFIG: aborted before commit, latestVersion=' + latestVersion + ' queuedRef=' + cloudConfigQueuedVersionRef.current + ' incoming=' + incomingVersion); return; }
 
         // Commit config, applied version, and generation together before asking
         // React/player to switch. On restart this snapshot selects the same cache.
@@ -707,13 +852,12 @@ export default function App() {
 
       eventEmitter.on('emergency:alert', (alert: any) => {
         console.log('Emergency alert received in App:', alert);
-        setEmergencyAlert({
-          active: true,
-          type: alert.type || 'FIRE',
-          title: alert.title || 'EMERGENCY ALERT',
-          message: alert.message || 'PLEASE EVACUATE IMMEDIATELY!',
-          sound: alert.sound || false,
-        });
+        void applyEmergencyAlert(alert);
+      });
+
+      eventEmitter.on('emergency:alert:clear', () => {
+        console.log('Emergency alert cleared remotely in App');
+        clearEmergencyAlertState(false);
       });
     };
 
@@ -747,6 +891,20 @@ export default function App() {
       offlineService.cleanup();
     };
   }, [appMode, deviceActivated]);
+
+  useEffect(() => {
+    if (appMode !== 'cloudMode' || deviceActivated !== true) return;
+    let mounted = true;
+    (async () => {
+      try {
+        const stored = await AsyncStorage.getItem(CLOUD_EMERGENCY_ALERT_KEY);
+        if (!stored || !mounted) return;
+        const alert = JSON.parse(stored);
+        if (alert?.active) await applyEmergencyAlert(alert);
+      } catch {}
+    })();
+    return () => { mounted = false; };
+  }, [appMode, deviceActivated, applyEmergencyAlert]);
 
   useEffect(() => {
     if (appMode !== 'cloudMode' || deviceActivated !== true) return;
@@ -792,14 +950,21 @@ export default function App() {
       return;
     }
 
+    let effectActive = true;
     let checkInProgress = false;
+    let activationRequestController: AbortController | null = null;
+    void isDeviceActivated().then((locallyActivated) => {
+      // A previously activated TV should enter its cached Cloud player at once
+      // when offline; a first-time TV can show its Device ID while polling.
+      if (effectActive) setDeviceActivatedState(locallyActivated);
+    });
     const checkActivation = async () => {
-      if (checkInProgress) return;
+      if (!effectActive || checkInProgress) return;
       checkInProgress = true;
       try {
         const deviceId = (NativeModules as any)?.DeviceIdModule?.getDeviceId?.();
         if (!deviceId) {
-          setDeviceActivatedState(false);
+          if (effectActive) setDeviceActivatedState(false);
           return;
         }
 
@@ -811,7 +976,19 @@ export default function App() {
         const requestToken = !cachedToken || Number(cachedExpiryText || 0) <= Date.now() + 5 * 60 * 1000;
 
         // Check cloud API first (most authoritative)
-        const response = await fetch(`${apiUrl}/api/devices/${deviceId}/activation?issueToken=${requestToken}`);
+        const controller = new AbortController();
+        activationRequestController = controller;
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        let response: Response;
+        try {
+          response = await fetch(`${apiUrl}/api/devices/${deviceId}/activation?issueToken=${requestToken}`, {
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeout);
+          if (activationRequestController === controller) activationRequestController = null;
+        }
+        if (!effectActive) return;
         if (!response.ok) throw new Error(`activation-http-${response.status}`);
         const data = await response.json();
 
@@ -835,22 +1012,24 @@ export default function App() {
             }
           }
           // Device is activated in cloud - save to local storage
+          if (!effectActive) return;
           await setDeviceActivated(true);
-          setDeviceActivatedState(true);
+          if (effectActive) setDeviceActivatedState(true);
           console.log('=== Device activated, setting state to true ===');
         } else {
+          if (!effectActive) return;
           await AsyncStorage.removeItem('@signage_device_token');
           await AsyncStorage.removeItem('@signage_device_token_expiry');
           // Device not activated in cloud (admin may have deleted it) - clear local storage
           await setDeviceActivated(false);
-          setDeviceActivatedState(false);
+          if (effectActive) setDeviceActivatedState(false);
           console.log('=== Device not activated, setting state to false ===');
         }
       } catch (error) {
         console.error('Failed to check device activation from cloud:', error);
         // If cloud check fails, fall back to local storage (offline mode)
         const locallyActivated = await isDeviceActivated();
-        setDeviceActivatedState(locallyActivated);
+        if (effectActive) setDeviceActivatedState(locallyActivated);
       } finally {
         checkInProgress = false;
       }
@@ -864,7 +1043,11 @@ export default function App() {
     // socket event for deactivation and keep a short polling fallback.
     const interval = setInterval(checkActivation, deviceActivated ? 60000 : 5000);
 
-    return () => clearInterval(interval);
+    return () => {
+      effectActive = false;
+      activationRequestController?.abort();
+      clearInterval(interval);
+    };
   }, [appMode, deviceActivated]);
 
   // APK Update Check
@@ -942,23 +1125,45 @@ export default function App() {
   };
 
   const selectAppMode = async (mode: AppMode, isManualChange = true) => {
-    await saveAppMode(mode);
-    await setMediaCacheMode(mode === 'cloudMode' ? 'cloud' : 'lan');
-    if (mode === 'cloudMode') await cloudService.initialize();
+    resettingModeRef.current = false;
+    try {
+      await saveAppMode(mode);
+    } catch (error) {
+      // Native mode storage is written before AsyncStorage, so keep this
+      // session moving if the JS storage layer temporarily fails.
+      console.warn('Could not persist app mode in AsyncStorage:', error);
+    }
     setAppMode(mode);
     setConfig(null);
     if (mode !== 'cloudMode') {
       clearPlaybackOverride('cloud-config');
     }
-    // Reload the configuration belonging to the newly selected mode immediately.
-    // loadConfig selects the cloud snapshot only in cloudMode and the LAN config otherwise.
-    await loadConfig(setConfig);
     setMediaVersion((version) => version + 1);
-    // Track manual mode changes to prevent cloud from overriding
+    // Player initialization follows appMode and performs cache/config setup;
+    // changing modes itself should not wait for network or storage work.
+    // Track manual mode changes to prevent cloud from overriding.
     if (isManualChange) {
-      AsyncStorage.setItem('@manual_mode_change', 'true');
+      void AsyncStorage.setItem('@manual_mode_change', 'true').catch(() => undefined);
     }
   };
+
+  const returnToModeSelection = useCallback(async () => {
+    if (resettingModeRef.current) return;
+    resettingModeRef.current = true;
+    try {
+      await resetAppMode();
+    } catch (error) {
+      console.warn("Could not clear saved mode before returning to setup:", error);
+    } finally {
+      clearPlaybackOverride("cloud-config");
+      setShowModeSelection(false);
+      setConfig(null);
+      setDeviceActivatedState(null);
+      setLicenseInput("");
+      setLicenseStatus("License required. Enter key to activate.");
+      setAppMode(null);
+    }
+  }, []);
 
   const openAdminPanel = (view: "access" | "cms" | "adminCms", options: { openedByBack?: boolean } = {}) => {
     setAdminInitialView(view);
@@ -976,7 +1181,15 @@ export default function App() {
   };
 
   const handleTvBackAction = useCallback(() => {
-    const now = Date.now();
+    if ((appMode === "cloudMode" && deviceActivated === false) ||
+      (appMode === "tvMode" && licenseReady && !licensed)) {
+      returnToModeSelection().catch(() => undefined);
+      return true;
+    }
+
+    // AdminOnlyScreen handles its own first Back (CMS -> URL entry) and then
+    // returns to mode selection. Do not cover it with the player overlay.
+    if (appMode === "adminOnlyMode") return false;
 
     if (showUsbSettings) {
       setShowUsbSettings(false);
@@ -996,7 +1209,7 @@ export default function App() {
     // Show mode selection screen on back button press
     setShowModeSelection(true);
     return true;
-  }, [showAdmin, showUsbSettings, showModeSelection]);
+  }, [appMode, deviceActivated, licenseReady, licensed, returnToModeSelection, showAdmin, showUsbSettings, showModeSelection]);
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", handleTvBackAction);
@@ -1041,17 +1254,20 @@ export default function App() {
       if (appMode === "tvMode" && !showAdmin && !showUsbSettings) {
         console.log("TV Remote Event:", { eventType, keyAction, isOkButton });
       }
-      if (appMode === "tvMode" && isOkButton && !showAdmin && !showUsbSettings) {
+      if (
+        appMode === "tvMode" && licensed && ready && isOkButton &&
+        !showAdmin && !showUsbSettings && !showModeSelection
+      ) {
         setShowUsbSettings(true);
         return;
       }
-      if (eventType !== "back") return;
+      if (eventType !== "back" || appMode === "adminOnlyMode") return;
       handleTvBackAction();
     });
     return () => {
       sub.remove();
     };
-  }, [handleTvBackAction, licensed, showAdmin, showUsbSettings, appMode]);
+  }, [handleTvBackAction, licensed, ready, showAdmin, showUsbSettings, showModeSelection, appMode]);
 
   useEffect(() => {
     offlineNoticeRef.current = offlineNotice;
@@ -1744,17 +1960,11 @@ export default function App() {
           return;
         }
         if (type === "emergency-alert-triggered") {
-          setEmergencyAlert({
-            active: true,
-            type: payload?.type || "FIRE",
-            title: payload?.title || "EMERGENCY ALERT",
-            message: payload?.message || "PLEASE EVACUATE IMMEDIATELY!",
-            sound: payload?.sound || false,
-          });
+          void applyEmergencyAlert(payload || {});
           return;
         }
         if (type === "emergency-alert-cleared") {
-          setEmergencyAlert({ ...emergencyAlert, active: false });
+          clearEmergencyAlertState(false);
           return;
         }
         if (type === "play-now") {
@@ -2016,7 +2226,9 @@ export default function App() {
   useEffect(() => {
     // Cloud mode has its own device activation and local config snapshot; it
     // must initialize offline playback even when this APK has no LAN license.
-    if (!bootReady || !licenseReady || (!licensed && appMode !== 'cloudMode')) return;
+    // Admin Only is a management surface, not a player. It must not start
+    // the LAN CMS, media sync, or license-gated playback lifecycle.
+    if (!bootReady || !licenseReady || appMode === 'adminOnlyMode' || (!licensed && appMode !== 'cloudMode')) return;
     let isMounted = true;
     let watchdogTimer: ReturnType<typeof setInterval> | null = null;
     let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -2575,9 +2787,11 @@ export default function App() {
     const init = async () => {
       if (initInProgress) return;
       initInProgress = true;
+      let initStage = "read-mode";
       try {
         // Check for cloud config first before embedded CMS
         const persistedMode = await getAppMode();
+        initStage = "initialize-media-cache";
         await setMediaCacheMode(persistedMode === 'cloudMode' ? 'cloud' : 'lan');
         if (persistedMode === 'cloudMode') {
           console.log('=== INIT: Cloud config is active, loading from AsyncStorage ===');
@@ -2617,30 +2831,9 @@ export default function App() {
               setSectionPlaybackTimeline(normalizePlaybackTimeline(cloudConfig?.playbackTimeline));
               lastConfigSyncAtRef.current = new Date().toISOString();
 
-              // Set playback override from cloud config sections
-              if (activeCloudConfig.sections && Array.isArray(activeCloudConfig.sections)) {
-                console.log('=== INIT: Setting playback override from cloud config ===');
-                const mediaItems: any[] = [];
-                activeCloudConfig.sections.forEach((section: any, sectionIndex: number) => {
-                  if (section.contentType === 'multimedia' && section.mediaUrls) {
-                    section.mediaUrls.forEach((url: string, index: number) => {
-                      const metadata = Array.isArray(section.mediaItems)
-                        ? section.mediaItems.find((item: any) => String(item?.url || '').split('?')[0] === String(url).split('?')[0])
-                        : null;
-                      mediaItems.push({
-                        ...metadata,
-                        url,
-                        streamUrl: undefined,
-                        remoteUrl: url,
-                        name: metadata?.name || url.split('/').pop() || `media_${index}`,
-                        originalName: metadata?.originalName || url.split('/').pop() || `media_${index}`,
-                        type: metadata?.type || (url.match(/\.(mp4|m4v|mov|mkv|webm|avi|3gp|mpg|mpeg)(\?|$)/i) ? 'video/mp4' : 'image/jpeg'),
-                        size: Number(metadata?.size || 0),
-                        section: sectionIndex + 1,
-                      });
-                    });
-                  }
-                });
+              // Set playback override from cloud config sections (incl. schedule profiles)
+              const mediaItems = collectCloudConfigMediaItems(activeCloudConfig);
+              if (mediaItems.length) {
                 console.log('=== INIT: Setting playback override with media items:', mediaItems.length);
                 setPlaybackOverride('cloud-config', mediaItems);
                 // Resume any interrupted downloads and fill missing Cloud
@@ -2662,7 +2855,9 @@ export default function App() {
         }
 
         if (USE_EMBEDDED_CMS) {
+          initStage = "start-embedded-cms";
           startEmbeddedCmsServer();
+          initStage = "restore-local-server";
           await restoreServerFromStorage();
           const localServer = getServer();
           deviceIdRef.current = String(
@@ -2674,17 +2869,20 @@ export default function App() {
               : "Starting local TV CMS",
             "Local CMS"
           );
+          initStage = "load-local-config";
           const loadedConfig = await loadConfig(setConfig);
           setSectionPlaybackTimeline(normalizePlaybackTimeline(loadedConfig?.playbackTimeline));
           if (loadedConfig) {
             lastConfigSyncAtRef.current = new Date().toISOString();
           }
+          initStage = "sync-local-media";
           await syncMedia({
             force: true,
             forceHard: true,
             blockUntilCachedSmallBytes: SMALL_CACHE_BLOCK_BYTES,
           });
           lastMediaSyncAtRef.current = new Date().toISOString();
+          initStage = "report-local-health";
           await emitDeviceHealthSnapshot("ready", { ready: true }, { forceStorageScan: true });
           if (healthTimer) clearInterval(healthTimer);
           healthTimer = setInterval(async () => {
@@ -3039,7 +3237,7 @@ export default function App() {
           startDisconnectRecovery(`connect_error:${err?.message || "unknown"}`);
         });
       } catch (err) {
-        console.log("Init error", err);
+        console.error(`Init error during ${initStage}`, err);
         if (socket?.connected) {
           socket.emit("device-error", {
             deviceId: deviceIdRef.current,
@@ -3048,7 +3246,15 @@ export default function App() {
           });
         }
         setConnectTexts("Startup failed unexpectedly", "Recovery mode");
-        if (isMounted) setReady(false);
+        if (isMounted && USE_EMBEDDED_CMS && appMode !== "cloudMode") {
+          // Local playback should stay available while CMS/cache startup is
+          // retried. A transient storage or service error must not trap the TV
+          // on the connection spinner after license activation.
+          setReady(true);
+          scheduleInitRetry();
+        } else if (isMounted) {
+          setReady(false);
+        }
       } finally {
         initInProgress = false;
       }
@@ -3177,7 +3383,7 @@ export default function App() {
   if (appMode === "cloudMode") {
     // Show activation screen if device is not activated
     if (deviceActivated === false) {
-      return <DeviceActivationScreen />;
+      return <DeviceActivationScreen onBack={returnToModeSelection} />;
     }
 
     // Show loading while checking activation
@@ -3222,6 +3428,7 @@ export default function App() {
           sourceManagerRef={sourceManagerRef}
           reportRuntimeError={reportRuntimeError}
           onPlaybackError={reportCloudPlaybackError}
+          onClearEmergencyAlert={() => clearEmergencyAlertState(true)}
         />
         {showModeSelection && appMode && (
           <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999 }}>
@@ -3253,8 +3460,9 @@ export default function App() {
     );
   }
 
-  // Skip license page if already licensed OR in cloud mode (cloud mode doesn't need license)
-  if (!licensed && String(appMode) !== "cloudMode") {
+  // Only LAN playback requires a LAN license. Cloud has its own device
+  // activation, while Admin Only is a CMS-management surface.
+  if (appMode === "tvMode" && !licensed) {
     return (
       <View style={styles.connectRoot}>
         <View style={styles.bgGlowTop} />
@@ -3309,6 +3517,15 @@ export default function App() {
           </Pressable>
 
           <Text style={styles.licenseStatus}>{licenseStatus}</Text>
+          <Pressable
+            onPress={() => returnToModeSelection().catch(() => undefined)}
+            onFocus={() => setModeBackFocused(true)}
+            onBlur={() => setModeBackFocused(false)}
+            style={[styles.modeBackButton, modeBackFocused ? styles.modeBackButtonFocused : null]}
+            focusable
+          >
+            <Text style={styles.modeBackButtonText}>Back to Mode Selection</Text>
+          </Pressable>
           <Text style={styles.licenseSupport}>
             Support: +919227896944{"\n"}nextviewsignage@gmail.com
           </Text>
@@ -3318,7 +3535,7 @@ export default function App() {
   }
 
   if (appMode === "adminOnlyMode") {
-    return <AdminOnlyScreen />;
+    return <AdminOnlyScreen onBack={returnToModeSelection} />;
   }
 
   // Keep the CMS/admin controls available through their existing non-visual flows,
@@ -3399,7 +3616,9 @@ export default function App() {
     : scheduledConfig.config;
   effectiveConfig.__scheduleRuntime = {
     enabled: scheduledConfig.enabled,
-    active: !!scheduledConfig.activeEntry,
+    // fallbackMode 'config' (cloud schedules) keeps the base configuration
+    // playing when no schedule entry matches, instead of the off-air fallback.
+    active: !!scheduledConfig.activeEntry || safeConfig?.schedule?.fallbackMode === 'config',
     activeEntryId: String(scheduledConfig.activeEntry?.id || ""),
   };
   effectiveConfig.__playerPaused = playerPaused;
@@ -3580,7 +3799,7 @@ export default function App() {
             onPlaybackChange={handlePlaybackChange}
             onPlaybackError={handlePlaybackError}
             emergencyAlert={emergencyAlert}
-            onClearEmergencyAlert={() => setEmergencyAlert({ ...emergencyAlert, active: false })}
+            onClearEmergencyAlert={() => clearEmergencyAlertState(true)}
           />
         </PlayerErrorBoundary>
         {!showAdmin && !showUsbSettings ? (
@@ -3885,6 +4104,27 @@ const styles = StyleSheet.create({
     color: "#526674",
     fontSize: 13,
     lineHeight: 18,
+  },
+  modeBackButton: {
+    marginTop: 16,
+    alignSelf: "center",
+    minWidth: 220,
+    alignItems: "center",
+    borderWidth: 2,
+    borderColor: "#b8c9d6",
+    borderRadius: 10,
+    backgroundColor: "#f7fafc",
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+  },
+  modeBackButtonFocused: {
+    borderColor: "#1d8fff",
+    backgroundColor: "#e8f5ff",
+  },
+  modeBackButtonText: {
+    color: "#365b73",
+    fontSize: 14,
+    fontWeight: "700",
   },
   licenseSupport: {
     marginTop: 18,

@@ -5,11 +5,15 @@ import Media from '../models/Media';
 import AuditLog from '../models/AuditLog';
 import User from '../models/User';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { getSocketInstance } from '../socket/socket';
+import { applyScheduleToConfig, syncScheduleForDevices } from '../services/schedule.service';
+import ScheduleTemplate from '../models/Schedule';
+import { getSocketInstance, pushEmergencyClearToDevice, pushEmergencyToDevice, pushEmergencyToUser } from '../socket/socket';
+import { buildEmergencyAlert } from './device.controller';
 import mongoose from 'mongoose';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
 import env from '../config/env';
 import { getMediaPathFromUrl } from '../utils/mediaUrl';
+import { countConfiguredMedia, getConfiguredMediaBytes } from '../utils/configMedia';
 
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -24,9 +28,10 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
 
     let userDeviceIds: string[] | null = null;
     if (req.userRole !== 'admin') {
-      const assignedDevices = await Device.find({ assignedUserId: req.userId }).select('deviceId').lean();
+      const ownerId = req.effectiveUserId || req.userId;
+      const assignedDevices = await Device.find({ assignedUserId: ownerId }).select('deviceId').lean();
       userDeviceIds = assignedDevices.map((device: any) => String(device.deviceId));
-      const ownershipClauses: any[] = [{ ownerId: req.userId }];
+      const ownershipClauses: any[] = [{ ownerId }];
       if (userDeviceIds.length) {
         ownershipClauses.push({
           ownerId: { $exists: false },
@@ -38,6 +43,9 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
         { $or: ownershipClauses },
       ];
       delete filter.name;
+    }
+    if (req.isSubUser) {
+      filter.$and = [...(filter.$and || []), { _id: { $in: req.resourceAccess?.groups || [] } }];
     }
 
     // Parse pagination parameters
@@ -94,16 +102,16 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
   try {
     const { name, devices } = req.body;
 
+    if (req.isSubUser) {
+      res.status(403).json({ error: 'Only the account owner can create groups' });
+      return;
+    }
+
     console.log('Create group request:', { name, devices, userId: req.userId, userRole: req.userRole });
 
     // Validation
     if (!name || name.trim().length === 0) {
       res.status(400).json({ error: 'Group name is required' });
-      return;
-    }
-
-    if (name.length < 2) {
-      res.status(400).json({ error: 'Group name must be at least 2 characters' });
       return;
     }
 
@@ -118,8 +126,9 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
+    const ownerId = req.effectiveUserId || req.userId;
     if (req.userRole !== 'admin') {
-      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: req.userId }).select('deviceId').lean();
+      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: ownerId }).select('deviceId').lean();
       if (allowed.length !== (devices || []).length) {
         res.status(403).json({ error: 'Groups can only contain devices assigned to your account' });
         return;
@@ -129,7 +138,7 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
     const group = new Group({
       name: name.trim(),
       devices: devices || [],
-      ownerId: req.userRole === 'admin' ? undefined : req.userId,
+      ownerId: req.userRole === 'admin' ? undefined : ownerId,
     });
 
     await group.save();
@@ -156,23 +165,28 @@ export const updateGroup = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
+    const ownerId = req.effectiveUserId || req.userId;
     if (req.userRole !== 'admin') {
       const ownsLegacyGroup = !group.ownerId && group.devices.length > 0 &&
-        (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: req.userId })) === group.devices.length;
-      if (group.ownerId?.toString() !== req.userId && !ownsLegacyGroup) {
+        (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
+      if (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id)))) {
         res.status(403).json({ error: 'Access denied: group does not belong to your account' });
         return;
       }
-      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: req.userId }).select('deviceId').lean();
+      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: ownerId }).select('deviceId').lean();
       if (allowed.length !== (devices || []).length) {
         res.status(403).json({ error: 'Groups can only contain devices assigned to your account' });
         return;
       }
-      group.ownerId = new mongoose.Types.ObjectId(req.userId);
+      group.ownerId = new mongoose.Types.ObjectId(ownerId);
     }
     if (name !== undefined) group.name = String(name).trim();
+    const previousDevices = devices !== undefined ? [...(group.devices || [])] : null;
     if (devices !== undefined) group.devices = devices;
     await group.save();
+    if (previousDevices) {
+      await syncScheduleForDevices([...previousDevices, ...(Array.isArray(devices) ? devices : [])]);
+    }
 
     // Invalidate group cache on update
     await cacheDelPattern('groups:*');
@@ -192,13 +206,19 @@ export const deleteGroup = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Group not found' });
       return;
     }
+    const ownerId = req.effectiveUserId || req.userId;
     const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: req.userId })) === group.devices.length;
-    if (req.userRole !== 'admin' && group.ownerId?.toString() !== req.userId && !ownsLegacyGroup) {
+      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
+    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
       res.status(403).json({ error: 'Access denied: group does not belong to your account' });
       return;
     }
+    const affectedDeviceIds = [...(group.devices || [])];
+    // Remove schedule templates targeting this group before deleting it
+    await ScheduleTemplate.deleteMany({ targetType: 'group', targetId: String(group._id) });
     await group.deleteOne();
+    // Rebuild affected device schedules now that group templates are gone.
+    await syncScheduleForDevices(affectedDeviceIds);
 
     // Invalidate group cache on delete
     await cacheDelPattern('groups:*');
@@ -226,16 +246,17 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const ownerId = req.effectiveUserId || req.userId;
     const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: req.userId })) === group.devices.length;
-    if (req.userRole !== 'admin' && group.ownerId?.toString() !== req.userId && !ownsLegacyGroup) {
+      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
+    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
       res.status(403).json({ error: 'Access denied: group does not belong to your account' });
       return;
     }
 
     // Get all devices in this group
     const deviceFilter: any = { deviceId: { $in: group.devices } };
-    if (req.userRole !== 'admin') deviceFilter.assignedUserId = req.userId;
+    if (req.userRole !== 'admin') deviceFilter.assignedUserId = ownerId;
     const devices = await Device.find(deviceFilter);
     if (devices.length !== group.devices.length) {
       res.status(403).json({ error: 'One or more group devices are not assigned to your account' });
@@ -264,7 +285,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       res.status(400).json({ error: 'Configuration contains a media file that no longer exists' });
       return;
     }
-    if (req.userRole !== 'admin' && mediaDocs.some((media: any) => media.uploadedBy?.toString() !== req.userId)) {
+    if (req.userRole !== 'admin' && mediaDocs.some((media: any) => media.uploadedBy?.toString() !== ownerId)) {
       res.status(403).json({ error: 'Configuration can only use media uploaded to your account' });
       return;
     }
@@ -320,6 +341,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     const updatePromises = devices.map(async (device) => {
       // Store previous config for audit
       const previousConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
+      if (previousConfig) delete previousConfig.schedule;
 
       if (previousConfig && JSON.stringify(previousConfig) !== JSON.stringify(config)) {
         device.configHistory = [
@@ -336,6 +358,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
 
       // Update device config
       device.config = config;
+      await applyScheduleToConfig(device);
 
       // Track who configured the device
       device.lastConfiguredBy = req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined;
@@ -375,9 +398,9 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       device.set('health.cloudSync', {
         configVersion,
         status: 'pending',
-        mediaTotal: mediaPaths.length,
+        mediaTotal: countConfiguredMedia(device.config),
         mediaCached: 0,
-        requiredStorageBytes: mediaDocs.reduce((total: number, media: any) => total + Math.max(0, Number(media.size || 0)), 0),
+        requiredStorageBytes: getConfiguredMediaBytes(device.config),
         onlineOnlySections: (Array.isArray(config.sections) ? config.sections : []).filter((section: any) =>
           (section?.contentType === 'web' && String(section?.webUrl || '').trim()) ||
           (section?.contentType === 'youtube' && String(section?.youtubeUrl || '').trim())
@@ -500,6 +523,100 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
   }
 };
 
+const canAccessGroup = async (group: any, req: AuthRequest): Promise<boolean> => {
+  if (req.userRole === 'admin') return true;
+  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))) return false;
+  const ownerId = req.effectiveUserId || req.userId;
+  const ownsLegacyGroup = !group.ownerId && group.devices.length > 0 &&
+    (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
+  return group.ownerId?.toString() === ownerId || ownsLegacyGroup;
+};
+
+const findGroupDevices = async (group: any, req: AuthRequest) => {
+  const deviceFilter: any = { deviceId: { $in: group.devices } };
+  if (req.userRole !== 'admin') deviceFilter.assignedUserId = req.effectiveUserId || req.userId;
+  return Device.find(deviceFilter);
+};
+
+export const triggerGroupEmergency = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const group = await Group.findById(req.params.id);
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!(await canAccessGroup(group, req))) {
+      res.status(403).json({ error: 'Access denied: group does not belong to your account' });
+      return;
+    }
+    if (!group.devices.length) {
+      res.status(400).json({ error: 'No devices in this group' });
+      return;
+    }
+
+    const { alert, error } = await buildEmergencyAlert(req.body, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId), req.userId);
+    if (!alert) {
+      res.status(400).json({ error: error || 'Invalid emergency alert payload' });
+      return;
+    }
+
+    const devices = await findGroupDevices(group, req);
+    if (devices.length !== group.devices.length) {
+      res.status(403).json({ error: 'One or more group devices are not assigned to your account' });
+      return;
+    }
+
+    const results = await Promise.allSettled(devices.map(async (device) => {
+      device.emergencyAlert = { ...alert, triggeredAt: new Date() };
+      await device.save();
+      pushEmergencyToDevice(device.deviceId, { ...device.emergencyAlert, deviceId: device.deviceId });
+      pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId: device.deviceId, action: 'triggered', alert: device.emergencyAlert });
+      return device.deviceId;
+    }));
+
+    const triggered = results.filter((r) => r.status === 'fulfilled').length;
+    const failed = results.filter((r) => r.status === 'rejected').length;
+
+    res.json({
+      success: triggered > 0,
+      triggered,
+      failed,
+      message: `Emergency alert sent to ${triggered} device${triggered === 1 ? '' : 's'}${failed ? `, failed on ${failed}` : ''}`,
+    });
+  } catch (error) {
+    console.error('Trigger group emergency error:', error);
+    res.status(500).json({ error: 'Failed to trigger group emergency alert' });
+  }
+};
+
+export const clearGroupEmergency = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const group = await Group.findById(req.params.id);
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!(await canAccessGroup(group, req))) {
+      res.status(403).json({ error: 'Access denied: group does not belong to your account' });
+      return;
+    }
+
+    const devices = await findGroupDevices(group, req);
+    await Promise.allSettled(devices.map(async (device) => {
+      if (!device.emergencyAlert) return;
+      device.emergencyAlert = null;
+      await device.save();
+      pushEmergencyClearToDevice(device.deviceId);
+      pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId: device.deviceId, action: 'cleared' });
+    }));
+
+    res.json({ success: true, cleared: devices.length });
+  } catch (error) {
+    console.error('Clear group emergency error:', error);
+    res.status(500).json({ error: 'Failed to clear group emergency alert' });
+  }
+};
+
 export const getGroupConfigHistory = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const group = await Group.findById(req.params.id);
@@ -507,9 +624,10 @@ export const getGroupConfigHistory = async (req: AuthRequest, res: Response): Pr
       res.status(404).json({ error: 'Group not found' });
       return;
     }
+    const ownerId = req.effectiveUserId || req.userId;
     const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: req.userId })) === group.devices.length;
-    if (req.userRole !== 'admin' && group.ownerId?.toString() !== req.userId && !ownsLegacyGroup) {
+      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
+    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }

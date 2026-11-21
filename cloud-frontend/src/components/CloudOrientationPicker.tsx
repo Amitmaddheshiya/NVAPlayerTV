@@ -115,7 +115,7 @@ export const CloudOrientationPicker = ({ value, onChange, config, mediaList = []
       <p className="mt-1 text-[9px] text-gray-500">Live preview · changes update as you edit settings below.</p>
       <style>{'@keyframes cloud-preview-scroll { from { transform: translateX(100%); } to { transform: translateX(-100%); } }'}</style>
       <div
-        className="relative mt-2 flex w-full items-center justify-center overflow-hidden rounded-lg bg-slate-100"
+        className={`relative mx-auto mt-2 flex items-center justify-center overflow-hidden rounded-lg bg-slate-100 ${quarterTurn ? 'h-52 sm:h-56' : 'h-36 sm:h-40'}`}
         style={{ aspectRatio: quarterTurn ? '9 / 16' : '16 / 9' }}
         aria-live="polite"
       >

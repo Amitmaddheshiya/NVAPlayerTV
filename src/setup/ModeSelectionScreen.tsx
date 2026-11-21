@@ -4,12 +4,11 @@ import {
   Text,
   StyleSheet,
   Pressable,
-  ScrollView,
   Image,
   Dimensions,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { getAppMode, saveAppMode, type AppMode } from "../services/setupService";
+import { type AppMode } from "../services/setupService";
 import { getCmsAccessInfo } from "../services/embeddedCmsService";
 import { DEFAULT_TEST_CLOUD_API_URL } from "../services/cloudRuntimeConfig";
 
@@ -27,14 +26,16 @@ export default function ModeSelectionScreen({
   onSwitchMode: (mode: AppMode) => void;
   onClose: () => void;
 }) {
-  const [cmsInfo, setCmsInfo] = useState(getCmsAccessInfo());
+  const [cmsInfo] = useState(() => getCmsAccessInfo());
   const [cloudApiUrl, setCloudApiUrl] = useState<string | null>(null);
   const [cloudConnectionStatus, setCloudConnectionStatus] = useState<'checking' | 'connected' | 'offline'>('checking');
   const [focused, setFocused] = useState<"lan" | "cloud" | "admin" | "close" | null>(null);
 
   useEffect(() => {
     // Load cloud API URL when component mounts
-    AsyncStorage.getItem('@signage_cloud_api_url').then((url) => setCloudApiUrl(url || DEFAULT_TEST_CLOUD_API_URL));
+    AsyncStorage.getItem('@signage_cloud_api_url')
+      .then((url) => setCloudApiUrl(url || DEFAULT_TEST_CLOUD_API_URL))
+      .catch(() => setCloudApiUrl(DEFAULT_TEST_CLOUD_API_URL));
   }, []);
 
   useEffect(() => {
@@ -49,8 +50,10 @@ export default function ModeSelectionScreen({
         if (active) setCloudConnectionStatus('offline');
       }
     };
-    void checkConnection();
-    const timer = setInterval(() => void checkConnection(), 15000);
+    checkConnection().catch(() => undefined);
+    const timer = setInterval(() => {
+      checkConnection().catch(() => undefined);
+    }, 15000);
     return () => {
       active = false;
       clearInterval(timer);

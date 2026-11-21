@@ -84,7 +84,8 @@ export const AdminDevices = () => {
   const loadUsers = async () => {
     try {
       const response = await userAPI.getUsers({ page: 1, limit: 1000 });
-      setUsers(response.data.data || response.data);
+      const usersData = response.data.data || response.data;
+      setUsers(usersData.filter((user: any) => user.role !== 'sub-user' && !user.parentId));
     } catch (error) {
       console.error('Failed to load users:', error);
     }

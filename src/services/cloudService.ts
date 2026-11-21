@@ -180,16 +180,29 @@ class CloudService {
         if (data.config) {
           if (await getAppMode() !== 'cloudMode') return;
           console.log('=== CLOUD SERVICE: Received config from heartbeat ===');
+          // Do NOT store the config version here. The version is only acked
+          // after the apply pipeline verifies the media cache and commits
+          // (App.tsx config:update handler). Acking early would make the
+          // backend stop resending the config if the apply fails or the app
+          // restarts mid-download, leaving the TV stuck on an old config.
           await AsyncStorage.multiSet([
             ['@cloud_device_config', JSON.stringify(data.config)],
-            ['@cloud_config_version', String(Number(data.configVersion || 0))],
             ['@cloud_config_active', 'true'],
           ]);
           // Emit config update event
           const eventEmitter = require('../utils/EventEmitter').default;
           eventEmitter.emit('config:update', { config: data.config, configVersion: Number(data.configVersion || 0) });
-        } else if (Number.isFinite(Number(data.configVersion))) {
-          await AsyncStorage.setItem(CLOUD_CONFIG_VERSION_KEY, String(Number(data.configVersion)));
+        }
+
+        // Emergency alert state is synced through heartbeat so a TV that missed
+        // the socket push (offline, reconnecting, rebooted) still converges.
+        if (Object.prototype.hasOwnProperty.call(data, 'emergencyAlert')) {
+          const eventEmitter = require('../utils/EventEmitter').default;
+          if (data.emergencyAlert && data.emergencyAlert.active) {
+            eventEmitter.emit('emergency:alert', data.emergencyAlert);
+          } else {
+            eventEmitter.emit('emergency:alert:clear');
+          }
         }
       } else if (response.status === 404) {
         // Device not registered - emit event to show activation screen

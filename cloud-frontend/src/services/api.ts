@@ -70,6 +70,9 @@ export const deviceAPI = {
   createDevice: (data: any) => api.post('/devices', data),
   updateDevice: (id: string, data: any) => api.put(`/devices/${id}`, data),
   checkActivation: (id: string) => api.get(`/devices/${id}/activation`),
+  triggerEmergency: (id: string, payload: { kind?: 'message' | 'media'; type?: string; title?: string; message?: string; mediaUrl?: string; mediaType?: string; sound?: boolean }) =>
+    api.post(`/devices/${id}/emergency`, payload),
+  clearEmergency: (id: string) => api.post(`/devices/${id}/emergency/clear`),
 };
 
 // Media
@@ -216,9 +219,10 @@ export const mediaAPI = {
     api.put(`/media/${id}`, data),
 };
 
-// Schedules
+// Schedule templates (device/group scheduling)
 export const scheduleAPI = {
-  getSchedules: () => api.get('/schedules'),
+  getSchedules: (params: { targetType: 'device' | 'group'; targetId: string }) =>
+    api.get('/schedules', { params }),
   createSchedule: (data: any) => api.post('/schedules', data),
   updateSchedule: (id: string, data: any) => api.put(`/schedules/${id}`, data),
   deleteSchedule: (id: string) => api.delete(`/schedules/${id}`),
@@ -234,6 +238,9 @@ export const groupAPI = {
   deleteGroup: (id: string) => api.delete(`/groups/${id}`),
   configureGroup: (id: string, config: any) => api.post(`/groups/${id}/configure`, { config }),
   getConfigHistory: (id: string) => api.get(`/groups/${id}/config-history`),
+  triggerEmergency: (id: string, payload: { kind?: 'message' | 'media'; type?: string; title?: string; message?: string; mediaUrl?: string; mediaType?: string; sound?: boolean }) =>
+    api.post(`/groups/${id}/emergency`, payload),
+  clearEmergency: (id: string) => api.post(`/groups/${id}/emergency/clear`),
 };
 
 // Users
@@ -250,6 +257,12 @@ export const userAPI = {
   deleteUser: (id: string) => api.delete(`/users/${id}`),
   assignDevices: (id: string, deviceIds: string[]) =>
     api.post(`/users/${id}/devices`, { deviceIds }),
+  getSubUsers: () => api.get('/users/me/sub-users'),
+  createSubUser: (data: { email: string; password: string; permissions?: Record<string, boolean>; resourceAccess?: { devices: string[]; groups: string[] } }) =>
+    api.post('/users/me/sub-users', data),
+  updateSubUser: (id: string, data: { email?: string; password?: string; permissions?: Record<string, boolean>; resourceAccess?: { devices: string[]; groups: string[] } }) =>
+    api.put(`/users/me/sub-users/${id}`, data),
+  deleteSubUser: (id: string) => api.delete(`/users/me/sub-users/${id}`),
 };
 
 // Global Config

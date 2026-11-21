@@ -1,83 +1,53 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-export interface ISchedule extends Document {
+/** fullDay remains in the stored type only for previously saved templates. */
+export type ScheduleMode = 'fullDay' | 'dayWise' | 'dateWise' | 'timeWise';
+export type ScheduleTargetType = 'device' | 'group';
+
+export interface IScheduleTemplate extends Document {
   name: string;
-  profile: {
-    layout: string;
-    sections: Array<{
-      section: number;
-      mediaIds: string[];
-      direction: string;
-      duration: number;
-    }>;
-    ticker: {
-      text: string;
-      position: string;
-      color: string;
-      speed: number;
-    };
-  };
-  slots: Array<{
-    profileId: string;
-    startTime: string;
-    endTime: string;
+  targetType: ScheduleTargetType;
+  /** deviceId string for 'device', Group _id string for 'group' */
+  targetId: string;
+  ownerId?: mongoose.Types.ObjectId;
+  /** Full processed device config snapshot (same shape as Device.config, without schedule) */
+  config: Record<string, unknown>;
+  schedule: {
+    mode: ScheduleMode;
+    /** 0=Sunday..6=Saturday. Empty = every day (fullDay/dayWise). */
     days: number[];
-    priority: number;
-  }>;
-  fallback: {
-    mode: 'black' | 'message' | 'image';
-    message?: string;
-    textColor?: string;
-    bgColor?: string;
-    imageUrl?: string;
+    /** 'YYYY-MM-DD' entries for dateWise mode */
+    dates: string[];
+    /** 'HH:mm' 24h. Optional for fullDay/dayWise/dateWise; required for timeWise. */
+    startTime?: string;
+    endTime?: string;
   };
-  assignedDevices: string[];
+  enabled: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
 
-const ScheduleSchema = new Schema<ISchedule>(
+const ScheduleTemplateSchema = new Schema<IScheduleTemplate>(
   {
-    name: { type: String, required: true },
-    profile: {
-      layout: { type: String, default: 'fullscreen' },
-      sections: [
-        {
-          section: { type: Number },
-          mediaIds: [{ type: String }],
-          direction: { type: String },
-          duration: { type: Number },
-        },
-      ],
-      ticker: {
-        text: { type: String },
-        position: { type: String },
-        color: { type: String },
-        speed: { type: Number },
-      },
+    name: { type: String, required: true, trim: true },
+    targetType: { type: String, enum: ['device', 'group'], required: true },
+    targetId: { type: String, required: true, trim: true },
+    ownerId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+    config: { type: Schema.Types.Mixed, required: true },
+    schedule: {
+    // Keep fullDay for legacy records; API validation prevents new ones.
+    mode: { type: String, enum: ['fullDay', 'dayWise', 'dateWise', 'timeWise'], required: true },
+      days: [{ type: Number, min: 0, max: 6 }],
+      dates: [{ type: String }],
+      startTime: { type: String },
+      endTime: { type: String },
     },
-    slots: [
-      {
-        profileId: { type: String },
-        startTime: { type: String },
-        endTime: { type: String },
-        days: [{ type: Number }],
-        priority: { type: Number },
-      },
-    ],
-    fallback: {
-      mode: { type: String, enum: ['black', 'message', 'image'], default: 'black' },
-      message: { type: String },
-      textColor: { type: String },
-      bgColor: { type: String },
-      imageUrl: { type: String },
-    },
-    assignedDevices: [{ type: String }],
+    enabled: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
 
-ScheduleSchema.index({ name: 1 });
-ScheduleSchema.index({ assignedDevices: 1 });
+ScheduleTemplateSchema.index({ targetType: 1, targetId: 1 });
+ScheduleTemplateSchema.index({ ownerId: 1 });
 
-export default mongoose.model<ISchedule>('Schedule', ScheduleSchema);
+export default mongoose.model<IScheduleTemplate>('ScheduleTemplate', ScheduleTemplateSchema);

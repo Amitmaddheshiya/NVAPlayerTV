@@ -61,6 +61,11 @@ class SocketService {
       this.emitCommand('clear-cache');
     });
 
+    this.socket.on('emergency:alert:clear', () => {
+      console.log('Emergency alert clear received');
+      eventEmitter.emit('emergency:alert:clear');
+    });
+
     this.socket.on('emergency:alert', (alert: any) => {
       console.log('Emergency alert received:', alert);
       this.emitEmergencyAlert(alert);
@@ -98,6 +103,14 @@ class SocketService {
 
   emitEmergencyAlert(alert: any): void {
     eventEmitter.emit('emergency:alert', alert);
+  }
+
+  emitEmergencyDismissed(): void {
+    try {
+      this.socket?.emit('emergency:dismissed');
+    } catch (error) {
+      console.warn('Failed to emit emergency dismissed:', error);
+    }
   }
 
   isConnected(): boolean {

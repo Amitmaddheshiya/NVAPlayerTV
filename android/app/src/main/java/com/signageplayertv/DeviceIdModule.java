@@ -363,6 +363,24 @@ public class DeviceIdModule extends ReactContextBaseJavaModule implements Activi
                 .commit();
     }
 
+    @ReactMethod
+    public void clearAppMode(Promise promise) {
+        try {
+            boolean cleared = reactContext.getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .remove(KEY_APP_MODE)
+                    .commit();
+            if (cleared) {
+                promise.resolve(true);
+            } else {
+                promise.reject("E_APP_MODE_CLEAR", "Could not clear the saved app mode.");
+            }
+        } catch (Exception ignored) {
+            promise.reject("E_APP_MODE_CLEAR", "Could not clear the saved app mode.");
+        }
+    }
+
     @ReactMethod(isBlockingSynchronousMethod = true)
     public String getAppMode() {
         return reactContext.getApplicationContext()

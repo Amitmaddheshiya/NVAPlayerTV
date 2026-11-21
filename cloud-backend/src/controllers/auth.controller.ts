@@ -82,7 +82,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       user: {
         id: user._id,
         email: user.email,
-        role: user.role,
+        role: user.parentId ? 'sub-user' : user.role,
+        parentId: user.parentId || null,
+        isSubUser: user.role === 'sub-user' || !!user.parentId,
+        permissions: user.permissions || null,
+        subUserLimit: user.subUserLimit || 0,
       },
     });
   } catch (error) {
