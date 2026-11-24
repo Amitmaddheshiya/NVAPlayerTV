@@ -1,0 +1,25 @@
+﻿node.exe : (node:16100) [MONGOOSE] Warning: Duplicate schema index on {"ownerId":1} found. This is often due to declaring an index using both "index: true" and "schema.index()". Please remove the duplicate index definition.
+At line:1 char:1
++ & "C:\nvm4w\nodejs/node.exe" "C:\nvm4w\nodejs/node_modules/npm/bin/np ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ((node:16100) [M...dex definition.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS tests/schedules.test.ts (26.79 s)
+(node:16100) [MONGOOSE] Warning: Duplicate schema index on {"ownerId":1} found. This is often due to declaring an index using both "index: true" and "schema.index()". Please remove the duplicate index definition.
+PASS tests/groups.test.ts (7.091 s)
+(node:16100) [MONGOOSE] Warning: Duplicate schema index on {"ownerId":1} found. This is often due to declaring an index using both "index: true" and "schema.index()". Please remove the duplicate index definition.
+PASS tests/devices.test.ts
+(node:16100) [MONGOOSE] Warning: Duplicate schema index on {"ownerId":1} found. This is often due to declaring an index using both "index: true" and "schema.index()". Please remove the duplicate index definition.
+PASS tests/media-delete.test.ts (5.317 s)
+(node:16100) [MONGOOSE] Warning: Duplicate schema index on {"ownerId":1} found. This is often due to declaring an index using both "index: true" and "schema.index()". Please remove the duplicate index definition.
+PASS tests/auth.test.ts
+
+Test Suites: 5 passed, 5 total
+Tests:       27 passed, 27 total
+Snapshots:   0 total
+Time:        47.853 s
+Jest did not exit one second after the test run has completed.
+
+'This usually means that there are asynchronous operations that weren't stopped in your tests. Consider running Jest with `--detectOpenHandles` to troubleshoot this issue.

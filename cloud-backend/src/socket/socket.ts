@@ -95,8 +95,26 @@ export const initializeSocket = (httpServer: HTTPServer): void => {
   console.log('Authenticated Socket.io initialized');
 };
 
+// Per-device throttle for heartbeat fan-out. Every heartbeat used to emit to
+// admin + user rooms (~667/sec at 40k devices). Status/appVersion/storage
+// changes still emit immediately; routine heartbeats emit at most once/minute
+// per device, which matches the CMS freshness needs.
+const HEARTBEAT_EMIT_INTERVAL_MS = 60_000;
+const heartbeatEmitState = new Map<string, { status?: string; appVersion?: string; storageUsed?: number; at: number }>();
+
 export const pushDeviceHeartbeat = (device: any): void => {
   if (!io) return;
+  const deviceId = String(device?.deviceId || '');
+  if (!deviceId) return;
+  const now = Date.now();
+  const prev = heartbeatEmitState.get(deviceId);
+  const storageUsed = Number(device?.storage?.used ?? -1);
+  const statusChanged = !!prev && prev.status !== device.status;
+  const metaChanged = !!prev && (prev.appVersion !== device.appVersion || prev.storageUsed !== storageUsed);
+  const intervalElapsed = !prev || now - prev.at >= HEARTBEAT_EMIT_INTERVAL_MS;
+  if (prev && !statusChanged && !metaChanged && !intervalElapsed) return;
+  heartbeatEmitState.set(deviceId, { status: device.status, appVersion: device.appVersion, storageUsed, at: now });
+
   const payload = {
     deviceId: device.deviceId,
     name: device.name,

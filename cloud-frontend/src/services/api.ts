@@ -1,9 +1,11 @@
 import axios from 'axios';
+import { Sha256 } from '../utils/sha256';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
 
 const api = axios.create({
   baseURL: API_URL,
+  timeout: 60000, // 60s — prevents hung requests from spinning forever
   headers: {
     'Content-Type': 'application/json',
   },
@@ -78,9 +80,9 @@ export const deviceAPI = {
 // Media
 const CHUNKED_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024;
 
-async function sha256Blob(blob: Blob): Promise<string> {
+async function sha256Buffer(buffer: ArrayBuffer): Promise<string> {
   if (!globalThis.crypto?.subtle) return '';
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
@@ -137,6 +139,10 @@ async function uploadMediaResumable(
     throw new Error('The saved upload session does not match the selected file');
   }
   const received = new Set((status.receivedChunks || []).map(Number));
+  // Whole-file hash is only computable when every chunk is uploaded in this
+  // session — a resumed upload would need to re-read already-received chunks.
+  const trackWholeFile = received.size === 0;
+  const fileHasher = trackWholeFile ? new Sha256() : null;
   let completedBytes = Array.from(received).reduce(
     (sum, index) => sum + Math.min(chunkSize, Math.max(0, file.size - index * chunkSize)),
     0,
@@ -148,14 +154,20 @@ async function uploadMediaResumable(
     const start = index * chunkSize;
     const end = Math.min(file.size, start + chunkSize);
     const chunk = file.slice(start, end);
+    // Hash once per chunk, BEFORE the retry loop — a retried upload must not
+    // feed the same bytes into the whole-file hasher twice.
+    const buffer = await chunk.arrayBuffer();
+    fileHasher?.update(new Uint8Array(buffer));
+    const chunkHash = await sha256Buffer(buffer);
     let lastError: any;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         const formData = new FormData();
-        formData.append('sha256', await sha256Blob(chunk));
+        formData.append('sha256', chunkHash);
         formData.append('chunk', chunk, file.name);
         await api.put(`/media/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`, formData, {
+          timeout: 0, // chunk uploads can be slow on LAN; they have their own retry
           headers: { 'Content-Type': 'multipart/form-data' },
           onUploadProgress: (event) => {
             const sent = Math.min(chunk.size, Number(event.loaded || 0));
@@ -177,9 +189,10 @@ async function uploadMediaResumable(
     onProgress?.(Math.min(99, Math.round((completedBytes / file.size) * 100)));
   }
 
+  const fileHash = fileHasher?.digestHex();
   let result;
   try {
-    result = await api.post(`/media/uploads/${encodeURIComponent(uploadId)}/complete`);
+    result = await api.post(`/media/uploads/${encodeURIComponent(uploadId)}/complete`, fileHash ? { fileHash } : undefined);
   } catch (error: any) {
     if ([400, 403, 413].includes(Number(error?.response?.status || 0))) {
       await api.delete(`/media/uploads/${encodeURIComponent(uploadId)}`).catch(() => undefined);
@@ -204,6 +217,7 @@ export const mediaAPI = {
     if (deviceId) formData.append('deviceId', deviceId);
     if (folder) formData.append('folder', folder);
     return api.post('/media/upload', formData, {
+      timeout: 0, // file uploads can be large; progress + retry handle failures
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (event) => {
         if (file.size > 0) onProgress?.(Math.min(100, Math.round((Number(event.loaded || 0) / file.size) * 100)));
@@ -232,6 +246,7 @@ export const scheduleAPI = {
 // Groups
 export const groupAPI = {
   getGroups: (params?: { page?: number; limit?: number; search?: string }) => api.get('/groups', { params }),
+  getGroup: (id: string) => api.get(`/groups/${id}`),
   createGroup: (name: string, devices: string[]) =>
     api.post('/groups', { name, devices }),
   updateGroup: (id: string, name: string, devices: string[]) =>

@@ -19,7 +19,9 @@ export const Dashboard = () => {
         const index = prev.findIndex((d) => d.deviceId === data.deviceId);
         if (index >= 0) {
           const updated = [...prev];
-          updated[index] = data;
+          // Heartbeat payload is partial — merge, don't replace, or fields
+          // like group/assignedUserId/health get wiped until next reload.
+          updated[index] = { ...prev[index], ...data };
           return updated;
         }
         return [...prev, data];

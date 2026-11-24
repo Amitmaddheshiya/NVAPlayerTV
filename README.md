@@ -1,5 +1,33 @@
 # NVA SignagePlayerTV
 
+Android TV signage player + cloud CMS + cloud backend. TVs play scheduled
+image/video/web/YouTube content; admins manage devices, media, groups and
+schedules from a web CMS. Works in **LAN mode** (TV-hosted/PC CMS) and
+**Cloud mode** (cloud backend with verified offline media cache).
+
+## Components
+
+| Component | Path | Stack |
+|---|---|---|
+| TV APK | repo root (`src/`, `android/`) | React Native (TV), react-native-video, Socket.io client |
+| Cloud backend | `cloud-backend/` | Node.js, Express, TypeScript, MongoDB (Mongoose), Redis, Socket.io |
+| Cloud CMS | `cloud-frontend/` | React, Vite, TypeScript, TanStack Query, Axios |
+
+## Documentation index
+
+- `ARCHITECTURE.md` — system design (APK, backend, CMS, MongoDB, Redis)
+- `DATABASE.md` — MongoDB schemas, collections, indexes
+- `API.md` — all REST endpoints, auth, request/response
+- `SECURITY.md` — JWT, roles, permissions, hardening rules
+- `DEPLOYMENT.md` — production build, server deploy, env config
+- `CHANGELOG.md` — important code changes, fixes, features
+- `TESTING.md` — test suites, regression, build verification
+- `docs/` — production readiness program (master plan, progress tracker, AWS guide, runbooks, load-test report)
+
+---
+
+# APK User Guide (LAN mode details below)
+
 Android TV signage player app jisme TV khud local CMS host kar sakta hai, QR se CMS open hota hai, media upload hota hai, aur screen par layout ke hisab se image/video/web/YouTube/template content play hota hai.
 
 ## 1. User Guide: App Active Karna, Permission Allow Karna, Aur Complete Workflow

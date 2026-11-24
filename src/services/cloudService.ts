@@ -346,25 +346,6 @@ class CloudService {
     }
   }
 
-  async sendCommandResponse(command: string, success: boolean): Promise<void> {
-    if (!this.config?.enabled || !this.config.apiUrl) return;
-
-    try {
-      await fetch(
-        `${this.config.apiUrl}/api/devices/${this.config.deviceId}/command-response`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ command, success }),
-        }
-      );
-    } catch (error) {
-      console.error('Send command response failed:', error);
-    }
-  }
-
   cleanup(): void {
     this.stopHeartbeat();
     if (this.socket) {

@@ -28,7 +28,11 @@ class SocketService {
       autoConnect: true,
       reconnection: true,
       reconnectionDelay: 1000,
-      reconnectionAttempts: 5,
+      // Unlimited retries: TVs run unattended for months. The previous cap of
+      // 5 attempts left config/emergency pushes dead until an app restart.
+      // Backoff is capped by reconnectionDelayMax (default 5s) with jitter.
+      reconnectionAttempts: Infinity,
+      reconnectionDelayMax: 30000,
     });
 
     this.socket.on('connect', () => {

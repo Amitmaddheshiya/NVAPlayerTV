@@ -7,12 +7,15 @@ import GlobalConfig from '../models/GlobalConfig';
 import AuditLog from '../models/AuditLog';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
 import Device from '../models/Device';
+import ScheduleTemplate from '../models/Schedule';
 import { getSocketInstance } from '../socket/socket';
 import { getMediaPathFromUrl, normalizeUserFolder } from '../utils/mediaUrl';
 import { createHash } from 'crypto';
 import mongoose from 'mongoose';
 import { createReadStream } from 'fs';
 import path from 'path';
+import { invalidateMediaAuth } from '../utils/fileAccessCache';
+import { checkUploadQuota, recordUpload, checkAssignQuota, recordAssign } from '../utils/quota';
 
 async function getFileSha256(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -69,25 +72,13 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Check monthly upload limit for non-admin users (use GlobalConfig)
-    const uploadUsageMonth = new Date().toISOString().slice(0, 7);
+    // Per-account quotas: storage cap, monthly bytes, monthly upload ops.
+    // Admin uploads are unmetered (internal/testing use).
     if (req.userRole !== 'admin' && ownerId) {
-      const user = await User.findById(ownerId);
-      if (user) {
-        if (user.uploadUsageMonth !== uploadUsageMonth) {
-          user.uploadUsageMonth = uploadUsageMonth;
-          user.currentMonthUpload = 0;
-          await user.save();
-        }
-        const monthlyLimitBytes = config.monthlyUploadLimitGB * 1024 * 1024 * 1024;
-        const remainingBytes = monthlyLimitBytes - user.currentMonthUpload;
-        const remainingMB = (remainingBytes / 1024 / 1024).toFixed(2);
-        if (user.currentMonthUpload + req.file.size > monthlyLimitBytes) {
-          res.status(400).json({
-            error: `Monthly upload limit exceeded. You have ${remainingMB} MB remaining out of ${config.monthlyUploadLimitGB} GB limit.`
-          });
-          return;
-        }
+      const quota = await checkUploadQuota(ownerId, req.file.size);
+      if (!quota.ok) {
+        res.status(quota.status || 400).json({ error: quota.error });
+        return;
       }
     }
 
@@ -122,18 +113,9 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
 
     await media.save();
 
-    // Update user storage and monthly upload (sub-user uploads count toward parent account)
+    // Update user storage and monthly counters (sub-user uploads count toward parent account)
     if (req.userRole !== 'admin' && ownerId) {
-      await User.findByIdAndUpdate(ownerId, {
-        $inc: {
-          storageUsed: req.file.size,
-          currentMonthUpload: req.file.size,
-        },
-        // This field stores a YYYY-MM string and must never be incremented.
-        $set: { uploadUsageMonth },
-      }, {
-        runValidators: true,
-      });
+      await recordUpload(ownerId, req.file.size);
     }
 
     // Audit log
@@ -196,8 +178,9 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
     const limitNum = parseInt(limit as string);
     const skip = (pageNum - 1) * limitNum;
 
-    // Create cache key based on filter and pagination
-    const cacheKey = `media:${JSON.stringify(filter)}:${req.userRole}:${req.userId || 'admin'}:page:${pageNum}:limit:${limitNum}`;
+    // Create cache key from raw query params — JSON.stringify(filter) cannot
+    // serialize RegExp (becomes {}), which made every search share one entry.
+    const cacheKey = `media:${req.userRole}:${req.userId || 'admin'}:${section || ''}:${deviceId || ''}:${folder || ''}:${type || ''}:${search || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -337,14 +320,28 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
 
     // Check persisted configurations before removing the backing file. A media
     // asset selected by a saved Cloud playlist must remain recoverable by TV.
+    // Schedule profiles live under config.schedule.profiles[].config — cover
+    // both their legacy mediaUrls and multimedia section mediaUrls too.
     const configuredDevices = await Device.find({
       $or: [
         { 'config.mediaUrls': media.url },
         { 'config.sections.mediaUrls': media.url },
+        { 'config.schedule.profiles.config.mediaUrls': media.url },
+        { 'config.schedule.profiles.config.sections.mediaUrls': media.url },
         ...(media.assignedDevices?.length ? [{ deviceId: { $in: media.assignedDevices } }] : []),
       ],
     }).select('deviceId');
-    if (configuredDevices.length > 0) {
+    // Schedule templates reference media directly (not via a device config
+    // until applied) — treat template usage as in-use as well.
+    const templateInUse = configuredDevices.length === 0
+      ? await ScheduleTemplate.findOne({
+          $or: [
+            { 'config.mediaUrls': media.url },
+            { 'config.sections.mediaUrls': media.url },
+          ],
+        }).select('_id').lean()
+      : null;
+    if (configuredDevices.length > 0 || templateInUse) {
       // A configured cloud playlist is a durable assignment. Hide the asset
       // from the user's library, but keep its file and DB metadata available
       // so assigned TVs can recover or re-cache it after restart/offline use.
@@ -362,6 +359,7 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
             size: media.size,
             folder: media.folder,
             retainedForConfiguredDevices: configuredDevices.map((device) => device.deviceId),
+            retainedForScheduleTemplate: templateInUse ? String((templateInUse as any)._id) : undefined,
           },
           ipAddress: req.ip,
           userAgent: req.get('user-agent'),
@@ -381,6 +379,7 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
     const storage = getStorageService();
     await storage.delete(media.path);
     await Media.findByIdAndDelete(req.params.id);
+    await invalidateMediaAuth(media.path);
 
     // Invalidate media cache on delete
     await cacheDelPattern('media:*');
@@ -447,10 +446,25 @@ export const assignMedia = async (req: AuthRequest, res: Response): Promise<void
       }
     }
 
+    // Monthly assignment-operation quota (1 API call = 1 op, regardless of
+    // how many devices are in deviceIds).
+    const assignOwnerId = req.effectiveUserId || req.userId;
+    if (req.userRole !== 'admin' && assignOwnerId) {
+      const assignQuota = await checkAssignQuota(assignOwnerId);
+      if (!assignQuota.ok) {
+        res.status(assignQuota.status || 429).json({ error: assignQuota.error });
+        return;
+      }
+    }
+
     media.assignedDevices = deviceIds || [];
     if (section) media.section = section;
 
     await media.save();
+
+    if (req.userRole !== 'admin' && assignOwnerId) {
+      await recordAssign(assignOwnerId);
+    }
 
     res.json({ success: true, media });
   } catch (error) {
@@ -505,6 +519,10 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
       media.path = newPath;
       media.url = storage.getUrl(newPath);
       media.folder = newFolder;
+
+      // File-access auth cache is keyed by path — drop both old and new keys.
+      await invalidateMediaAuth(oldPath);
+      await invalidateMediaAuth(newPath);
     }
 
     await media.save();
@@ -517,4 +535,72 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
     console.error('Update media error:', error);
     res.status(500).json({ error: 'Failed to update media' });
   }
+};
+
+/**
+ * Background purge: permanently delete archived media (deletedFromLibrary)
+ * older than the retention window — but ONLY if no device config or schedule
+ * template still references it. TVs keep playing retained files until their
+ * config changes; purging an in-use file would break playback.
+ *
+ * Called daily from index.ts. Returns counts for logging.
+ */
+export const purgeArchivedMedia = async (): Promise<{ purged: number; skipped: number; errors: number }> => {
+  const result = { purged: 0, skipped: 0, errors: 0 };
+  try {
+    const config = await (GlobalConfig as any).getConfig();
+    const retentionDays = Number(config.archivedMediaRetentionDays || 30);
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+    const candidates = await Media.find({
+      deletedFromLibrary: true,
+      updatedAt: { $lt: cutoff },
+    }).select('_id path url uploadedBy size originalName assignedDevices').lean();
+
+    const storage = getStorageService();
+    for (const media of candidates) {
+      try {
+        // Re-check references — config may have changed since archiving.
+        const stillUsed = await Device.exists({
+          $or: [
+            { 'config.mediaUrls': media.url },
+            { 'config.sections.mediaUrls': media.url },
+            { 'config.sections.mediaItems.url': media.url },
+            { 'config.schedule.profiles.config.mediaUrls': media.url },
+            { 'config.schedule.profiles.config.sections.mediaUrls': media.url },
+            { 'config.schedule.profiles.config.sections.mediaItems.url': media.url },
+            ...(media.assignedDevices?.length ? [{ deviceId: { $in: media.assignedDevices } }] : []),
+          ],
+        }) || await ScheduleTemplate.exists({
+          $or: [
+            { 'config.mediaUrls': media.url },
+            { 'config.sections.mediaUrls': media.url },
+            { 'config.sections.mediaItems.url': media.url },
+          ],
+        });
+        if (stillUsed) {
+          result.skipped += 1;
+          continue;
+        }
+
+        await storage.delete(media.path);
+        await Media.findByIdAndDelete(media._id);
+        await invalidateMediaAuth(media.path);
+        if (media.uploadedBy) {
+          await User.findByIdAndUpdate(media.uploadedBy, { $inc: { storageUsed: -Number(media.size || 0) } });
+        }
+        result.purged += 1;
+      } catch (err) {
+        result.errors += 1;
+        console.error(`Purge archived media ${media._id} failed:`, err);
+      }
+    }
+    if (result.purged || result.skipped || result.errors) {
+      console.log(`[MediaPurge] purged=${result.purged} skipped(in-use)=${result.skipped} errors=${result.errors}`);
+    }
+  } catch (error) {
+    console.error('Purge archived media error:', error);
+    result.errors += 1;
+  }
+  return result;
 };

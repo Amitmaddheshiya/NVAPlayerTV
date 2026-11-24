@@ -13,6 +13,12 @@ export const UserDashboard = () => {
     storageLimit: 0,
     currentMonthUpload: 0,
     monthlyLimit: 0,
+    uploadOpsUsed: 0,
+    uploadOpsLimit: 0,
+    assignOpsUsed: 0,
+    assignOpsLimit: 0,
+    deviceLimit: 0,
+    fileSizeLimitMB: 500,
   });
   const [loading, setLoading] = useState(true);
 
@@ -50,14 +56,21 @@ export const UserDashboard = () => {
         currentMonthUpload: currentUser?.currentMonthUpload,
       });
 
+      const usage = currentUser?.usage;
       setStats({
         totalDevices: currentUser?.totalDevices || 0,
         onlineDevices: currentUser?.onlineDevices || 0,
         offlineDevices: currentUser?.offlineDevices || 0,
-        storageUsed: currentUser?.storageUsed || 0,
-        storageLimit: (currentUser?.monthlyUploadLimit || 10) * 1024 * 1024 * 1024,
-        currentMonthUpload: currentUser?.currentMonthUpload || 0,
-        monthlyLimit: currentUser?.monthlyUploadLimit || 10,
+        storageUsed: usage?.storage?.usedBytes ?? currentUser?.storageUsed ?? 0,
+        storageLimit: usage?.storage?.limitBytes ?? ((currentUser?.monthlyUploadLimit || 10) * 1024 * 1024 * 1024),
+        currentMonthUpload: usage?.monthlyUpload?.usedBytes ?? currentUser?.currentMonthUpload ?? 0,
+        monthlyLimit: usage?.monthlyUpload?.limitGB ?? currentUser?.monthlyUploadLimit ?? 10,
+        uploadOpsUsed: usage?.uploadOps?.used ?? 0,
+        uploadOpsLimit: usage?.uploadOps?.limit ?? 10,
+        assignOpsUsed: usage?.assignOps?.used ?? 0,
+        assignOpsLimit: usage?.assignOps?.limit ?? 15,
+        deviceLimit: usage?.devices?.limit ?? 4,
+        fileSizeLimitMB: usage?.fileSizeLimitMB ?? 500,
       });
     } catch (error) {
       console.error('Failed to load stats:', error);
@@ -67,9 +80,15 @@ export const UserDashboard = () => {
         onlineDevices: 0,
         offlineDevices: 0,
         storageUsed: 0,
-        storageLimit: 10 * 1024 * 1024 * 1024,
+        storageLimit: 1 * 1024 * 1024 * 1024,
         currentMonthUpload: 0,
         monthlyLimit: 10,
+        uploadOpsUsed: 0,
+        uploadOpsLimit: 10,
+        assignOpsUsed: 0,
+        assignOpsLimit: 15,
+        deviceLimit: 4,
+        fileSizeLimitMB: 500,
       });
     } finally {
       setLoading(false);
@@ -169,10 +188,10 @@ export const UserDashboard = () => {
                 </div>
                 <div className="flex justify-between text-[10px] sm:text-xs md:text-sm">
                   <span className="text-gray-600">Limit</span>
-                  <span className="font-medium">{stats.monthlyLimit} GB</span>
+                  <span className="font-medium">{(stats.storageLimit / (1024 * 1024 * 1024)).toFixed(1)} GB</span>
                 </div>
                 <div className="text-[10px] sm:text-xs md:text-sm text-gray-500">
-                  {storagePercentage.toFixed(1)}% of monthly limit
+                  {storagePercentage.toFixed(1)}% of storage quota
                 </div>
               </div>
             </CardContent>
@@ -210,6 +229,47 @@ export const UserDashboard = () => {
             </CardContent>
           </Card>
         </div>
+
+        {/* Your Plan Limits */}
+        <Card className="mb-3 sm:mb-4 md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-[10px] sm:text-xs md:text-sm">
+              <TrendingUp className="w-3 h-3 sm:w-4 sm:h-4 md:w-5 md:h-5" />
+              Your Plan &amp; Usage
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">Storage</div>
+                <div className="text-sm sm:text-base font-bold">{formatBytes(stats.storageUsed)} / {(stats.storageLimit / (1024*1024*1024)).toFixed(1)} GB</div>
+              </div>
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">Uploads this month</div>
+                <div className="text-sm sm:text-base font-bold">{stats.uploadOpsUsed} / {stats.uploadOpsLimit}</div>
+              </div>
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">Assignments this month</div>
+                <div className="text-sm sm:text-base font-bold">{stats.assignOpsUsed} / {stats.assignOpsLimit}</div>
+              </div>
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">TVs</div>
+                <div className="text-sm sm:text-base font-bold">{stats.totalDevices} / {stats.deviceLimit}</div>
+              </div>
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">Max file size</div>
+                <div className="text-sm sm:text-base font-bold">{stats.fileSizeLimitMB} MB</div>
+              </div>
+              <div className="p-2 sm:p-3 bg-gray-50 rounded-lg">
+                <div className="text-[10px] sm:text-xs text-gray-600">Monthly upload data</div>
+                <div className="text-sm sm:text-base font-bold">{formatBytes(stats.currentMonthUpload)} / {stats.monthlyLimit} GB</div>
+              </div>
+            </div>
+            <p className="text-[10px] sm:text-xs text-gray-500 mt-2 sm:mt-3">
+              Monthly counters reset on the 1st of each month. Need more? Contact support to upgrade your plan.
+            </p>
+          </CardContent>
+        </Card>
 
         {/* Device Status */}
         <Card>

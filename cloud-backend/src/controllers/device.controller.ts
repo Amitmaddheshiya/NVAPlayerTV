@@ -14,7 +14,9 @@ import { processConfigForStorage } from '../utils/configProcessor';
 import { applyScheduleToConfig } from '../services/schedule.service';
 import ScheduleTemplate from '../models/Schedule';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
-import { countConfiguredMedia, getConfiguredMediaBytes } from '../utils/configMedia';
+import { countConfiguredMedia, getConfiguredMediaBytes, getConfiguredMediaUrls } from '../utils/configMedia';
+import { invalidateDevicePaths, invalidateDeviceActive } from '../utils/fileAccessCache';
+import { checkDeviceLimit } from '../utils/quota';
 
 const hasDeviceScope = (req: AuthRequest, deviceId: string): boolean =>
   !req.isSubUser || (req.resourceAccess?.devices || []).includes(String(deviceId));
@@ -92,8 +94,9 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
     const limitNum = parseInt(limit as string);
     const skip = (pageNum - 1) * limitNum;
 
-    // Create cache key based on filter and pagination
-    const cacheKey = `devices:${JSON.stringify(filter)}:${req.userRole}:${req.userId || 'admin'}:page:${pageNum}:limit:${limitNum}`;
+    // Create cache key from raw query params — JSON.stringify(filter) cannot
+    // serialize RegExp (becomes {}), which made every search share one entry.
+    const cacheKey = `devices:${req.userRole}:${req.userId || 'admin'}:${status || ''}:${group || ''}:${assignedUserId || ''}:${includeUnassigned || ''}:${search || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -109,21 +112,29 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
     let summary: any;
     if (req.userRole !== 'admin') {
       const ownerId = req.effectiveUserId || req.userId;
-      const assigned = await Device.find({ assignedUserId: ownerId }).select('deviceId status').lean();
-      const assignedIds = assigned.map((device: any) => String(device.deviceId));
-      const groups = assignedIds.length
-        ? await Group.find({ $or: [
-            { ownerId },
-            { ownerId: { $exists: false }, devices: { $in: assignedIds } },
-          ] }).select('devices').lean()
-        : await Group.find({ ownerId }).select('devices').lean();
-      const groupedIds = new Set(groups.flatMap((group: any) => group.devices || []));
-      summary = {
-        totalDevices: assigned.length,
-        onlineDevices: assigned.filter((device: any) => device.status === 'online').length,
-        offlineDevices: assigned.filter((device: any) => device.status !== 'online').length,
-        groupedDevices: assigned.filter((device: any) => groupedIds.has(device.deviceId)).length,
-      };
+      // Summary costs 2 extra queries per page request — cache it briefly.
+      const summaryKey = `devices:summary:${ownerId}`;
+      const cachedSummary = await cacheGet(summaryKey);
+      if (cachedSummary) {
+        summary = JSON.parse(cachedSummary);
+      } else {
+        const assigned = await Device.find({ assignedUserId: ownerId }).select('deviceId status').lean();
+        const assignedIds = assigned.map((device: any) => String(device.deviceId));
+        const groups = assignedIds.length
+          ? await Group.find({ $or: [
+              { ownerId },
+              { ownerId: { $exists: false }, devices: { $in: assignedIds } },
+            ] }).select('devices').lean()
+          : await Group.find({ ownerId }).select('devices').lean();
+        const groupedIds = new Set(groups.flatMap((group: any) => group.devices || []));
+        summary = {
+          totalDevices: assigned.length,
+          onlineDevices: assigned.filter((device: any) => device.status === 'online').length,
+          offlineDevices: assigned.filter((device: any) => device.status !== 'online').length,
+          groupedDevices: assigned.filter((device: any) => groupedIds.has(device.deviceId)).length,
+        };
+        await cacheSet(summaryKey, JSON.stringify(summary), 30);
+      }
     }
 
     // Get paginated devices
@@ -212,7 +223,7 @@ export const getDeviceConfigHistory = async (req: AuthRequest, res: Response): P
     // and any future write path always return newest-first to every client.
     const entries = [...(device.configHistory || [])].sort(
       (a: any, b: any) => Number(new Date(b?.savedAt || 0)) - Number(new Date(a?.savedAt || 0))
-    );
+    ).slice(0, 2);
     res.json({ entries });
   } catch (error) {
     console.error('Get device config history error:', error);
@@ -299,10 +310,10 @@ export const heartbeat = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Device lists (including their online/offline summaries) are cached by
-    // query for 60 seconds. Heartbeats update status and lastSeen, so clear
-    // those snapshots before the next dashboard/device-page request.
-    await cacheDelPattern('devices:*');
+    // NOTE: do NOT purge devices:* here. Every heartbeat (~667/sec at 40k
+    // devices) ran a full Redis SCAN and made the 60s list cache useless.
+    // Status/lastSeen staleness is already bounded by the cache TTL, and real
+    // mutations (config, assignment, delete, group ops) invalidate explicitly.
     pushDeviceHeartbeat(device);
 
     // Send the full configuration only when the player's persisted version is stale.
@@ -502,7 +513,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       device.configHistory = [
         { config: previousConfig, configVersion: Number(device.cacheInfo?.configVersion || 0), savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined, source: 'device' },
         ...(device.configHistory || []),
-      ].slice(0, 20) as any;
+      ].slice(0, 2) as any;
     }
     device.config = processed.config;
     // Re-attach the resolved schedule payload (config.schedule) so template
@@ -572,6 +583,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     });
 
     await device.save();
+    await invalidateDevicePaths(deviceId);
     console.log(`=== CONFIG UPDATE: Config saved to database ===`);
 
     // Push the already-persisted config immediately. Media bookkeeping and
@@ -589,10 +601,9 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     // holding the Save response or delaying the live config event.
     void (async () => {
       try {
-        const selectedUrls = new Set(
-          (Array.isArray(device.config.sections) ? device.config.sections : [])
-            .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : [])
-        );
+        // Covers multimedia sections, legacy top-level mediaUrls, and every
+        // schedule profile's media so assignedDevices stays complete.
+        const selectedUrls = getConfiguredMediaUrls(device.config);
         const mediaDocs = selectedUrls.size
           ? await Media.find({ url: { $in: [...selectedUrls] } })
           : [];
@@ -702,6 +713,8 @@ export const deleteDevice = async (req: AuthRequest, res: Response): Promise<voi
     await ScheduleTemplate.deleteMany({ targetType: 'device', targetId: deviceId });
     await Device.findOneAndDelete({ deviceId });
     revokeDeviceSockets(deviceId);
+    await invalidateDevicePaths(deviceId);
+    await invalidateDeviceActive(deviceId);
 
     // Invalidate device cache on delete
     await cacheDelPattern('devices:*');
@@ -741,6 +754,12 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
       }
       if (user.role === 'sub-user' || user.parentId) {
         res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
+        return;
+      }
+      // Per-account device limit (plan-based).
+      const deviceLimit = await checkDeviceLimit(assignedUserId, 1);
+      if (!deviceLimit.ok) {
+        res.status(400).json({ error: deviceLimit.error });
         return;
       }
     }
@@ -835,6 +854,16 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
         return;
       }
+      // Per-account device limit (plan-based) — skip when the assignment is
+      // unchanged (device already counted toward this user's quota).
+      const targetUserId = String(updates.assignedUserId);
+      if (String(device.assignedUserId || '') !== targetUserId) {
+        const deviceLimit = await checkDeviceLimit(targetUserId, 1);
+        if (!deviceLimit.ok) {
+          res.status(400).json({ error: deviceLimit.error });
+          return;
+        }
+      }
     }
 
     // Track assignment changes for audit
@@ -880,7 +909,7 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         device.configHistory = [
           { config: priorConfig, configVersion: Number(device.cacheInfo?.configVersion || 0), savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined, source: 'assignment-change' },
           ...(device.configHistory || []),
-        ].slice(0, 20) as any;
+        ].slice(0, 2) as any;
       }
       await Group.updateMany({ devices: deviceId }, { $pull: { devices: deviceId } });
       // Direct device schedules belong to the previous assignment. Remove
@@ -907,6 +936,8 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     await device.save();
+    await invalidateDevicePaths(deviceId);
+    await invalidateDeviceActive(deviceId);
 
     if (updates.activated === false) revokeDeviceSockets(deviceId);
     if (assignmentChanged) getSocketInstance().to(`device:${deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
@@ -1046,6 +1077,7 @@ export const triggerEmergency = async (req: AuthRequest, res: Response): Promise
 
     device.emergencyAlert = alert;
     await device.save();
+    await invalidateDevicePaths(deviceId);
 
     pushEmergencyToDevice(deviceId, { ...alert, deviceId });
     pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId, action: 'triggered', alert });
@@ -1072,6 +1104,7 @@ export const clearEmergency = async (req: AuthRequest, res: Response): Promise<v
 
     device.emergencyAlert = null;
     await device.save();
+    await invalidateDevicePaths(deviceId);
 
     pushEmergencyClearToDevice(deviceId);
     pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId, action: 'cleared' });

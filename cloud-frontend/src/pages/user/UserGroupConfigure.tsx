@@ -178,12 +178,8 @@ export const UserGroupConfigure = () => {
 
   const loadGroup = async () => {
     try {
-      // This page is often opened from a direct group URL. The API is
-      // paginated (10 rows by default), so search the full manageable range
-      // instead of silently rendering an empty page for older groups.
-      const response = await groupAPI.getGroups({ page: 1, limit: 1000 });
-      const groups = response.data.data || response.data;
-      const groupData = groups.find((g: any) => g._id === groupId);
+      const response = await groupAPI.getGroup(groupId);
+      const groupData = response.data;
       setGroup(groupData);
       const firstDeviceId = groupData?.devices?.[0];
       let loadedConfig = groupData?.config;

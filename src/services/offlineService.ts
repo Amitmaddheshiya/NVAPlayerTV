@@ -48,9 +48,9 @@ class OfflineService {
     this.syncInterval = setInterval(() => {
       if (this.appState === 'active' && cloudService.isEnabled()) {
         this.checkConnectivity();
-        if (this.isOnline) {
-          this.syncMedia();
-        }
+        // NOTE: do NOT call syncMedia() here. It downloaded the entire device
+        // library into cloud_media/ every 60s, duplicating storage and
+        // bandwidth alongside the generation-based mediaService pipeline.
       }
     }, 60000); // Check every minute
   }

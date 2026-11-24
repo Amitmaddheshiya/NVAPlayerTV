@@ -93,9 +93,8 @@ export default function UserSchedules() {
         const device = deviceRes.data;
         setTargetName(device?.name || deviceId);
       } else if (groupId) {
-        const groupsRes = await groupAPI.getGroups({ page: 1, limit: 1000 });
-        const groups = groupsRes.data?.data || groupsRes.data || [];
-        const group = groups.find((g: any) => g._id === groupId);
+        const groupRes = await groupAPI.getGroup(groupId);
+        const group = groupRes.data;
         setTargetName(group?.name || groupId);
       }
     } catch (err: any) {
@@ -117,9 +116,8 @@ export default function UserSchedules() {
         const res = await deviceAPI.getDevice(deviceId);
         setConfig(cloneConfig(res.data?.config));
       } else if (groupId) {
-        const groupsRes = await groupAPI.getGroups({ page: 1, limit: 1000 });
-        const groups = groupsRes.data?.data || groupsRes.data || [];
-        const group = groups.find((g: any) => g._id === groupId);
+        const groupRes = await groupAPI.getGroup(groupId);
+        const group = groupRes.data;
         let baseConfig = group?.config;
         if ((!baseConfig || !baseConfig.sections) && Array.isArray(group?.devices) && group.devices.length) {
           try {

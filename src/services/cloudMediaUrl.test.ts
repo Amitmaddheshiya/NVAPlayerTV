@@ -4,12 +4,12 @@ describe("addCloudDeviceAccess", () => {
   it("adds both credentials while preserving existing query parameters", () => {
     expect(
       addCloudDeviceAccess(
-        "http://192.168.1.4:3000/api/media/file/users/u/a.mp4?download=1",
+        "http://192.168.1.3:3000/api/media/file/users/u/a.mp4?download=1",
         "device-1",
         "device-token"
       )
     ).toBe(
-      "http://192.168.1.4:3000/api/media/file/users/u/a.mp4?download=1&deviceId=device-1&deviceToken=device-token"
+      "http://192.168.1.3:3000/api/media/file/users/u/a.mp4?download=1&deviceId=device-1&deviceToken=device-token"
     );
   });
 

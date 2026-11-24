@@ -24,6 +24,8 @@ export interface IUser extends Document {
   monthlyUploadLimit: number;
   currentMonthUpload: number;
   uploadUsageMonth?: string;
+  monthlyUploadOps: number;
+  monthlyAssignOps: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -53,6 +55,8 @@ const UserSchema = new Schema<IUser>(
     monthlyUploadLimit: { type: Number, default: 10, min: 0 },
     currentMonthUpload: { type: Number, default: 0, min: 0 },
     uploadUsageMonth: { type: String, default: '' },
+    monthlyUploadOps: { type: Number, default: 0, min: 0 },
+    monthlyAssignOps: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );

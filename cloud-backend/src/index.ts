@@ -1,28 +1,14 @@
-import express from 'express';
 import http from 'http';
-import cors from 'cors';
-import path from 'path';
-import compression from 'compression';
 import connectDB from './config/database';
 import env from './config/env';
+import app from './app';
 import { initializeSocket, pushDeviceHeartbeat } from './socket/socket';
-import { errorHandler, notFound } from './middleware/error.middleware';
-import { fileAccessAuth } from './middleware/fileAccess.middleware';
-import { rateLimit } from './middleware/rateLimit.middleware';
-import { getRedisClient, closeRedisClient, cacheDelPattern } from './config/redis';
+import { getRedisClient, cacheDelPattern } from './config/redis';
 import Device from './models/Device';
 import { syncDeviceSchedule } from './services/schedule.service';
 import { ensureTestAdmin } from './config/testAdmin';
+import { purgeArchivedMedia } from './controllers/media.controller';
 
-import authRoutes from './routes/auth.routes';
-import deviceRoutes from './routes/device.routes';
-import mediaRoutes from './routes/media.routes';
-import scheduleRoutes from './routes/schedule.routes';
-import groupRoutes from './routes/group.routes';
-import userRoutes from './routes/user.routes';
-import globalConfigRoutes from './routes/globalConfig.routes';
-
-const app = express();
 const httpServer = http.createServer(app);
 
 // Initialize Redis (optional - will fallback to DB if not available)
@@ -32,39 +18,6 @@ getRedisClient().catch((err) => {
 
 // Initialize Socket.io
 initializeSocket(httpServer);
-
-// Middleware
-app.use(cors({
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:5174', 'http://127.0.0.1:5174', 'http://127.0.0.1:52844', 'http://127.0.0.1:54608', env.FRONTEND_URL],
-  credentials: true,
-}));
-app.use(compression({ threshold: 1024 })); // Compress responses > 1KB
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Apply rate limiting to all API routes
-app.use('/api', rateLimit());
-
-// Serve uploaded files with authentication
-app.use('/api/media/file', fileAccessAuth, express.static(path.join(process.cwd(), 'uploads')));
-
-// Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/devices', deviceRoutes);
-app.use('/api/media', mediaRoutes);
-app.use('/api/schedules', scheduleRoutes);
-app.use('/api/groups', groupRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/config', globalConfigRoutes);
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date() });
-});
-
-// Error handling
-app.use(notFound);
-app.use(errorHandler);
 
 const PORT = env.PORT;
 // Do not accept logins or device traffic until the database and test bootstrap
@@ -123,3 +76,17 @@ setInterval(async () => {
 }, CHECK_INTERVAL_SECONDS * 1000);
 
 console.log(`[Offline Detection] Background job running - checking every ${CHECK_INTERVAL_SECONDS}s, marking offline after ${OFFLINE_THRESHOLD_MINUTES}m without heartbeat`);
+
+// Daily purge of archived media past the retention window. Only removes files
+// no device config or schedule template still references (in-use files are
+// skipped so active playlists never break).
+const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+setInterval(() => {
+  purgeArchivedMedia().catch((error) => console.error('[MediaPurge] Job failed:', error));
+}, PURGE_INTERVAL_MS);
+// Run once shortly after boot so retention is enforced even if the process
+// restarts daily (e.g. deploys).
+setTimeout(() => {
+  purgeArchivedMedia().catch((error) => console.error('[MediaPurge] Boot run failed:', error));
+}, 60 * 1000);
+console.log('[MediaPurge] Background job scheduled (daily + once after boot)');

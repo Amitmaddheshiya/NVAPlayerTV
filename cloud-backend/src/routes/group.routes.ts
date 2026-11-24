@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
   getGroups,
+  getGroup,
   createGroup,
   updateGroup,
   deleteGroup,
@@ -15,6 +16,7 @@ import { requirePermission } from '../middleware/permission.middleware';
 const router = Router();
 
 router.get('/', auth, requirePermission('groups'), getGroups);
+router.get('/:id', auth, requirePermission('groups'), getGroup);
 router.post('/', auth, requirePermission('groups'), createGroup);
 router.put('/:id', auth, requirePermission('groups'), updateGroup);
 router.delete('/:id', auth, requirePermission('groups'), deleteGroup);

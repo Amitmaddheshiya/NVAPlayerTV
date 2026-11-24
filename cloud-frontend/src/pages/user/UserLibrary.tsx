@@ -6,6 +6,9 @@ import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Trash2, Download, HardDrive, FolderPlus, Folder, Search, Image, Video, FileText, Edit2, ChevronRight, Home, Grid3X3, List } from 'lucide-react';
 
+const getRequestErrorMessage = (error: any, fallback: string) =>
+  error?.response?.data?.error || error?.response?.data?.message || error?.message || fallback;
+
 export const UserLibrary = () => {
   const [mediaList, setMediaList] = useState<any[]>([]);
   const [folders, setFolders] = useState<{ name: string; count: number }[]>([]);
@@ -16,6 +19,7 @@ export const UserLibrary = () => {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [loading, setLoading] = useState(true);
   const [storageUsed, setStorageUsed] = useState(0);
+  const [storageLimit, setStorageLimit] = useState(0);
   const [monthlyLimit, setMonthlyLimit] = useState(0);
   const [currentMonthUpload, setCurrentMonthUpload] = useState(0);
   const [currentFolder, setCurrentFolder] = useState<string | null>(null); // null = root
@@ -98,12 +102,16 @@ export const UserLibrary = () => {
       setMonthlyLimit(configRes.data.monthlyUploadLimitGB * 1024 * 1024 * 1024);
       setCurrentMonthUpload(userRes.data.currentMonthUpload || 0);
       setStorageUsed(userRes.data.storageUsed || 0);
+      const usage = userRes.data.usage;
+      if (usage?.storage?.limitBytes) setStorageLimit(usage.storage.limitBytes);
+      else if (usage?.storage?.limitGB) setStorageLimit(usage.storage.limitGB * 1024 * 1024 * 1024);
     } catch (error) {
       console.error('Failed to load storage info:', error);
       // Set default values on error
       setMonthlyLimit(10 * 1024 * 1024 * 1024);
       setCurrentMonthUpload(0);
       setStorageUsed(0);
+      setStorageLimit(1 * 1024 * 1024 * 1024);
     }
   };
 
@@ -158,7 +166,7 @@ export const UserLibrary = () => {
       setAlertState({
         isOpen: true,
         title: 'Upload Failed',
-        message: 'Failed to upload files. Please try again.',
+        message: getRequestErrorMessage(error, 'Failed to upload files. Please try again.'),
         type: 'error',
       });
     } finally {
@@ -388,15 +396,15 @@ export const UserLibrary = () => {
             <CardContent className="pt-2 sm:pt-3">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-3">
                 <div className="p-2 sm:p-3 bg-blue-50 rounded-lg">
-                  <div className="text-[10px] sm:text-xs text-blue-800">Total Storage Used</div>
-                  <div className="text-sm sm:text-lg font-bold text-blue-600">{formatBytes(storageUsed)}</div>
+                  <div className="text-[10px] sm:text-xs text-blue-800">Library Storage</div>
+                  <div className="text-sm sm:text-lg font-bold text-blue-600">{formatBytes(storageUsed)} / {formatBytes(storageLimit)}</div>
                 </div>
                 <div className="p-2 sm:p-3 bg-green-50 rounded-lg">
                   <div className="text-[10px] sm:text-xs text-green-800">This Month Upload</div>
                   <div className="text-sm sm:text-lg font-bold text-green-600">{formatBytes(currentMonthUpload)}</div>
                 </div>
                 <div className="p-2 sm:p-3 bg-purple-50 rounded-lg">
-                  <div className="text-[10px] sm:text-xs text-purple-800">Monthly Limit</div>
+                  <div className="text-[10px] sm:text-xs text-purple-800">Monthly Upload Limit</div>
                   <div className="text-sm sm:text-lg font-bold text-purple-600">{formatBytes(monthlyLimit)}</div>
                 </div>
               </div>

@@ -9,6 +9,33 @@ export const countConfiguredMedia = (config: any): number => {
       (total: number, profile: any) => total + countSections(profile?.config?.sections), 0);
 };
 
+/**
+ * All media URLs referenced by a config: multimedia section mediaUrls, the
+ * legacy top-level mediaUrls field, and every schedule profile's config
+ * (recursively). Used to keep Media.assignedDevices complete.
+ */
+export const getConfiguredMediaUrls = (config: any): Set<string> => {
+  const urls = new Set<string>();
+  const addUrl = (url: any) => {
+    const value = String(url || '').trim();
+    if (value) urls.add(value);
+  };
+  const collect = (cfg: any) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (Array.isArray(cfg.mediaUrls)) cfg.mediaUrls.forEach(addUrl);
+    for (const section of Array.isArray(cfg.sections) ? cfg.sections : []) {
+      if (section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls)) {
+        section.mediaUrls.forEach(addUrl);
+      }
+    }
+    for (const profile of Array.isArray(cfg.schedule?.profiles) ? cfg.schedule.profiles : []) {
+      collect(profile?.config);
+    }
+  };
+  collect(config);
+  return urls;
+};
+
 /** Sum unique Cloud media bytes across the base playlist and schedule profiles. */
 export const getConfiguredMediaBytes = (config: any): number => {
   const sizes = new Map<string, number>();

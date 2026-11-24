@@ -44,6 +44,16 @@ interface UploadSession {
   updatedAt: number;
 }
 
+async function hashFileSha256(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const input = fs.createReadStream(filePath);
+    input.on('error', reject);
+    input.on('data', (chunk) => hash.update(chunk));
+    input.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
 function safeUploadId(value: unknown): string | null {
   const id = String(value || '');
   return /^[a-f0-9-]{36}$/i.test(id) ? id : null;
@@ -174,6 +184,14 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
         const monthlyLimit = Number(config.monthlyUploadLimitGB || 10) * 1024 * 1024 * 1024;
         if (used + totalSize > monthlyLimit) {
           res.status(400).json({ error: 'Monthly upload limit exceeded' });
+          return;
+        }
+        // Early storage-quota check so users don't waste time uploading a
+        // file that can never fit. The authoritative check (incl. ops count)
+        // runs again in uploadMedia on complete.
+        const storageLimitBytes = Number(config.storageLimitGB || 1) * 1024 * 1024 * 1024;
+        if (Number(user.storageUsed || 0) + totalSize > storageLimitBytes) {
+          res.status(400).json({ error: `Storage limit exceeded. Your library limit is ${config.storageLimitGB} GB.` });
           return;
         }
       }
@@ -404,6 +422,22 @@ export async function completeChunkedUpload(req: AuthRequest, res: Response): Pr
     if (Number(stat.size) !== session.totalSize) {
       res.status(400).json({ error: 'Assembled upload size does not match original file' });
       return;
+    }
+
+    // Optional whole-file integrity check: the CMS streams a SHA-256 of the
+    // original file while uploading chunks. Per-chunk hashes already guard
+    // transport; this catches assembly/storage corruption end-to-end.
+    const expectedFileHash = String(req.body?.fileHash || '').toLowerCase();
+    if (expectedFileHash) {
+      if (!/^[a-f0-9]{64}$/.test(expectedFileHash)) {
+        res.status(400).json({ error: 'Invalid file checksum' });
+        return;
+      }
+      const actualFileHash = await hashFileSha256(assembledPath);
+      if (actualFileHash !== expectedFileHash) {
+        res.status(400).json({ error: 'File checksum mismatch; upload rejected' });
+        return;
+      }
     }
 
     req.body = {

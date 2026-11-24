@@ -46,5 +46,7 @@ MediaSchema.index({ uploadedBy: 1, section: 1 }); // Compound index for user's m
 MediaSchema.index({ folder: 1 });
 MediaSchema.index({ assignedDevices: 1 });
 MediaSchema.index({ createdAt: -1 }); // For cleanup and recent media
+MediaSchema.index({ path: 1 }, { unique: true }); // Hot lookup: fileAccessAuth per range request
+MediaSchema.index({ url: 1 }); // getMediaList $in queries
 
 export default mongoose.model<IMedia>('Media', MediaSchema);

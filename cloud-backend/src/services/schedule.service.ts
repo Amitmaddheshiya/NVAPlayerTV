@@ -4,6 +4,7 @@ import ScheduleTemplate, { IScheduleTemplate } from '../models/Schedule';
 import { getSocketInstance } from '../socket/socket';
 import { cacheDelPattern } from '../config/redis';
 import { countConfiguredMedia, getConfiguredMediaBytes } from '../utils/configMedia';
+import { invalidateDevicePaths } from '../utils/fileAccessCache';
 
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 
@@ -88,6 +89,44 @@ export const getTemplatesForDevice = async (deviceId: string): Promise<ISchedule
   return templates as unknown as IScheduleTemplate[];
 };
 
+/**
+ * Batch variant of getTemplatesForDevice: resolves templates for many devices
+ * with 2 queries total (one Group scan + one ScheduleTemplate scan) instead of
+ * 2 queries per device. Returns a Map keyed by deviceId.
+ */
+export const getTemplatesForDevices = async (deviceIds: string[]): Promise<Map<string, IScheduleTemplate[]>> => {
+  const result = new Map<string, IScheduleTemplate[]>();
+  const unique = [...new Set(deviceIds.map(String).filter(Boolean))];
+  if (!unique.length) return result;
+
+  const groups = await Group.find({ devices: { $in: unique } }).select('_id devices').lean();
+  const deviceToGroupIds = new Map<string, string[]>();
+  const allGroupIds = new Set<string>();
+  for (const group of groups as any[]) {
+    const groupId = String(group._id);
+    allGroupIds.add(groupId);
+    for (const member of group.devices || []) {
+      const key = String(member);
+      const list = deviceToGroupIds.get(key) || [];
+      list.push(groupId);
+      deviceToGroupIds.set(key, list);
+    }
+  }
+
+  const or: any[] = [{ targetType: 'device', targetId: { $in: unique } }];
+  if (allGroupIds.size) or.push({ targetType: 'group', targetId: { $in: [...allGroupIds] } });
+  const templates = (await ScheduleTemplate.find({ enabled: true, $or: or }).lean()) as unknown as IScheduleTemplate[];
+
+  for (const deviceId of unique) {
+    const groupIds = deviceToGroupIds.get(deviceId) || [];
+    result.set(deviceId, templates.filter((t) =>
+      (t.targetType === 'device' && String(t.targetId) === deviceId) ||
+      (t.targetType === 'group' && groupIds.includes(String(t.targetId)))
+    ));
+  }
+  return result;
+};
+
 const scheduleSignature = (schedule: any) => JSON.stringify(schedule || null);
 const deviceScheduleSyncQueue = new Map<string, Promise<void>>();
 
@@ -95,7 +134,7 @@ const deviceScheduleSyncQueue = new Map<string, Promise<void>>();
  * Recomputes config.schedule for one device and pushes it only when it changed.
  * Safe to call after any config/group/template mutation.
  */
-export const syncDeviceSchedule = async (deviceOrId: any, options: { push?: boolean } = {}): Promise<void> => {
+export const syncDeviceSchedule = async (deviceOrId: any, options: { push?: boolean } = {}, templates?: IScheduleTemplate[]): Promise<void> => {
   const deviceId = String(typeof deviceOrId === 'string' ? deviceOrId : deviceOrId?.deviceId || '');
   if (!deviceId) return;
   const previousSync = deviceScheduleSyncQueue.get(deviceId) || Promise.resolve();
@@ -103,7 +142,7 @@ export const syncDeviceSchedule = async (deviceOrId: any, options: { push?: bool
     // Always reconcile the latest database snapshot. A queued operation must
     // not write a stale Device document captured before another config save.
     const device = await Device.findOne({ deviceId });
-    await reconcileDeviceSchedule(device, deviceId, options);
+    await reconcileDeviceSchedule(device, deviceId, options, templates);
   });
   deviceScheduleSyncQueue.set(deviceId, currentSync);
   try {
@@ -113,13 +152,13 @@ export const syncDeviceSchedule = async (deviceOrId: any, options: { push?: bool
   }
 };
 
-const reconcileDeviceSchedule = async (device: any, deviceId: string, options: { push?: boolean }): Promise<void> => {
+const reconcileDeviceSchedule = async (device: any, deviceId: string, options: { push?: boolean }, templates?: IScheduleTemplate[]): Promise<void> => {
   const push = options.push !== false;
   if (!device) return;
   if (!device.config || typeof device.config !== 'object') return;
 
-  const templates = await getTemplatesForDevice(deviceId);
-  const nextSchedule = buildScheduleConfig(templates as IScheduleTemplate[]);
+  const resolvedTemplates = templates ?? await getTemplatesForDevice(deviceId);
+  const nextSchedule = buildScheduleConfig(resolvedTemplates);
   const currentSchedule = (device.config as any).schedule || null;
 
   if (scheduleSignature(currentSchedule) === scheduleSignature(nextSchedule)) return;
@@ -145,6 +184,7 @@ const reconcileDeviceSchedule = async (device: any, deviceId: string, options: {
     updatedAt: new Date(),
   });
   await device.save();
+  await invalidateDevicePaths(deviceId);
 
   if (push) {
     const io = getSocketInstance();
@@ -163,7 +203,8 @@ export const syncScheduleForTarget = async (targetType: string, targetId: string
       deviceIds = Array.isArray((group as any)?.devices) ? (group as any).devices.map(String) : [];
     }
     const devices = await Device.find({ deviceId: { $in: deviceIds } });
-    await Promise.all(devices.map((device) => syncDeviceSchedule(device)));
+    const templatesByDevice = await getTemplatesForDevices(deviceIds);
+    await Promise.all(devices.map((device) => syncDeviceSchedule(device, {}, templatesByDevice.get(device.deviceId) || [])));
     if (devices.length) await cacheDelPattern('devices:*');
   } catch (error) {
     console.error('Schedule sync error for target', targetType, targetId, error);
@@ -177,7 +218,8 @@ export const syncScheduleForDevices = async (deviceIds: string[]): Promise<void>
     const unique = [...new Set(deviceIds.map(String).filter(Boolean))];
     if (!unique.length) return;
     const devices = await Device.find({ deviceId: { $in: unique } });
-    await Promise.all(devices.map((device) => syncDeviceSchedule(device)));
+    const templatesByDevice = await getTemplatesForDevices(unique);
+    await Promise.all(devices.map((device) => syncDeviceSchedule(device, {}, templatesByDevice.get(device.deviceId) || [])));
     if (devices.length) await cacheDelPattern('devices:*');
   } catch (error) {
     console.error('Schedule sync error for devices', deviceIds, error);
@@ -186,10 +228,10 @@ export const syncScheduleForDevices = async (deviceIds: string[]): Promise<void>
 };
 
 /** Re-inject schedule into a freshly saved device config without bumping version again. */
-export const applyScheduleToConfig = async (device: any): Promise<void> => {
+export const applyScheduleToConfig = async (device: any, templates?: IScheduleTemplate[]): Promise<void> => {
   if (!device?.config) return;
-  const templates = await getTemplatesForDevice(device.deviceId);
-  const nextSchedule = buildScheduleConfig(templates as IScheduleTemplate[]);
+  const resolvedTemplates = templates ?? await getTemplatesForDevice(device.deviceId);
+  const nextSchedule = buildScheduleConfig(resolvedTemplates);
   const config = { ...(device.config as any) };
   if (nextSchedule) {
     config.schedule = nextSchedule;

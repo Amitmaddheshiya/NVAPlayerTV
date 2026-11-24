@@ -714,9 +714,13 @@ export default function App() {
         // Download into an isolated generation. Playback and its manifest stay
         // on the previous committed generation until verification succeeds.
         let progressReportQueue: Promise<unknown> = Promise.resolve();
+        let lastProgressReportAt = 0;
         const downloadResult = await prefetchMediaItems(mediaItems, async (progress) => {
           const completed = progress.cached + progress.failed;
-          if (completed % 5 === 0 || completed === progress.total) {
+          const now = Date.now();
+          // Throttle: at most one progress POST per 5s; completion always reports.
+          if ((completed % 5 === 0 || completed === progress.total) && (now - lastProgressReportAt >= 5000 || completed === progress.total)) {
+            lastProgressReportAt = now;
             progressReportQueue = progressReportQueue.then(() => reportCloudConfigSync({
               configVersion: incomingVersion,
               status: 'pending',

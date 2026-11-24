@@ -48,6 +48,9 @@ const canAccessTarget = async (req: AuthRequest, targetType: string, targetId: s
     if (req.userRole !== 'admin' && String((device as any).assignedUserId || '') !== String(req.effectiveUserId || req.userId)) {
       return { ok: false, error: 'Access denied: device is not assigned to your account' };
     }
+    if (req.isSubUser && !(req.resourceAccess?.devices || []).includes(String(targetId))) {
+      return { ok: false, error: 'Access denied: device is outside your assigned resources' };
+    }
     return { ok: true };
   }
   const group = await Group.findById(targetId).select('ownerId devices').lean();
@@ -59,6 +62,9 @@ const canAccessTarget = async (req: AuthRequest, targetType: string, targetId: s
     (await Device.countDocuments({ deviceId: { $in: groupDevices }, assignedUserId: ownerId })) === groupDevices.length;
   if (String((group as any).ownerId || '') !== ownerId && !ownsLegacy) {
     return { ok: false, error: 'Access denied: group does not belong to your account' };
+  }
+  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String((group as any)._id))) {
+    return { ok: false, error: 'Access denied: group is outside your assigned resources' };
   }
   return { ok: true };
 };
@@ -160,6 +166,11 @@ export const updateScheduleTemplate = async (req: AuthRequest, res: Response): P
       res.status(403).json({ error: 'Access denied for this schedule target' });
       return;
     }
+    const targetAccess = await canAccessTarget(req, template.targetType, template.targetId);
+    if (!targetAccess.ok) {
+      res.status(403).json({ error: targetAccess.error || 'Access denied for this schedule target' });
+      return;
+    }
 
     const { name, config, schedule, enabled } = req.body;
     if (name !== undefined) template.name = String(name).trim();
@@ -200,6 +211,11 @@ export const deleteScheduleTemplate = async (req: AuthRequest, res: Response): P
     }
     if (!subUserModuleAllowed(req, template.targetType)) {
       res.status(403).json({ error: 'Access denied for this schedule target' });
+      return;
+    }
+    const targetAccess = await canAccessTarget(req, template.targetType, template.targetId);
+    if (!targetAccess.ok) {
+      res.status(403).json({ error: targetAccess.error || 'Access denied for this schedule target' });
       return;
     }
     const { targetType, targetId } = template;

@@ -43,5 +43,7 @@ AuditLogSchema.index({ userId: 1, timestamp: -1 });
 AuditLogSchema.index({ targetType: 1, targetId: 1, timestamp: -1 });
 AuditLogSchema.index({ action: 1, timestamp: -1 });
 AuditLogSchema.index({ timestamp: -1 }); // For cleanup of old logs
+// Auto-expire audit logs after 90 days so the collection stays bounded.
+AuditLogSchema.index({ timestamp: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 export default mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);

@@ -7,7 +7,9 @@ let socket: Socket | null = null;
 export const connectSocket = (): Socket => {
   if (!socket) {
     socket = io(SOCKET_URL, {
-      auth: { token: localStorage.getItem('token') || '' },
+      // Callback form: socket.io calls this on every (re)connect, so a fresh
+      // token is read each time instead of the one captured at first connect.
+      auth: (callback) => callback({ token: localStorage.getItem('token') || '' }),
       autoConnect: true,
     });
 

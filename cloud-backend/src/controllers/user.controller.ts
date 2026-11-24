@@ -11,6 +11,8 @@ import { getMediaPathFromUrl } from '../utils/mediaUrl';
 import bcrypt from 'bcryptjs';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { cacheGet, cacheSet, cacheDel, cacheDelPattern } from '../config/redis';
+import { invalidateDevicePaths, invalidateMediaAuth } from '../utils/fileAccessCache';
+import { checkDeviceLimit } from '../utils/quota';
 
 const isSubUserAccount = (user: any): boolean => user?.role === 'sub-user' || !!user?.parentId;
 const presentUser = (user: any): any => {
@@ -47,8 +49,9 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     const limitNum = parseInt(limit as string);
     const skip = (pageNum - 1) * limitNum;
 
-    // Create cache key based on filter and pagination
-    const cacheKey = `users:${JSON.stringify(filter)}:page:${pageNum}:limit:${limitNum}`;
+    // Create cache key from raw query params — JSON.stringify(filter) cannot
+    // serialize RegExp (becomes {}), which made every search share one entry.
+    const cacheKey = `users:${search || ''}:${role || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -128,14 +131,17 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
     if (user.uploadUsageMonth !== currentMonth) {
       user.uploadUsageMonth = currentMonth;
       user.currentMonthUpload = 0;
+      user.monthlyUploadOps = 0;
+      user.monthlyAssignOps = 0;
       await user.save();
     }
     const ownerId = req.effectiveUserId || req.userId;
     const [totalDevices, onlineDevices, config] = await Promise.all([
       Device.countDocuments({ assignedUserId: ownerId }),
       Device.countDocuments({ assignedUserId: ownerId, status: 'online' }),
-      GlobalConfig.findOne().select('monthlyUploadLimitGB'),
+      GlobalConfig.findOne(),
     ]);
+    const GB = 1024 * 1024 * 1024;
     res.json({
       ...presentUser(user),
       isSubUser: isSubUserAccount(user),
@@ -143,6 +149,32 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
       onlineDevices,
       offlineDevices: Math.max(0, totalDevices - onlineDevices),
       monthlyUploadLimit: config?.monthlyUploadLimitGB ?? 10,
+      usage: {
+        storage: {
+          usedBytes: Number(user.storageUsed || 0),
+          limitBytes: Number(config?.storageLimitGB ?? 1) * GB,
+          limitGB: Number(config?.storageLimitGB ?? 1),
+        },
+        monthlyUpload: {
+          usedBytes: Number(user.currentMonthUpload || 0),
+          limitBytes: Number(config?.monthlyUploadLimitGB ?? 10) * GB,
+          limitGB: Number(config?.monthlyUploadLimitGB ?? 10),
+        },
+        uploadOps: {
+          used: Number(user.monthlyUploadOps || 0),
+          limit: Number(config?.monthlyUploadOpsLimit ?? 10),
+        },
+        assignOps: {
+          used: Number(user.monthlyAssignOps || 0),
+          limit: Number(config?.monthlyAssignOpsLimit ?? 15),
+        },
+        devices: {
+          used: totalDevices,
+          limit: Number(config?.maxDevicesPerUser ?? 4),
+        },
+        fileSizeLimitMB: Number(config?.singleUploadLimitMB ?? 500),
+        resetsAt: 'month-start',
+      },
     });
   } catch (error) {
     console.error('Get me error:', error);
@@ -289,6 +321,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
     // Remove this user's content from stored device configs before deleting the files.
     for (const media of userMedia) {
       await storage.delete(media.path);
+      await invalidateMediaAuth(media.path);
       const devices = await Device.find({
         $or: [
           { 'config.mediaUrls': media.url },
@@ -307,6 +340,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
         }
         if (device.cacheInfo) device.cacheInfo.configVersion += 1;
         await device.save();
+        await invalidateDevicePaths(device.deviceId);
         io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
       }
     }
@@ -320,6 +354,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
         device.cacheInfo.cachedMedia = [];
       }
       await device.save();
+      await invalidateDevicePaths(device.deviceId);
       io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
     }
 
@@ -381,6 +416,25 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
       res.status(400).json({ error: 'One or more device IDs do not exist' });
       return;
     }
+
+    // Per-account device limit (plan-based, admin-tunable via GlobalConfig).
+    // Count only NEWLY added devices — devices already assigned to this user
+    // don't consume extra quota when the list is re-saved.
+    const deviceLimit = await checkDeviceLimit(userId, 0);
+    if (!deviceLimit.ok) {
+      res.status(400).json({ error: deviceLimit.error });
+      return;
+    }
+    const currentlyAssigned = await Device.countDocuments({ assignedUserId: userId });
+    const newAssignments = normalizedDeviceIds.filter((id: string) =>
+      !requestedDevices.find((d: any) => String(d.deviceId) === id && String(d.assignedUserId) === userId)
+    );
+    if (currentlyAssigned + newAssignments.length > (deviceLimit.limit || 4)) {
+      res.status(400).json({
+        error: `Device limit reached. Your plan allows ${deviceLimit.limit} TV(s); this account already has ${currentlyAssigned}. Remove a device or upgrade your plan.`,
+      });
+      return;
+    }
     const transferredDeviceIds = requestedDevices
       .filter((device: any) => device.assignedUserId && String(device.assignedUserId) !== userId)
       .map((device: any) => String(device.deviceId));
@@ -431,6 +485,7 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
           device.cacheInfo.cachedMedia = [];
         }
         await device.save();
+        await invalidateDevicePaths(device.deviceId);
         io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
       }
     }

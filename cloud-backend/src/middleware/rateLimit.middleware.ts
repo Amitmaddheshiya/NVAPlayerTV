@@ -61,6 +61,13 @@ export const rateLimit = (windowMs: number = env.RATE_LIMIT_WINDOW_MS, maxReques
   };
 };
 
+// Stricter limiter for unauthenticated credential endpoints (login/register).
+// The global limiter allows 100 req/15min/IP/path — far too loose for password
+// guessing. 20/15min per IP per path still allows shared-office NAT logins
+// while cutting brute-force throughput ~5x. Applies on top of the global
+// limiter; both must pass.
+export const authRateLimit = rateLimit(env.RATE_LIMIT_WINDOW_MS, 20);
+
 // Clean up expired entries periodically (every 5 minutes)
 setInterval(() => {
   const now = Date.now();

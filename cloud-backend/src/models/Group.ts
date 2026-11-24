@@ -31,6 +31,7 @@ const GroupSchema = new Schema<IGroup>(
 
 // Indexes for performance
 GroupSchema.index({ createdAt: -1 }); // For sorting groups by creation time
+GroupSchema.index({ devices: 1 }); // Multikey: getTemplatesForDevice looks up groups by member deviceId
 // name:1 index is automatically created by unique: true, no need for explicit index
 
 export default mongoose.model<IGroup>('Group', GroupSchema);

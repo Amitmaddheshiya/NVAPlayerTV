@@ -5,15 +5,16 @@ import Media from '../models/Media';
 import AuditLog from '../models/AuditLog';
 import User from '../models/User';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { applyScheduleToConfig, syncScheduleForDevices } from '../services/schedule.service';
+import { applyScheduleToConfig, syncScheduleForDevices, getTemplatesForDevices } from '../services/schedule.service';
 import ScheduleTemplate from '../models/Schedule';
 import { getSocketInstance, pushEmergencyClearToDevice, pushEmergencyToDevice, pushEmergencyToUser } from '../socket/socket';
 import { buildEmergencyAlert } from './device.controller';
 import mongoose from 'mongoose';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
-import env from '../config/env';
-import { getMediaPathFromUrl } from '../utils/mediaUrl';
-import { countConfiguredMedia, getConfiguredMediaBytes } from '../utils/configMedia';
+import { processConfigForStorage } from '../utils/configProcessor';
+import { countConfiguredMedia, getConfiguredMediaBytes, getConfiguredMediaUrls } from '../utils/configMedia';
+import { invalidateDevicePaths } from '../utils/fileAccessCache';
+import { checkAssignQuota, recordAssign } from '../utils/quota';
 
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -53,8 +54,9 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
     const limitNum = parseInt(limit as string);
     const skip = (pageNum - 1) * limitNum;
 
-    // Create cache key based on filter and pagination
-    const cacheKey = `groups:${req.userId || 'admin'}:${JSON.stringify(filter)}:page:${pageNum}:limit:${limitNum}`;
+    // Create cache key from raw query params — JSON.stringify(filter) cannot
+    // serialize RegExp (becomes {}), which made every search share one entry.
+    const cacheKey = `groups:${req.userId || 'admin'}:${search || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -268,59 +270,27 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const submittedMediaUrls = (Array.isArray(submittedConfig.sections) ? submittedConfig.sections : [])
-      .flatMap((section: any) => section?.contentType === 'multimedia' && Array.isArray(section.mediaUrls) ? section.mediaUrls : []);
-    const mediaPaths = submittedMediaUrls
-      .map((value: string) => getMediaPathFromUrl(value))
-      .filter((path: string | null): path is string => !!path);
-    if (mediaPaths.length !== submittedMediaUrls.length) {
-      res.status(400).json({ error: 'Configuration contains an invalid media URL' });
+    // Monthly assignment-operation quota: 1 group configure = 1 op
+    // (regardless of how many devices are in the group).
+    if (req.userRole !== 'admin' && ownerId) {
+      const assignQuota = await checkAssignQuota(ownerId);
+      if (!assignQuota.ok) {
+        res.status(assignQuota.status || 429).json({ error: assignQuota.error });
+        return;
+      }
+    }
+
+    // Same validation/normalization as single-device config saves: absolute
+    // URLs, mediaItems metadata, section field cleaning, legacy mediaUrls.
+    const processed = await processConfigForStorage(
+      submittedConfig,
+      req.userRole === 'admin' ? undefined : ownerId
+    );
+    if (processed.error || !processed.config) {
+      res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
       return;
     }
-    const uniqueMediaPaths = [...new Set(mediaPaths)];
-    const mediaDocs = uniqueMediaPaths.length
-      ? await Media.find({ path: { $in: uniqueMediaPaths } }).select('path originalName filename mimeType size hash updatedAt createdAt uploadedBy').lean()
-      : [];
-    if (mediaDocs.length !== uniqueMediaPaths.length) {
-      res.status(400).json({ error: 'Configuration contains a media file that no longer exists' });
-      return;
-    }
-    if (req.userRole !== 'admin' && mediaDocs.some((media: any) => media.uploadedBy?.toString() !== ownerId)) {
-      res.status(403).json({ error: 'Configuration can only use media uploaded to your account' });
-      return;
-    }
-    const mediaByPath = new Map(mediaDocs.map((media: any) => [String(media.path), media]));
-    const config = {
-      ...submittedConfig,
-      sections: Array.isArray(submittedConfig.sections)
-        ? submittedConfig.sections.map((section: any) => {
-            if (section?.contentType !== 'multimedia' || !Array.isArray(section.mediaUrls)) return section;
-            const mediaUrls = section.mediaUrls.map((value: string) =>
-              value.startsWith('/api/media/file/') ? `${env.SERVER_URL}${value}` : value
-            );
-            const mediaItems = mediaUrls.map((url: string) => {
-              const mediaPath = getMediaPathFromUrl(url);
-              const media: any = mediaPath ? mediaByPath.get(mediaPath) : null;
-              return media ? {
-                url,
-                name: media.filename || media.originalName,
-                originalName: media.originalName,
-                type: media.mimeType,
-                size: Number(media.size || 0),
-                hash: media.hash,
-                mtimeMs: Number(media.updatedAt?.getTime?.() || media.createdAt?.getTime?.() || 0),
-              } : { url };
-            });
-            return { ...section, mediaUrls, mediaItems };
-          })
-        : [],
-    };
-    if (config.layout === 'fullscreen') {
-      const firstSection = config.sections[0];
-      config.mediaUrls = firstSection?.contentType === 'multimedia' ? firstSection.mediaUrls : [];
-    } else {
-      config.mediaUrls = [];
-    }
+    const config = processed.config;
 
     // Collect all media URLs from config
     const allMediaUrls: string[] = [];
@@ -338,6 +308,10 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
 
     // Apply config to each device in the group
     const io = getSocketInstance();
+    // Resolve schedule templates for all devices in 2 queries instead of 2N.
+    const templatesByDevice = await getTemplatesForDevices(devices.map((device) => device.deviceId));
+    // Per-device media URL sets (incl. schedule profiles) for assignedDevices sync.
+    const deviceUrlSets = new Map<string, Set<string>>();
     const updatePromises = devices.map(async (device) => {
       // Store previous config for audit
       const previousConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
@@ -353,12 +327,13 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
             source: 'group',
           },
           ...(device.configHistory || []),
-        ].slice(0, 20) as any;
+        ].slice(0, 2) as any;
       }
 
       // Update device config
       device.config = config;
-      await applyScheduleToConfig(device);
+      await applyScheduleToConfig(device, templatesByDevice.get(device.deviceId) || []);
+      deviceUrlSets.set(device.deviceId, getConfiguredMediaUrls(device.config));
 
       // Track who configured the device
       device.lastConfiguredBy = req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined;
@@ -410,6 +385,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       });
 
       await device.save();
+      await invalidateDevicePaths(device.deviceId);
 
       // Emit config update via socket
       io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo.configVersion });
@@ -446,11 +422,14 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     const failedDeviceIds = updateResults.flatMap((result, index) => result.status === 'rejected' ? [devices[index].deviceId] : []);
 
     if (appliedDeviceIds.length > 0) {
+      if (req.userRole !== 'admin' && ownerId) {
+        await recordAssign(ownerId);
+      }
       if (previousGroupConfig && JSON.stringify(previousGroupConfig) !== JSON.stringify(config)) {
         group.configHistory = [
           { config: previousGroupConfig, savedAt: new Date(), savedBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined },
           ...(group.configHistory || []),
-        ].slice(0, 20) as any;
+        ].slice(0, 2) as any;
       }
       group.config = config;
       try {
@@ -467,18 +446,23 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       console.error('Device cache invalidation failed after group config save:', cacheError);
     }
 
-    // Reconcile media assignment records for devices that actually saved.
+    // Reconcile media assignment records per device — each device's schedule
+    // profiles can reference different media, so a shared URL set would be wrong.
     if (appliedDeviceIds.length > 0) {
       try {
-        const selectedUrls = new Set(allMediaUrls);
-        const groupMedia = await Media.find({ assignedDevices: { $in: appliedDeviceIds } }).select('_id url');
-        await Promise.all(groupMedia.filter(media => !selectedUrls.has(media.url)).map(media =>
-          Media.findByIdAndUpdate(media._id, { $pull: { assignedDevices: { $in: appliedDeviceIds } } })
-        ));
-        const selectedMedia = await Media.find({ url: { $in: allMediaUrls } });
-        await Promise.all(selectedMedia.map(media =>
-          Media.findByIdAndUpdate(media._id, { $addToSet: { assignedDevices: { $each: appliedDeviceIds } } })
-        ));
+        for (const deviceId of appliedDeviceIds) {
+          const selectedUrls = deviceUrlSets.get(deviceId) || new Set<string>();
+          const deviceMedia = await Media.find({ assignedDevices: deviceId }).select('_id url');
+          await Promise.all(deviceMedia.filter(media => !selectedUrls.has(media.url)).map(media =>
+            Media.findByIdAndUpdate(media._id, { $pull: { assignedDevices: deviceId } })
+          ));
+          if (selectedUrls.size) {
+            const selectedMedia = await Media.find({ url: { $in: [...selectedUrls] } });
+            await Promise.all(selectedMedia.map(media =>
+              Media.findByIdAndUpdate(media._id, { $addToSet: { assignedDevices: deviceId } })
+            ));
+          }
+        }
       } catch (mediaError) {
         console.error('Error updating media assignments for group:', mediaError);
       }
@@ -569,6 +553,7 @@ export const triggerGroupEmergency = async (req: AuthRequest, res: Response): Pr
     const results = await Promise.allSettled(devices.map(async (device) => {
       device.emergencyAlert = { ...alert, triggeredAt: new Date() };
       await device.save();
+      await invalidateDevicePaths(device.deviceId);
       pushEmergencyToDevice(device.deviceId, { ...device.emergencyAlert, deviceId: device.deviceId });
       pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId: device.deviceId, action: 'triggered', alert: device.emergencyAlert });
       return device.deviceId;
@@ -606,6 +591,7 @@ export const clearGroupEmergency = async (req: AuthRequest, res: Response): Prom
       if (!device.emergencyAlert) return;
       device.emergencyAlert = null;
       await device.save();
+      await invalidateDevicePaths(device.deviceId);
       pushEmergencyClearToDevice(device.deviceId);
       pushEmergencyToUser(device.assignedUserId?.toString(), { deviceId: device.deviceId, action: 'cleared' });
     }));
@@ -614,6 +600,24 @@ export const clearGroupEmergency = async (req: AuthRequest, res: Response): Prom
   } catch (error) {
     console.error('Clear group emergency error:', error);
     res.status(500).json({ error: 'Failed to clear group emergency alert' });
+  }
+};
+
+export const getGroup = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const group = await Group.findById(req.params.id);
+    if (!group) {
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    }
+    if (!(await canAccessGroup(group, req))) {
+      res.status(403).json({ error: 'Access denied: group does not belong to your account' });
+      return;
+    }
+    res.json(group);
+  } catch (error) {
+    console.error('Get group error:', error);
+    res.status(500).json({ error: 'Failed to fetch group' });
   }
 };
 
@@ -631,7 +635,7 @@ export const getGroupConfigHistory = async (req: AuthRequest, res: Response): Pr
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-    res.json({ entries: [...(group.configHistory || [])].reverse() });
+    res.json({ entries: [...(group.configHistory || [])].slice(0, 2).reverse() });
   } catch (error) {
     console.error('Get group config history error:', error);
     res.status(500).json({ error: 'Failed to fetch group configuration history' });

@@ -153,6 +153,8 @@ DeviceSchema.index({ assignedUserId: 1, status: 1 }); // Compound index for user
 DeviceSchema.index({ assignedUserId: 1, status: 1, lastSeen: -1 }); // Compound index for user's devices with status and lastSeen
 DeviceSchema.index({ lastConfiguredBy: 1, lastConfiguredAt: -1 }); // For audit tracking
 DeviceSchema.index({ 'cacheInfo.configVersion': 1 }); // For cache sync
+DeviceSchema.index({ updatedAt: -1 }); // getDevices sort (admin/unfiltered)
+DeviceSchema.index({ assignedUserId: 1, updatedAt: -1 }); // getDevices sort (per-user)
 
 // Virtual field to calculate display status (30D+ for long offline devices)
 DeviceSchema.virtual('displayStatus').get(function() {
