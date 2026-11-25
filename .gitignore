@@ -151,3 +151,11 @@ android/.gradle-user-home/
 
 android/.gradle-tmp/
 *.alive
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# LAN server runtime state — credentials & generated data, never commit
+server/data/cms-security.json
+server/data/groups.json
+server/data/playback-timeline.json
