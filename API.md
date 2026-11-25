@@ -24,7 +24,7 @@ Base URL: `SERVER_URL` (e.g. `http://192.168.1.3:3000`). All routes under
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/stats` | user | Device stats |
-| GET | `/` | user + `devices` perm | Paginated device list (non-admin: assigned only) |
+| GET | `/` | user + `devices` perm | Paginated device list (non-admin: assigned only). Admin params: `assignedUserId`, `excludeAssignedUserId`, `status` (online/offline/30D+), `search`, `page`, `limit` |
 | GET | `/:id` | user + perm | Device detail (sub-user scope checked) |
 | GET | `/:id/media` | user + perm | Device media list |
 | GET | `/:id/config-history` | user + perm | Config rollback history |
@@ -52,13 +52,13 @@ Base URL: `SERVER_URL` (e.g. `http://192.168.1.3:3000`). All routes under
 | PUT | `/uploads/:uploadId/chunks/:index` | user + `library` | Upload chunk (per-chunk sha256) |
 | POST | `/uploads/:uploadId/complete` | user + `library` | Complete (size + whole-file hash verify) |
 | GET | `/stats` | admin | Media stats |
-| GET | `/` | user + `library` | Paginated media list |
-| GET | `/folders` | user + `library` | Folder list |
+| GET | `/` | user + `library` | Paginated media list. Admin param: `uploadedBy` (view a specific user's library) |
+| GET | `/folders` | user + `library` | Folder list (admin param: `uploadedBy`) |
 | GET | `/media-list` | device | Device-facing media list |
 | DELETE | `/:id` | user + `library` | Delete (blocked if in-use) |
 | POST | `/:id/assign` | user + `library` | Assign media to devices (counts 1 assign op) |
 | PUT | `/:id` | user + `library` | Update media metadata |
-| GET | `/file/<path>` | fileAccessAuth | Stream media file (Range → 206) |
+| GET | `/file/<path>` | fileAccessAuth | Stream media file (Range → 206). **S3 media:** 302 redirect to a short-lived signed URL (CloudFront or S3 presign) — clients must follow redirects; Range is honored on the signed URL |
 
 ### Groups — `/api/groups`
 | Method | Path | Auth | Description |
@@ -91,20 +91,20 @@ Base URL: `SERVER_URL` (e.g. `http://192.168.1.3:3000`). All routes under
 | POST | `/me/sub-users` | user | Create sub-user |
 | PUT | `/me/sub-users/:id` | user | Update sub-user |
 | DELETE | `/me/sub-users/:id` | user | Delete sub-user |
-| GET | `/` | admin | All users |
+| GET | `/` | admin | All users — each row includes effective `monthlyUploadLimit` (from GlobalConfig; `null` for admins), month-reset `currentMonthUpload`, and parent-account `storageUsed`/`currentMonthUpload` for sub-users |
 | GET | `/:id` | admin | User detail |
 | GET | `/:id/stats` | admin | User stats |
 | POST | `/` | admin | Create user |
 | PUT | `/:id` | admin | Update user |
 | DELETE | `/:id` | admin | Delete user |
-| POST | `/:id/devices` | admin | Assign devices |
+| POST | `/:id/devices` | admin | Assign devices — rejected with `400` when the FINAL assigned count would exceed `maxDevicesPerUser` (devices not in the list are unassigned, so swaps within the limit are allowed) |
 
 ### Global config — `/api/config`
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/public` | public | Basic limits (no auth) |
 | GET | `/` | admin | Full config |
-| PUT | `/` | admin | Update config (APK version, quota limits) |
+| PUT | `/` | admin | Update config (APK version, quota limits). Numeric quota fields validated: must be finite non-negative numbers (`400` otherwise) |
 
 ## Quotas & usage
 
@@ -116,14 +116,18 @@ Per-account limits (defaults, admin-tunable via `PUT /api/config`):
 | `singleUploadLimitMB` | 500 MB | max single file |
 | `monthlyUploadLimitGB` | 10 GB | upload bytes/month |
 | `monthlyUploadOpsLimit` | 10 | uploads/month (1 file = 1 op) |
-| `monthlyAssignOpsLimit` | 15 | assign/configure calls/month |
+| `monthlyAssignOpsLimit` | 15 | assign/configure calls/month — counts media assign, group configure, AND single-device config save (1 call = 1 op) |
 | `maxDevicesPerUser` | 4 | TVs per account |
 | `archivedMediaRetentionDays` | 30 | archived media purge window |
 
-`GET /api/users/me` returns a `usage` object:
+`GET /api/users/me` returns a `usage` object. For sub-users the usage
+counters reflect the PARENT (quota-owning) account — sub-user uploads and
+assignments accrue to the parent — and the response includes
+`quotaAccountId` (the account the counters belong to):
 
 ```json
 {
+  "quotaAccountId": "<userId>",
   "usage": {
     "storage":        { "usedBytes": 0, "limitBytes": 1073741824, "limitGB": 1 },
     "monthlyUpload":  { "usedBytes": 0, "limitBytes": 10737418240, "limitGB": 10 },

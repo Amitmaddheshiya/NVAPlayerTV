@@ -28,6 +28,7 @@ const deviceActiveKey = (deviceId: string) => `fileauth:deviceactive:${deviceId}
 
 export interface CachedMediaAuth {
   uploadedBy?: string;
+  storageType?: string;
 }
 
 export async function getCachedMediaAuth(path: string): Promise<CachedMediaAuth | null> {
@@ -41,8 +42,8 @@ export async function getCachedMediaAuth(path: string): Promise<CachedMediaAuth 
   }
 }
 
-export async function setCachedMediaAuth(path: string, uploadedBy?: string): Promise<void> {
-  await cacheSet(mediaKey(path), JSON.stringify({ uploadedBy: uploadedBy || '' }), MEDIA_AUTH_TTL);
+export async function setCachedMediaAuth(path: string, uploadedBy?: string, storageType?: string): Promise<void> {
+  await cacheSet(mediaKey(path), JSON.stringify({ uploadedBy: uploadedBy || '', storageType: storageType || '' }), MEDIA_AUTH_TTL);
 }
 
 export async function invalidateMediaAuth(path: string): Promise<void> {

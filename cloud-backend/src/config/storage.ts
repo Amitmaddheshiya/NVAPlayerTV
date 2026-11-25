@@ -1,9 +1,15 @@
 import env from './env';
+import AWS from 'aws-sdk';
+import crypto from 'crypto';
+import fs from 'fs';
 
 export interface StorageService {
   upload(file: Express.Multer.File, path: string): Promise<string>;
   delete(path: string): Promise<void>;
+  move?(fromPath: string, toPath: string): Promise<void>;
   getUrl(path: string): string;
+  /** Short-lived URL the client can fetch bytes from directly (S3 presign or CloudFront signed). */
+  getDeliveryUrl?(path: string, expiresInSeconds?: number): Promise<string>;
 }
 
 export class LocalStorage implements StorageService {
@@ -45,6 +51,15 @@ export class LocalStorage implements StorageService {
     }
   }
 
+  async move(fromPath: string, toPath: string): Promise<void> {
+    const fsp = fs.promises;
+    const fullFrom = `${this.uploadDir}/${fromPath}`;
+    const fullTo = `${this.uploadDir}/${toPath}`;
+    const dir = fullTo.substring(0, fullTo.lastIndexOf('/'));
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.rename(fullFrom, fullTo);
+  }
+
   getUrl(path: string): string {
     return `${env.SERVER_URL}/api/media/file/${path}`;
   }
@@ -56,27 +71,115 @@ export class LocalStorage implements StorageService {
   }
 }
 
+/**
+ * CloudFront canned-policy signed URL (RSA-SHA1, base64-encoded policy).
+ * Used when CDN_BASE_URL + key pair are configured so edge locations can
+ * serve bytes without hitting the origin for auth on every range request.
+ */
+function buildCloudFrontSignedUrl(resourceUrl: string, keyPairId: string, privateKeyPem: string, expiresEpochSeconds: number): string {
+  const policy = JSON.stringify({
+    Statement: [{
+      Resource: resourceUrl,
+      Condition: { DateLessThan: { 'AWS:EpochTime': expiresEpochSeconds } },
+    }],
+  });
+  const signer = crypto.createSign('RSA-SHA1');
+  signer.update(policy);
+  const signature = signer.sign(privateKeyPem, 'base64');
+  const encodedPolicy = Buffer.from(policy).toString('base64');
+  const separator = resourceUrl.includes('?') ? '&' : '?';
+  return `${resourceUrl}${separator}Policy=${encodeURIComponent(encodedPolicy)}&Signature=${encodeURIComponent(signature)}&Key-Pair-Id=${encodeURIComponent(keyPairId)}`;
+}
+
 export class S3Storage implements StorageService {
-  // S3 implementation for production
+  private s3: AWS.S3;
+  private bucket: string;
+
+  constructor() {
+    if (!env.S3_BUCKET_NAME) {
+      throw new Error('S3_BUCKET_NAME is required when STORAGE_TYPE=s3');
+    }
+    this.bucket = env.S3_BUCKET_NAME;
+    this.s3 = new AWS.S3({
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      region: env.AWS_REGION || 'ap-south-1',
+      signatureVersion: 'v4',
+    });
+  }
+
   async upload(file: Express.Multer.File, path: string): Promise<string> {
-    // TODO: Implement S3 upload
-    throw new Error('S3 storage not implemented yet');
+    const fsp = fs.promises;
+    // Stream the temp file — aws-sdk v2 auto-switches to multipart upload for
+    // large bodies, so multi-GB media never sits in memory.
+    await this.s3.upload({
+      Bucket: this.bucket,
+      Key: path,
+      Body: fs.createReadStream(file.path),
+      ContentType: file.mimetype || 'application/octet-stream',
+    }).promise();
+    // S3 has the bytes now — remove the local temp copy so disk doesn't fill.
+    await fsp.unlink(file.path).catch(() => undefined);
+    return path;
   }
 
   async delete(path: string): Promise<void> {
-    // TODO: Implement S3 delete
-    throw new Error('S3 storage not implemented yet');
+    try {
+      await this.s3.deleteObject({ Bucket: this.bucket, Key: path }).promise();
+    } catch (error) {
+      console.error(`Error deleting S3 object ${path}:`, error);
+    }
+  }
+
+  async move(fromPath: string, toPath: string): Promise<void> {
+    await this.s3.copyObject({
+      Bucket: this.bucket,
+      CopySource: `${this.bucket}/${fromPath}`,
+      Key: toPath,
+    }).promise();
+    await this.s3.deleteObject({ Bucket: this.bucket, Key: fromPath }).promise();
   }
 
   getUrl(path: string): string {
-    // TODO: Return S3 URL
-    throw new Error('S3 storage not implemented yet');
+    // URLs stay on the backend endpoint — fileAccessAuth still gates access,
+    // then serveMediaFile redirects to a short-lived signed delivery URL.
+    // Keeping this format means zero DB/config/APK migration.
+    return `${env.SERVER_URL}/api/media/file/${path}`;
+  }
+
+  async getDeliveryUrl(path: string, expiresInSeconds?: number): Promise<string> {
+    const ttl = expiresInSeconds || env.MEDIA_URL_EXPIRES_IN || 3600;
+
+    // Preferred: CloudFront signed URL — bytes come from the edge, not EC2.
+    if (env.CDN_BASE_URL && env.CLOUDFRONT_KEY_PAIR_ID && env.CLOUDFRONT_PRIVATE_KEY) {
+      const resourceUrl = `${env.CDN_BASE_URL}/${path}`;
+      const expires = Math.floor(Date.now() / 1000) + ttl;
+      return buildCloudFrontSignedUrl(resourceUrl, env.CLOUDFRONT_KEY_PAIR_ID, env.CLOUDFRONT_PRIVATE_KEY, expires);
+    }
+
+    // Fallback: S3 presigned GET — still offloads bytes from EC2 to S3,
+    // just without edge caching. Range requests are supported natively.
+    return this.s3.getSignedUrlPromise('getObject', {
+      Bucket: this.bucket,
+      Key: path,
+      Expires: ttl,
+    });
   }
 }
 
-export function getStorageService(): StorageService {
-  if (env.STORAGE_TYPE === 's3') {
-    return new S3Storage();
+const localStorage = new LocalStorage();
+let cachedS3: S3Storage | null = null;
+
+/**
+ * Returns the storage backend. Pass an explicit type ('local' | 's3') to
+ * address a specific media record — needed during migration when old files
+ * live on disk and new files live in S3 under the same deployment.
+ */
+export function getStorageService(type?: string): StorageService {
+  const effective = type === 's3' || type === 'local' ? type : env.STORAGE_TYPE;
+  if (effective === 's3') {
+    if (!cachedS3) cachedS3 = new S3Storage();
+    return cachedS3;
   }
-  return new LocalStorage();
+  return localStorage;
 }

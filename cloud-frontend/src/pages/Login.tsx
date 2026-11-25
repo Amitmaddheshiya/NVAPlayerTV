@@ -39,7 +39,7 @@ export const Login = () => {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <Card className="w-full max-w-md">
+      <Card className="w-full max-w-md mx-4">
         <CardHeader>
           <CardTitle>Signage CMS Login</CardTitle>
         </CardHeader>

@@ -1,21 +1,25 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Select } from '../../components/ui/Select';
 import { Alert } from '../../components/ui/Alert';
+import { SkeletonTable } from '../../components/ui/Skeleton';
+import { useUrlParam, useUrlNumberParam, useSortParam } from '../../hooks/useUrlParam';
+import { SortableTh } from '../../components/admin/SortableTh';
 import { Plus, Edit, Trash2, Monitor, HardDrive, Upload, Shield, ShieldAlert } from 'lucide-react';
 
 export const AdminUsers = () => {
   const navigate = useNavigate();
-  const [filteredUsers, setFilteredUsers] = useState<any[]>([]);
+  const queryClient = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editingUser, setEditingUser] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [roleFilter, setRoleFilter] = useState('all');
+  const [searchTerm, setSearchTerm] = useUrlParam('q');
+  const [searchInput, setSearchInput] = useState(searchTerm);
+  const [roleFilter, setRoleFilter] = useUrlParam('role', 'all');
   const [alertState, setAlertState] = useState<{
     isOpen: boolean;
     title: string;
@@ -39,43 +43,46 @@ export const AdminUsers = () => {
     subUserLimit: 0,
   });
 
-  const [currentPage, setCurrentPage] = useState(1);
+  const [currentPage, setCurrentPage] = useUrlNumberParam('page', 1);
+  const { sortBy, sortOrder, toggleSort } = useSortParam('createdAt', 'desc');
   const usersPerPage = 15;
-  const [totalUsers, setTotalUsers] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
+
+  const usersQuery = useQuery({
+    queryKey: ['admin-users', currentPage, searchTerm, roleFilter, sortBy, sortOrder],
+    queryFn: async () => {
+      const params: any = { page: currentPage, limit: usersPerPage };
+      if (roleFilter && roleFilter !== 'all') params.role = roleFilter;
+      if (searchTerm) params.search = searchTerm;
+      if (sortBy) { params.sortBy = sortBy; params.sortOrder = sortOrder; }
+      const response = await userAPI.getUsers(params);
+      return response.data;
+    },
+  });
+
+  const filteredUsers = usersQuery.data?.data || [];
+  const loading = usersQuery.isLoading;
+  const totalUsers = usersQuery.data?.total || 0;
+  const totalPages = usersQuery.data?.totalPages || 0;
+  const loadUsers = () => queryClient.invalidateQueries({ queryKey: ['admin-users'] });
 
   const isSubUser = (user: any) => user?.role === 'sub-user' || !!user?.parentId;
 
+  // Debounce search input -> URL param (400ms)
   useEffect(() => {
-    loadUsers();
-  }, [currentPage, searchTerm, roleFilter]);
+    setSearchInput(searchTerm);
+  }, [searchTerm]);
 
-  const loadUsers = async () => {
-    try {
-      const params: any = {
-        page: currentPage,
-        limit: usersPerPage
-      };
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (searchInput !== searchTerm) setSearchTerm(searchInput);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
 
-      // Send filters to backend for server-side filtering
-      if (roleFilter && roleFilter !== 'all') {
-        params.role = roleFilter;
-      }
-      if (searchTerm) {
-        params.search = searchTerm;
-      }
-
-      const response = await userAPI.getUsers(params);
-      const usersData = response.data.data || response.data;
-      setFilteredUsers(usersData); // No client-side filtering needed
-      setTotalUsers(response.data.total || 0);
-      setTotalPages(response.data.totalPages || 0);
-    } catch (error) {
-      console.error('Failed to load users:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, roleFilter, sortBy, sortOrder]);
 
   // No client-side filtering - all filtering happens on server
 
@@ -167,10 +174,8 @@ export const AdminUsers = () => {
     navigate(`/admin/users/${user._id}/devices`);
   };
 
-  const paginatedUsers = filteredUsers.slice(
-    (currentPage - 1) * usersPerPage,
-    currentPage * usersPerPage
-  );
+  // Server already paginates — use the page's users directly.
+  const paginatedUsers = filteredUsers;
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
@@ -180,13 +185,65 @@ export const AdminUsers = () => {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   };
 
+  const renderRoleBadge = (user: any) => {
+    if (user.role === 'admin') {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-purple-100 text-purple-800 whitespace-nowrap">
+          <Shield className="w-2.5 h-2.5 mr-1" />
+          Admin
+        </span>
+      );
+    }
+    if (isSubUser(user)) {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-100 text-amber-800 whitespace-nowrap">
+          <ShieldAlert className="w-2.5 h-2.5 mr-1" />
+          Sub-user
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-100 text-blue-800 whitespace-nowrap">
+        <ShieldAlert className="w-2.5 h-2.5 mr-1" />
+        User
+      </span>
+    );
+  };
+
+  const renderUploadUsage = (user: any) =>
+    user.role === 'admin'
+      ? 'Unlimited'
+      : `${formatBytes(user.currentMonthUpload || 0)} / ${user.monthlyUploadLimit ?? '—'} GB`;
+
+  const renderUserActions = (user: any) => (
+    <div className="flex gap-0.5">
+      <Button size="sm" variant="secondary" onClick={() => handleEdit(user)} className="px-2 py-1 text-xs">
+        <Edit className="w-3 h-3" />
+      </Button>
+      {!isSubUser(user) && (
+        <Button size="sm" variant="secondary" onClick={() => handleDeviceAssignment(user)} className="px-2 py-1 text-xs">
+          <Monitor className="w-3 h-3" />
+        </Button>
+      )}
+      {user.role !== 'admin' && (
+        <Button size="sm" variant="danger" onClick={() => handleDelete(user._id)} className="px-2 py-1 text-xs">
+          <Trash2 className="w-3 h-3" />
+        </Button>
+      )}
+    </div>
+  );
+
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={10} cols={6} />
+      </div>
+    );
   }
 
   return (
     <>
-      <div className="p-2 sm:p-4 md:p-6 max-w-[95vw] sm:max-w-[1200px] mx-auto overflow-x-hidden">
+      <div className="p-1.5 sm:p-2 md:p-3 w-full">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 sm:mb-4 md:mb-6 gap-2 sm:gap-3 md:gap-4">
         <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900">Users</h1>
         <Button onClick={() => setShowForm(!showForm)} className="text-xs sm:text-sm w-full sm:w-auto">
@@ -203,8 +260,8 @@ export const AdminUsers = () => {
               <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Search</label>
               <Input
                 placeholder="Search users..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
                 className="text-xs sm:text-sm"
               />
             </div>
@@ -311,96 +368,88 @@ export const AdminUsers = () => {
       {/* Users Table */}
       <Card>
         <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs sm:text-sm">
+          {/* Mobile / tablet: card list — no horizontal scroll */}
+          <div className="lg:hidden divide-y divide-gray-200">
+            {paginatedUsers.map((user) => (
+              <div key={user._id} className="p-3 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-gray-900 truncate" title={user.email}>{user.email}</div>
+                    <div className="text-[11px] text-gray-500 truncate">{user.businessName || '—'}</div>
+                  </div>
+                  {renderRoleBadge(user)}
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-gray-700">
+                  <div className="truncate"><span className="text-gray-500">Phone:</span> {user.phone || '—'}</div>
+                  <div><span className="text-gray-500">Devices:</span> {user.assignedDevices?.length || 0}</div>
+                  <div className="truncate"><span className="text-gray-500">Storage:</span> {formatBytes(user.storageUsed)}</div>
+                  <div className="truncate"><span className="text-gray-500">Monthly Upload:</span> {renderUploadUsage(user)}</div>
+                  <div><span className="text-gray-500">Created:</span> {new Date(user.createdAt).toLocaleDateString()}</div>
+                </div>
+                <div className="flex justify-end">{renderUserActions(user)}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Desktop: compact full-width table — all columns visible, no horizontal scroll */}
+          <div className="hidden lg:block">
+            <table className="w-full table-fixed text-[11px]">
+              <colgroup>
+                <col className="w-[20%]" />
+                <col className="w-[8%]" />
+                <col className="w-[10%]" />
+                <col className="w-[12%]" />
+                <col className="w-[6%]" />
+                <col className="w-[10%]" />
+                <col className="w-[16%]" />
+                <col className="w-[8%]" />
+                <col className="w-[10%]" />
+              </colgroup>
               <thead className="bg-gray-50 border-b">
                 <tr>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Phone</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Business</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Devices</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Storage</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Monthly Upload</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                  <SortableTh label="User" field="email" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <SortableTh label="Role" field="role" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Phone</th>
+                  <SortableTh label="Business" field="businessName" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Devices</th>
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Storage</th>
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Monthly Upload</th>
+                  <SortableTh label="Created" field="createdAt" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {paginatedUsers.map((user) => (
                   <tr key={user._id} className="hover:bg-gray-50">
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap">
-                      <div className="text-xs sm:text-sm font-medium text-gray-900">{user.email}</div>
+                    <td className="px-2 py-2 whitespace-nowrap">
+                      <div className="text-xs font-medium text-gray-900 truncate" title={user.email}>{user.email}</div>
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap">
-                      {user.role === 'admin' ? (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-purple-100 text-purple-800">
-                          <Shield className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          Admin
-                        </span>
-                      ) : isSubUser(user) ? (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-amber-100 text-amber-800">
-                          <ShieldAlert className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          Sub-user
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-blue-100 text-blue-800">
-                          <ShieldAlert className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          User
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
-                      {user.phone || '-'}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
-                      {user.businessName || '-'}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
+                    <td className="px-2 py-2 whitespace-nowrap">{renderRoleBadge(user)}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={user.phone || ''}>{user.phone || '—'}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={user.businessName || ''}>{user.businessName || '—'}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900">
                       <div className="flex items-center gap-1">
-                        <Monitor className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-gray-600" />
+                        <Monitor className="w-2.5 h-2.5 text-gray-600" />
                         {user.assignedDevices?.length || 0}
                       </div>
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={formatBytes(user.storageUsed)}>
                       <div className="flex items-center gap-1">
-                        <HardDrive className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-gray-600" />
+                        <HardDrive className="w-2.5 h-2.5 text-gray-600" />
                         {formatBytes(user.storageUsed)}
                       </div>
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={renderUploadUsage(user)}>
                       <div className="flex items-center gap-1">
-                        <Upload className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-gray-600" />
-                        {formatBytes(user.currentMonthUpload)} / {user.monthlyUploadLimit} GB
+                        <Upload className="w-2.5 h-2.5 text-gray-600" />
+                        {renderUploadUsage(user)}
                       </div>
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-500">
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-500">
                       {new Date(user.createdAt).toLocaleDateString()}
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm font-medium">
-                      <div className="flex gap-1 sm:gap-2">
-                        <Button size="sm" variant="secondary" onClick={() => handleEdit(user)}>
-                          <Edit className="w-3 h-3 sm:w-4 sm:h-4" />
-                        </Button>
-                        {!isSubUser(user) && (
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            onClick={() => handleDeviceAssignment(user)}
-                          >
-                            <Monitor className="w-3 h-3 sm:w-4 sm:h-4" />
-                          </Button>
-                        )}
-                        {user.role !== 'admin' && (
-                          <Button
-                            size="sm"
-                            variant="danger"
-                            onClick={() => handleDelete(user._id)}
-                          >
-                            <Trash2 className="w-3 h-3 sm:w-4 sm:h-4" />
-                          </Button>
-                        )}
-                      </div>
+                    <td className="px-1.5 py-1.5 whitespace-nowrap font-medium">
+                      {renderUserActions(user)}
                     </td>
                   </tr>
                 ))}
@@ -421,7 +470,7 @@ export const AdminUsers = () => {
                 <Button
                   size="sm"
                   variant="secondary"
-                  onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                  onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
                   disabled={currentPage === 1}
                   className="text-xs sm:text-sm"
                 >
@@ -433,7 +482,7 @@ export const AdminUsers = () => {
                 <Button
                   size="sm"
                   variant="secondary"
-                  onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                  onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
                   disabled={currentPage === totalPages}
                   className="text-xs sm:text-sm"
                 >

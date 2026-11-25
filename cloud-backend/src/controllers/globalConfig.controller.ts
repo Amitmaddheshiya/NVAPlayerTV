@@ -16,6 +16,34 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
   try {
     const { monthlyUploadLimitGB, singleUploadLimitMB, storageLimitGB, monthlyUploadOpsLimit, monthlyAssignOpsLimit, maxDevicesPerUser, archivedMediaRetentionDays, apkVersion, apkUrl } = req.body;
 
+    // Validate numeric quota fields: must be finite, non-negative numbers.
+    const numericFields: Record<string, unknown> = {
+      monthlyUploadLimitGB,
+      singleUploadLimitMB,
+      storageLimitGB,
+      monthlyUploadOpsLimit,
+      monthlyAssignOpsLimit,
+      maxDevicesPerUser,
+      archivedMediaRetentionDays,
+    };
+    for (const [field, value] of Object.entries(numericFields)) {
+      if (value !== undefined) {
+        const num = Number(value);
+        if (!Number.isFinite(num) || num < 0) {
+          res.status(400).json({ error: `${field} must be a non-negative number` });
+          return;
+        }
+      }
+    }
+    if (apkVersion !== undefined && typeof apkVersion !== 'string') {
+      res.status(400).json({ error: 'apkVersion must be a string' });
+      return;
+    }
+    if (apkUrl !== undefined && apkUrl !== null && typeof apkUrl !== 'string') {
+      res.status(400).json({ error: 'apkUrl must be a string' });
+      return;
+    }
+
     const config = await (GlobalConfig as any).getConfig();
 
     if (monthlyUploadLimitGB !== undefined) config.monthlyUploadLimitGB = monthlyUploadLimitGB;

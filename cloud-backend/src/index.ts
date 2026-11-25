@@ -8,6 +8,7 @@ import Device from './models/Device';
 import { syncDeviceSchedule } from './services/schedule.service';
 import { ensureTestAdmin } from './config/testAdmin';
 import { purgeArchivedMedia } from './controllers/media.controller';
+import { reconcileStorageUsage } from './services/storageReconcile.service';
 
 const httpServer = http.createServer(app);
 
@@ -90,3 +91,27 @@ setTimeout(() => {
   purgeArchivedMedia().catch((error) => console.error('[MediaPurge] Boot run failed:', error));
 }, 60 * 1000);
 console.log('[MediaPurge] Background job scheduled (daily + once after boot)');
+
+// Monthly storage reconciliation: compare user.storageUsed against the actual
+// sum of Media.size per owner and repair small drift. Runs daily but only
+// acts when the calendar month rolls over (tracked via a module-level marker).
+const RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let lastReconcileMonth = '';
+const runReconcileIfNewMonth = async () => {
+  const month = new Date().toISOString().slice(0, 7);
+  if (month === lastReconcileMonth) return;
+  lastReconcileMonth = month;
+  try {
+    await reconcileStorageUsage();
+  } catch (error) {
+    console.error('[StorageReconcile] Job failed:', error);
+  }
+};
+setInterval(() => {
+  runReconcileIfNewMonth().catch((error) => console.error('[StorageReconcile] Job failed:', error));
+}, RECONCILE_INTERVAL_MS);
+// Also run once after boot so a fresh deploy reconciles immediately.
+setTimeout(() => {
+  runReconcileIfNewMonth().catch((error) => console.error('[StorageReconcile] Boot run failed:', error));
+}, 2 * 60 * 1000);
+console.log('[StorageReconcile] Background job scheduled (monthly + once after boot)');

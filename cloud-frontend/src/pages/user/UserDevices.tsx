@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, groupAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
@@ -7,6 +8,7 @@ import { Select } from '../../components/ui/Select';
 import { Wifi, WifiOff, Settings, Layers, Clock, Monitor } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { subscribeToDeviceUpdates } from '../../services/socket';
+import { SkeletonTable } from '../../components/ui/Skeleton';
 
 const formatLastSeen = (lastSeen: string | Date): string => {
   const date = new Date(lastSeen);
@@ -24,23 +26,40 @@ const formatLastSeen = (lastSeen: string | Date): string => {
 };
 
 export const UserDevices = () => {
-  const [devices, setDevices] = useState<any[]>([]);
-  const [filteredDevices, setFilteredDevices] = useState<any[]>([]);
-  const [groups, setGroups] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
   const devicesPerPage = 10;
-  const [totalDevices, setTotalDevices] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
-  const [deviceSummary, setDeviceSummary] = useState({ onlineDevices: 0, offlineDevices: 0, groupedDevices: 0 });
   const navigate = useNavigate();
 
-  useEffect(() => {
-    loadDevices();
-    loadGroups();
-  }, [currentPage, searchTerm, statusFilter]);
+  const devicesQuery = useQuery({
+    queryKey: ['user-devices', currentPage, searchTerm, statusFilter],
+    queryFn: async () => {
+      const params: any = { page: currentPage, limit: devicesPerPage };
+      if (statusFilter && statusFilter !== 'all') params.status = statusFilter;
+      if (searchTerm) params.search = searchTerm;
+      const response = await deviceAPI.getDevices(params);
+      return response.data;
+    },
+  });
+
+  const groupsQuery = useQuery({
+    queryKey: ['user-groups-list'],
+    queryFn: async () => {
+      const response = await groupAPI.getGroups();
+      return response.data.data || response.data;
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const devices = devicesQuery.data?.data || [];
+  const filteredDevices = devices;
+  const groups = groupsQuery.data || [];
+  const loading = devicesQuery.isLoading;
+  const totalDevices = devicesQuery.data?.total || 0;
+  const totalPages = devicesQuery.data?.totalPages || 0;
+  const deviceSummary = devicesQuery.data?.summary || { onlineDevices: 0, offlineDevices: 0, groupedDevices: 0 };
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -48,54 +67,14 @@ export const UserDevices = () => {
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        void loadDevices();
+        void queryClient.invalidateQueries({ queryKey: ['user-devices'] });
       }, 5000);
     });
     return () => {
       unsubscribe();
       if (timer) clearTimeout(timer);
     };
-  }, [currentPage, searchTerm, statusFilter]);
-
-  const loadDevices = async () => {
-    try {
-      const params: any = {
-        page: currentPage,
-        limit: devicesPerPage
-      };
-
-      // Send filters to backend for server-side filtering
-      if (statusFilter && statusFilter !== 'all') {
-        params.status = statusFilter;
-      }
-      if (searchTerm) {
-        params.search = searchTerm;
-      }
-
-      const response = await deviceAPI.getDevices(params);
-      const devicesData = response.data.data || response.data;
-      setDevices(devicesData);
-      setFilteredDevices(devicesData); // No client-side filtering needed
-      setTotalDevices(response.data.total || 0);
-      setTotalPages(response.data.totalPages || 0);
-      if (response.data.summary) setDeviceSummary(response.data.summary);
-    } catch (error) {
-      console.error('Failed to load devices:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadGroups = async () => {
-    try {
-      const response = await groupAPI.getGroups();
-      setGroups(response.data.data || response.data);
-    } catch (error) {
-      console.error('Failed to load groups:', error);
-    }
-  };
-
-  // No client-side filtering - all filtering happens on server
+  }, [queryClient]);
 
   const isDeviceInGroup = (deviceId: string) => {
     return groups.some((group) => group.devices.includes(deviceId));
@@ -108,7 +87,11 @@ export const UserDevices = () => {
   const paginatedDevices = filteredDevices;
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={8} cols={5} />
+      </div>
+    );
   }
 
   return (

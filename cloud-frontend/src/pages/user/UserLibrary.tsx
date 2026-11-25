@@ -1,27 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { mediaAPI, configAPI, userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
+import { SkeletonGrid } from '../../components/ui/Skeleton';
 import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Trash2, Download, HardDrive, FolderPlus, Folder, Search, Image, Video, FileText, Edit2, ChevronRight, Home, Grid3X3, List } from 'lucide-react';
+import { MediaThumbnail } from '../../components/MediaThumbnail';
 
 const getRequestErrorMessage = (error: any, fallback: string) =>
   error?.response?.data?.error || error?.response?.data?.message || error?.message || fallback;
 
 export const UserLibrary = () => {
-  const [mediaList, setMediaList] = useState<any[]>([]);
-  const [folders, setFolders] = useState<{ name: string; count: number }[]>([]);
-  const [filteredMedia, setFilteredMedia] = useState<any[]>([]);
+  const queryClient = useQueryClient();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [storageUsed, setStorageUsed] = useState(0);
-  const [storageLimit, setStorageLimit] = useState(0);
-  const [monthlyLimit, setMonthlyLimit] = useState(0);
-  const [currentMonthUpload, setCurrentMonthUpload] = useState(0);
   const [currentFolder, setCurrentFolder] = useState<string | null>(null); // null = root
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
@@ -35,8 +31,6 @@ export const UserLibrary = () => {
   const [folderPage, setFolderPage] = useState(1);
   const filesPerPage = 10;
   const foldersPerPage = 10;
-  const [totalMedia, setTotalMedia] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
   const [alertState, setAlertState] = useState<{
     isOpen: boolean;
     title: string;
@@ -51,69 +45,68 @@ export const UserLibrary = () => {
     type: 'info',
   });
 
-  useEffect(() => {
-    loadMedia();
-    loadStorageInfo();
-  }, [currentPage, searchTerm, currentFolder, typeFilter]);
-
-  const loadMedia = async () => {
-    try {
-      const params: any = {
-        page: currentPage,
-        limit: filesPerPage
-      };
-
-      // Send filters to backend for server-side filtering
-      if (currentFolder) {
-        params.folder = currentFolder;
-      } else {
-        params.folder = 'general'; // Default folder
-      }
-      if (typeFilter && typeFilter !== 'all') {
-        params.type = typeFilter;
-      }
-      if (searchTerm) {
-        params.search = searchTerm;
-      }
-
+  const mediaQuery = useQuery({
+    queryKey: ['user-library-media', currentPage, searchTerm, currentFolder, typeFilter],
+    queryFn: async () => {
+      const params: any = { page: currentPage, limit: filesPerPage };
+      params.folder = currentFolder || 'general';
+      if (typeFilter && typeFilter !== 'all') params.type = typeFilter;
+      if (searchTerm) params.search = searchTerm;
       const [response, foldersResponse] = await Promise.all([
         mediaAPI.getMedia(params),
         mediaAPI.getFolders(),
       ]);
-      const mediaData = response.data.data || response.data;
-      setMediaList(mediaData);
-      setFilteredMedia(mediaData); // No client-side filtering needed
-      setTotalMedia(response.data.total || 0);
-      setTotalPages(response.data.totalPages || 0);
-      setFolders(foldersResponse.data.data || foldersResponse.data || []);
-    } catch (error) {
-      console.error('Failed to load media:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+      return {
+        media: response.data.data || response.data,
+        folders: foldersResponse.data.data || foldersResponse.data || [],
+        total: response.data.total || 0,
+        totalPages: response.data.totalPages || 0,
+      };
+    },
+  });
 
-  const loadStorageInfo = async () => {
-    try {
-      const [configRes, userRes] = await Promise.all([
-        configAPI.getConfig(),
-        userAPI.getMe(),
-      ]);
-      setMonthlyLimit(configRes.data.monthlyUploadLimitGB * 1024 * 1024 * 1024);
-      setCurrentMonthUpload(userRes.data.currentMonthUpload || 0);
-      setStorageUsed(userRes.data.storageUsed || 0);
-      const usage = userRes.data.usage;
-      if (usage?.storage?.limitBytes) setStorageLimit(usage.storage.limitBytes);
-      else if (usage?.storage?.limitGB) setStorageLimit(usage.storage.limitGB * 1024 * 1024 * 1024);
-    } catch (error) {
-      console.error('Failed to load storage info:', error);
-      // Set default values on error
-      setMonthlyLimit(10 * 1024 * 1024 * 1024);
-      setCurrentMonthUpload(0);
-      setStorageUsed(0);
-      setStorageLimit(1 * 1024 * 1024 * 1024);
-    }
-  };
+  const storageQuery = useQuery({
+    queryKey: ['user-library-storage'],
+    queryFn: async () => {
+      try {
+        const [configRes, userRes] = await Promise.all([
+          configAPI.getConfig(),
+          userAPI.getMe(),
+        ]);
+        const usage = userRes.data.usage;
+        let storageLimit = 0;
+        if (usage?.storage?.limitBytes) storageLimit = usage.storage.limitBytes;
+        else if (usage?.storage?.limitGB) storageLimit = usage.storage.limitGB * 1024 * 1024 * 1024;
+        return {
+          monthlyLimit: configRes.data.monthlyUploadLimitGB * 1024 * 1024 * 1024,
+          currentMonthUpload: userRes.data.currentMonthUpload || 0,
+          storageUsed: userRes.data.storageUsed || 0,
+          storageLimit,
+        };
+      } catch {
+        return {
+          monthlyLimit: 10 * 1024 * 1024 * 1024,
+          currentMonthUpload: 0,
+          storageUsed: 0,
+          storageLimit: 1 * 1024 * 1024 * 1024,
+        };
+      }
+    },
+  });
+
+  const mediaList = mediaQuery.data?.media || [];
+  const folders: { name: string; count: number }[] = mediaQuery.data?.folders || [];
+  const filteredMedia = mediaList;
+  const loading = mediaQuery.isLoading;
+  const totalMedia = mediaQuery.data?.total || 0;
+  const totalPages = mediaQuery.data?.totalPages || 0;
+  const storageUsed = storageQuery.data?.storageUsed || 0;
+  const storageLimit = storageQuery.data?.storageLimit || 0;
+  const monthlyLimit = storageQuery.data?.monthlyLimit || 0;
+  const currentMonthUpload = storageQuery.data?.currentMonthUpload || 0;
+
+  const loadMedia = () => queryClient.invalidateQueries({ queryKey: ['user-library-media'] });
+  const loadStorageInfo = () => queryClient.invalidateQueries({ queryKey: ['user-library-storage'] });
 
   // No client-side filtering - all filtering happens on server
   const paginatedMedia = filteredMedia;
@@ -377,7 +370,11 @@ export const UserLibrary = () => {
   ).length;
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonGrid count={12} />
+      </div>
+    );
   }
 
   return (
@@ -664,7 +661,7 @@ export const UserLibrary = () => {
                             className="w-4 h-4 mt-0.5 flex-shrink-0"
                           />
                           <div className="flex-shrink-0 mt-0.5">
-                            {getMediaTypeIcon(media.mimeType)}
+                            <MediaThumbnail url={media.url} mimeType={media.mimeType} name={media.originalName} />
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="text-xs font-medium text-gray-900 truncate" title={media.originalName}>
@@ -734,8 +731,11 @@ export const UserLibrary = () => {
                               />
                             </td>
                             <td className="px-2 sm:px-3 py-1.5 sm:py-2">
-                              <div className="text-[10px] sm:text-xs font-medium text-gray-900 truncate max-w-[150px] md:max-w-xs">
-                                {media.originalName}
+                              <div className="flex items-center gap-2">
+                                <MediaThumbnail url={media.url} mimeType={media.mimeType} name={media.originalName} />
+                                <div className="text-[10px] sm:text-xs font-medium text-gray-900 truncate max-w-[150px] md:max-w-xs">
+                                  {media.originalName}
+                                </div>
                               </div>
                             </td>
                             <td className="px-2 sm:px-3 py-1.5 sm:py-2 whitespace-nowrap">

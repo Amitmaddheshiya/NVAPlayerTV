@@ -1,23 +1,51 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, userAPI, mediaAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Users, Monitor, Wifi, HardDrive, Upload, TrendingUp } from 'lucide-react';
 import { subscribeToDeviceUpdates } from '../../services/socket';
+import { SkeletonStats, SkeletonCard } from '../../components/ui/Skeleton';
 
 export const AdminDashboard = () => {
-  const [stats, setStats] = useState({
+  const queryClient = useQueryClient();
+
+  const statsQuery = useQuery({
+    queryKey: ['admin-dashboard-stats'],
+    queryFn: async () => {
+      const [deviceStatsRes, usersRes, mediaStatsRes, recentMediaRes] = await Promise.all([
+        deviceAPI.getDeviceStats(),
+        userAPI.getUsers({ page: 1, limit: 1 }),
+        mediaAPI.getStats(),
+        mediaAPI.getMedia({ page: 1, limit: 5 }),
+      ]);
+
+      const totalUsers = usersRes.data.total || 0;
+      const totalDevices = deviceStatsRes.data.totalDevices || 0;
+      const onlineDevices = deviceStatsRes.data.onlineDevices || 0;
+      const offlineDevices = deviceStatsRes.data.offlineDevices || 0;
+      const totalStorage = mediaStatsRes.data.totalStorage || 0;
+      const media = recentMediaRes.data.data || recentMediaRes.data;
+
+      return {
+        totalUsers,
+        totalDevices,
+        onlineDevices,
+        offlineDevices,
+        totalStorage,
+        recentUploads: media.slice(0, 5),
+      };
+    },
+  });
+
+  const stats = statsQuery.data || {
     totalUsers: 0,
     totalDevices: 0,
     onlineDevices: 0,
     offlineDevices: 0,
     totalStorage: 0,
     recentUploads: [] as any[],
-  });
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    loadStats();
-  }, []);
+  };
+  const loading = statsQuery.isLoading;
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -25,54 +53,14 @@ export const AdminDashboard = () => {
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        void loadStats();
+        void queryClient.invalidateQueries({ queryKey: ['admin-dashboard-stats'] });
       }, 5000);
     });
     return () => {
       unsubscribe();
       if (timer) clearTimeout(timer);
     };
-  }, []);
-
-  const loadStats = async () => {
-    try {
-      // Get device stats from dedicated endpoint for accurate counts
-      const [deviceStatsRes, usersRes, mediaStatsRes, recentMediaRes] = await Promise.all([
-        deviceAPI.getDeviceStats(),
-        userAPI.getUsers({ page: 1, limit: 1000 }),
-        mediaAPI.getStats(),
-        mediaAPI.getMedia({ page: 1, limit: 5 }),
-      ]);
-
-      console.log('Admin Dashboard - Device Stats:', deviceStatsRes.data);
-      console.log('Admin Dashboard - Users:', usersRes.data);
-      console.log('Admin Dashboard - Media:', mediaStatsRes.data);
-
-      // Use actual counts from device stats endpoint
-      const totalUsers = usersRes.data.total || 0;
-      const totalDevices = deviceStatsRes.data.totalDevices || 0;
-      const onlineDevices = deviceStatsRes.data.onlineDevices || 0;
-      const offlineDevices = deviceStatsRes.data.offlineDevices || 0;
-      const totalMedia = mediaStatsRes.data.totalMedia || 0;
-      const totalStorage = mediaStatsRes.data.totalStorage || 0;
-      const media = recentMediaRes.data.data || recentMediaRes.data;
-
-      console.log('Stats:', { totalUsers, totalDevices, onlineDevices, offlineDevices, totalMedia, totalStorage });
-
-      setStats({
-        totalUsers,
-        totalDevices,
-        onlineDevices,
-        offlineDevices,
-        totalStorage,
-        recentUploads: media.slice(0, 5),
-      });
-    } catch (error) {
-      console.error('Failed to load stats:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+  }, [queryClient]);
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
@@ -83,15 +71,23 @@ export const AdminDashboard = () => {
   };
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonStats count={4} />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mt-3">
+          <SkeletonCard />
+          <SkeletonCard />
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div className="p-2 sm:p-4 md:p-6 max-w-[95vw] sm:max-w-[1200px] mx-auto overflow-x-hidden">
-      <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900 mb-3 sm:mb-4 md:mb-6">Admin Dashboard</h1>
+    <div className="p-1 sm:p-1.5 md:p-2 w-full">
+      <h1 className="text-lg sm:text-xl md:text-2xl font-bold text-gray-900 mb-2 sm:mb-3">Admin Dashboard</h1>
 
         {/* Stats Cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3 md:gap-4 lg:gap-6 mb-4 sm:mb-6 md:mb-8">
+        <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3 mb-3 sm:mb-4">
           <Card>
             <CardContent className="p-3 sm:p-4 md:p-6">
               <div className="flex items-center gap-2 sm:gap-3 md:gap-4">
@@ -144,7 +140,7 @@ export const AdminDashboard = () => {
         </div>
 
         {/* Additional Stats */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4 md:gap-6 mb-4 sm:mb-6 md:mb-8">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-3 sm:mb-4">
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-sm sm:text-base">

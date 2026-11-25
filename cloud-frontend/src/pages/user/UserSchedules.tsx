@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { scheduleAPI, deviceAPI, groupAPI, mediaAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
@@ -62,12 +63,9 @@ export default function UserSchedules() {
   const targetType = deviceId ? 'device' : 'group';
   const targetId = deviceId || groupId || '';
 
-  const [targetName, setTargetName] = useState('');
-  const [templates, setTemplates] = useState<any[]>([]);
-  const [mediaList, setMediaList] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const queryClient = useQueryClient();
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [isNew, setIsNew] = useState(false);
@@ -77,34 +75,37 @@ export default function UserSchedules() {
 
   const backPath = deviceId ? `/user/devices/${deviceId}` : `/user/groups/${groupId}/configure`;
 
-  const load = async () => {
-    try {
-      setLoading(true);
-      setError('');
+  const schedulesQuery = useQuery({
+    queryKey: ['user-schedules', targetType, targetId],
+    queryFn: async () => {
       const [tplRes, mediaRes] = await Promise.all([
         scheduleAPI.getSchedules({ targetType: targetType as any, targetId }),
         mediaAPI.getMedia({ page: 1, limit: 1000 }),
       ]);
-      setTemplates(tplRes.data?.data || tplRes.data || []);
-      setMediaList(mediaRes.data?.data || mediaRes.data || []);
+      let name = targetId;
+      try {
+        if (deviceId) {
+          const deviceRes = await deviceAPI.getDevice(deviceId);
+          name = deviceRes.data?.name || deviceId;
+        } else if (groupId) {
+          const groupRes = await groupAPI.getGroup(groupId);
+          name = groupRes.data?.name || groupId;
+        }
+      } catch { /* keep id as name */ }
+      return {
+        templates: tplRes.data?.data || tplRes.data || [],
+        mediaList: mediaRes.data?.data || mediaRes.data || [],
+        targetName: name,
+      };
+    },
+    enabled: !!targetId,
+  });
 
-      if (deviceId) {
-        const deviceRes = await deviceAPI.getDevice(deviceId);
-        const device = deviceRes.data;
-        setTargetName(device?.name || deviceId);
-      } else if (groupId) {
-        const groupRes = await groupAPI.getGroup(groupId);
-        const group = groupRes.data;
-        setTargetName(group?.name || groupId);
-      }
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to load schedules');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { void load(); }, [deviceId, groupId]);
+  const templates = schedulesQuery.data?.templates || [];
+  const mediaList = schedulesQuery.data?.mediaList || [];
+  const targetName = schedulesQuery.data?.targetName || targetId;
+  const loading = schedulesQuery.isLoading;
+  const load = () => queryClient.invalidateQueries({ queryKey: ['user-schedules', targetType, targetId] });
 
   const startNew = async () => {
     setIsNew(true);

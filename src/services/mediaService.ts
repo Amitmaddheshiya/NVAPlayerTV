@@ -692,12 +692,22 @@ async function isManifestEntryUsable(
   const sizeExpected = isExpectedValue(expectedSize);
   const mtimeExpected = isExpectedValue(expectedMtime);
   const hashExpected = String(expectedHash || "").trim();
+
+  // Hash-first: the content hash is the source of truth. A matching hash means
+  // the cached bytes are identical even when size/mtime metadata drifted —
+  // e.g. the same file re-uploaded gets a new Media.updatedAt (mtimeMs) but
+  // identical content, and must not trigger a full re-download.
+  if (hashExpected) {
+    const actualHash = await computeFileHash(entry.localPath, hashExpected);
+    if (!actualHash || actualHash !== hashExpected) return false;
+    if (sizeExpected && entry.size !== expectedSize) entry.size = expectedSize;
+    if (mtimeExpected && entry.mtimeMs !== expectedMtime) entry.mtimeMs = expectedMtime;
+    entry.hash = hashExpected;
+    entry.lastSeenAt = Date.now();
+    return true;
+  }
+
   if (!sizeExpected && !mtimeExpected) {
-    if (hashExpected) {
-      const actualHash = await computeFileHash(entry.localPath, hashExpected);
-      if (!actualHash || actualHash !== hashExpected) return false;
-      entry.hash = hashExpected;
-    }
     entry.lastSeenAt = Date.now();
     return true;
   }
@@ -707,15 +717,9 @@ async function isManifestEntryUsable(
     const size = Number(stat?.size || 0);
     const sizeOk = !sizeExpected || size === expectedSize;
     const mtimeOk = !mtimeExpected || Number(entry.mtimeMs || 0) === expectedMtime;
-    let hashOk = true;
-    if (hashExpected) {
-      const actualHash = await computeFileHash(entry.localPath, hashExpected);
-      hashOk = !!actualHash && actualHash === hashExpected;
-    }
-    if (sizeOk && mtimeOk && hashOk) {
+    if (sizeOk && mtimeOk) {
       if (sizeExpected && entry.size !== expectedSize) entry.size = expectedSize;
       if (mtimeExpected && entry.mtimeMs !== expectedMtime) entry.mtimeMs = expectedMtime;
-      if (hashExpected && entry.hash !== hashExpected) entry.hash = hashExpected;
       entry.lastSeenAt = Date.now();
       return true;
     }

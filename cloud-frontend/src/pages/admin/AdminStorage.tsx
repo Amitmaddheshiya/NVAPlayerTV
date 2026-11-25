@@ -1,28 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { userAPI, mediaAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { ArrowLeft, HardDrive, Users, FolderOpen, FileText, TrendingUp } from 'lucide-react';
+import { SkeletonTable } from '../../components/ui/Skeleton';
 
 export const AdminStorage = () => {
-  const [storageData, setStorageData] = useState({
-    totalStorage: 0,
-    userBreakdown: [] as any[],
-    folderBreakdown: [] as any[],
-    typeBreakdown: [] as any[],
-  });
-  const [loading, setLoading] = useState(true);
   const [userPage, setUserPage] = useState(1);
   const [folderPage, setFolderPage] = useState(1);
   const [typePage, setTypePage] = useState(1);
   const itemsPerPage = 10;
 
-  useEffect(() => {
-    loadStorageData();
-  }, []);
-
-  const loadStorageData = async () => {
-    try {
+  const storageQuery = useQuery({
+    queryKey: ['admin-storage'],
+    queryFn: async () => {
       const [usersRes, mediaRes] = await Promise.all([
         userAPI.getUsers({ page: 1, limit: 1000 }),
         mediaAPI.getMedia({ page: 1, limit: 1000 }),
@@ -31,18 +23,14 @@ export const AdminStorage = () => {
       const users = usersRes.data.data || usersRes.data;
       const media = mediaRes.data.data || mediaRes.data;
 
-      // Calculate total storage
       const totalStorage = media.reduce((acc: number, m: any) => acc + (m.size || 0), 0);
 
-      // Breakdown by user
       const userMap = new Map<string, { email: string; storage: number; fileCount: number }>();
       media.forEach((m: any) => {
         const userId = m.uploadedBy;
         if (!userId) return;
-        
         const user = users.find((u: any) => u._id === userId);
         const email = user?.email || 'Unknown';
-        
         if (!userMap.has(userId)) {
           userMap.set(userId, { email, storage: 0, fileCount: 0 });
         }
@@ -58,7 +46,6 @@ export const AdminStorage = () => {
           percentage: totalStorage > 0 ? (u.storage / totalStorage * 100).toFixed(1) : 0,
         }));
 
-      // Breakdown by folder
       const folderMap = new Map<string, { storage: number; fileCount: number }>();
       media.forEach((m: any) => {
         const folder = m.folder || 'general';
@@ -78,7 +65,6 @@ export const AdminStorage = () => {
         }))
         .sort((a, b) => b.storage - a.storage);
 
-      // Breakdown by file type
       const typeMap = new Map<string, { storage: number; fileCount: number }>();
       media.forEach((m: any) => {
         const type = m.mimeType?.split('/')[0] || 'unknown';
@@ -98,18 +84,17 @@ export const AdminStorage = () => {
         }))
         .sort((a, b) => b.storage - a.storage);
 
-      setStorageData({
-        totalStorage,
-        userBreakdown,
-        folderBreakdown,
-        typeBreakdown,
-      });
-    } catch (error) {
-      console.error('Failed to load storage data:', error);
-    } finally {
-      setLoading(false);
-    }
+      return { totalStorage, userBreakdown, folderBreakdown, typeBreakdown };
+    },
+  });
+
+  const storageData = storageQuery.data || {
+    totalStorage: 0,
+    userBreakdown: [] as any[],
+    folderBreakdown: [] as any[],
+    typeBreakdown: [] as any[],
   };
+  const loading = storageQuery.isLoading;
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
@@ -139,24 +124,28 @@ export const AdminStorage = () => {
   const typeTotalPages = Math.ceil(storageData.typeBreakdown.length / itemsPerPage);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={10} cols={5} />
+      </div>
+    );
   }
 
   return (
-    <div className="p-2 sm:p-4 md:p-6 max-w-[95vw] sm:max-w-[1200px] mx-auto overflow-x-hidden">
-      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 sm:gap-3 md:gap-4 mb-3 sm:mb-4 md:mb-6">
+    <div className="p-1 sm:p-1.5 md:p-2 w-full">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 mb-2 sm:mb-3">
         <Button variant="secondary" onClick={() => window.location.href = '/admin/dashboard'} className="text-xs sm:text-sm">
           <ArrowLeft className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2" />
           <span className="hidden sm:inline">Back to Dashboard</span>
           <span className="sm:hidden">←</span>
         </Button>
-        <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900">
+        <h1 className="text-lg sm:text-xl md:text-2xl font-bold text-gray-900">
           Storage Details
         </h1>
       </div>
 
       {/* Total Storage Card */}
-      <Card className="mb-4 sm:mb-6 md:mb-8">
+      <Card className="mb-3 sm:mb-4">
         <CardContent className="p-4 sm:p-6">
           <div className="flex items-center gap-3 sm:gap-4">
             <HardDrive className="w-8 h-8 sm:w-10 sm:h-10 text-orange-600" />
@@ -169,7 +158,7 @@ export const AdminStorage = () => {
       </Card>
 
       {/* Breakdown Sections */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
         {/* By User */}
         <Card>
           <CardHeader>
@@ -338,7 +327,7 @@ export const AdminStorage = () => {
               </div>
               <div className="flex justify-between items-center text-xs sm:text-sm">
                 <span className="text-gray-600">Total Files</span>
-                <span className="font-bold">{storageData.userBreakdown.reduce((acc, u) => acc + u.fileCount, 0)}</span>
+                <span className="font-bold">{(storageData.userBreakdown as any[]).reduce((acc: number, u: any) => acc + u.fileCount, 0)}</span>
               </div>
             </div>
           </CardContent>

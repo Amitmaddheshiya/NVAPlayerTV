@@ -1,63 +1,21 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Wifi, HardDrive, Upload, Monitor, TrendingUp } from 'lucide-react';
 import { subscribeToDeviceUpdates } from '../../services/socket';
+import { SkeletonStats, SkeletonCard } from '../../components/ui/Skeleton';
 
 export const UserDashboard = () => {
-  const [stats, setStats] = useState({
-    totalDevices: 0,
-    onlineDevices: 0,
-    offlineDevices: 0,
-    storageUsed: 0,
-    storageLimit: 0,
-    currentMonthUpload: 0,
-    monthlyLimit: 0,
-    uploadOpsUsed: 0,
-    uploadOpsLimit: 0,
-    assignOpsUsed: 0,
-    assignOpsLimit: 0,
-    deviceLimit: 0,
-    fileSizeLimitMB: 500,
-  });
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
 
-  useEffect(() => {
-    loadStats();
-  }, []);
-
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const unsubscribe = subscribeToDeviceUpdates(() => {
-      if (timer) return;
-      timer = setTimeout(() => {
-        timer = null;
-        void loadStats();
-      }, 5000);
-    });
-    return () => {
-      unsubscribe();
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
-
-  const loadStats = async () => {
-    try {
+  const statsQuery = useQuery({
+    queryKey: ['user-dashboard-stats'],
+    queryFn: async () => {
       const userRes = await userAPI.getMe();
-      console.log('User Dashboard - User:', userRes.data);
-
       const currentUser = userRes.data;
-
-      console.log('User Dashboard Stats:', {
-        totalDevices: currentUser?.totalDevices,
-        onlineDevices: currentUser?.onlineDevices,
-        offlineDevices: currentUser?.offlineDevices,
-        storageUsed: currentUser?.storageUsed,
-        currentMonthUpload: currentUser?.currentMonthUpload,
-      });
-
       const usage = currentUser?.usage;
-      setStats({
+      return {
         totalDevices: currentUser?.totalDevices || 0,
         onlineDevices: currentUser?.onlineDevices || 0,
         offlineDevices: currentUser?.offlineDevices || 0,
@@ -71,29 +29,41 @@ export const UserDashboard = () => {
         assignOpsLimit: usage?.assignOps?.limit ?? 15,
         deviceLimit: usage?.devices?.limit ?? 4,
         fileSizeLimitMB: usage?.fileSizeLimitMB ?? 500,
-      });
-    } catch (error) {
-      console.error('Failed to load stats:', error);
-      // Set default values on error
-      setStats({
-        totalDevices: 0,
-        onlineDevices: 0,
-        offlineDevices: 0,
-        storageUsed: 0,
-        storageLimit: 1 * 1024 * 1024 * 1024,
-        currentMonthUpload: 0,
-        monthlyLimit: 10,
-        uploadOpsUsed: 0,
-        uploadOpsLimit: 10,
-        assignOpsUsed: 0,
-        assignOpsLimit: 15,
-        deviceLimit: 4,
-        fileSizeLimitMB: 500,
-      });
-    } finally {
-      setLoading(false);
-    }
+      };
+    },
+  });
+
+  const stats = statsQuery.data || {
+    totalDevices: 0,
+    onlineDevices: 0,
+    offlineDevices: 0,
+    storageUsed: 0,
+    storageLimit: 0,
+    currentMonthUpload: 0,
+    monthlyLimit: 0,
+    uploadOpsUsed: 0,
+    uploadOpsLimit: 0,
+    assignOpsUsed: 0,
+    assignOpsLimit: 0,
+    deviceLimit: 0,
+    fileSizeLimitMB: 500,
   };
+  const loading = statsQuery.isLoading;
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = subscribeToDeviceUpdates(() => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void queryClient.invalidateQueries({ queryKey: ['user-dashboard-stats'] });
+      }, 5000);
+    });
+    return () => {
+      unsubscribe();
+      if (timer) clearTimeout(timer);
+    };
+  }, [queryClient]);
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
@@ -107,7 +77,15 @@ export const UserDashboard = () => {
   const uploadPercentage = stats.monthlyLimit > 0 ? (stats.currentMonthUpload / (stats.monthlyLimit * 1024 * 1024 * 1024)) * 100 : 0;
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonStats count={4} />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mt-3">
+          <SkeletonCard />
+          <SkeletonCard />
+        </div>
+      </div>
+    );
   }
 
   return (

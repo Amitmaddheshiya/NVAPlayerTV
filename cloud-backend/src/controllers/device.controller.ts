@@ -16,7 +16,7 @@ import ScheduleTemplate from '../models/Schedule';
 import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
 import { countConfiguredMedia, getConfiguredMediaBytes, getConfiguredMediaUrls } from '../utils/configMedia';
 import { invalidateDevicePaths, invalidateDeviceActive } from '../utils/fileAccessCache';
-import { checkDeviceLimit } from '../utils/quota';
+import { checkDeviceLimit, checkAssignQuota, recordAssign } from '../utils/quota';
 
 const hasDeviceScope = (req: AuthRequest, deviceId: string): boolean =>
   !req.isSubUser || (req.resourceAccess?.devices || []).includes(String(deviceId));
@@ -47,7 +47,7 @@ export const getDeviceStats = async (req: AuthRequest, res: Response): Promise<v
 
 export const getDevices = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { status, group, includeUnassigned, assignedUserId, search, page = '1', limit = '10' } = req.query;
+    const { status, group, includeUnassigned, assignedUserId, excludeAssignedUserId, search, page = '1', limit = '10', sortBy, sortOrder } = req.query;
     const filter: any = {};
 
     // Handle 30D+ filter - convert to date-based query
@@ -66,6 +66,12 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
     // Filter by assigned user if specified (for admin)
     if (assignedUserId) {
       filter.assignedUserId = assignedUserId;
+    }
+
+    // Admin-only: exclude devices assigned to a specific user (e.g. the
+    // "available devices" list on the user device-assignment page).
+    if (req.userRole === 'admin' && excludeAssignedUserId) {
+      filter.assignedUserId = { $ne: excludeAssignedUserId };
     }
 
     // Search filter - search in name, deviceId, location
@@ -96,7 +102,7 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
 
     // Create cache key from raw query params — JSON.stringify(filter) cannot
     // serialize RegExp (becomes {}), which made every search share one entry.
-    const cacheKey = `devices:${req.userRole}:${req.userId || 'admin'}:${status || ''}:${group || ''}:${assignedUserId || ''}:${includeUnassigned || ''}:${search || ''}:page:${pageNum}:limit:${limitNum}`;
+    const cacheKey = `devices:${req.userRole}:${req.userId || 'admin'}:${status || ''}:${group || ''}:${assignedUserId || ''}:${excludeAssignedUserId || ''}:${includeUnassigned || ''}:${search || ''}:sort:${sortBy || ''}:${sortOrder || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -137,10 +143,17 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
       }
     }
 
+    // Whitelist sortable fields to prevent arbitrary field injection
+    const SORTABLE_FIELDS: Record<string, 1 | -1> = {
+      name: 1, deviceId: 1, status: 1, location: 1, lastSeen: 1, createdAt: 1, updatedAt: 1,
+    };
+    const sortField = (sortBy && SORTABLE_FIELDS[sortBy as string]) ? (sortBy as string) : 'updatedAt';
+    const sortDir = sortOrder === 'asc' ? 1 : -1;
+
     // Get paginated devices
     const devices = await Device.find(filter)
       .select('-configHistory')
-      .sort({ updatedAt: -1 })
+      .sort({ [sortField]: sortDir })
       .skip(skip)
       .limit(limitNum);
 
@@ -497,6 +510,17 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    // Monthly assignment-operation quota: 1 config save = 1 op (same rule as
+    // group configure and media assign). Admin saves are unmetered.
+    const assignOwnerId = req.effectiveUserId || req.userId;
+    if (req.userRole !== 'admin' && assignOwnerId) {
+      const assignQuota = await checkAssignQuota(assignOwnerId);
+      if (!assignQuota.ok) {
+        res.status(assignQuota.status || 429).json({ error: assignQuota.error });
+        return;
+      }
+    }
+
     // Store previous config for audit (schedule payload is derived, not user content)
     const previousConfig = device.config ? JSON.parse(JSON.stringify(device.config)) : null;
     if (previousConfig) delete previousConfig.schedule;
@@ -585,6 +609,10 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     await device.save();
     await invalidateDevicePaths(deviceId);
     console.log(`=== CONFIG UPDATE: Config saved to database ===`);
+
+    if (req.userRole !== 'admin' && assignOwnerId) {
+      await recordAssign(assignOwnerId);
+    }
 
     // Push the already-persisted config immediately. Media bookkeeping and
     // audit logging are secondary and should not make the TV wait to apply it.
@@ -720,6 +748,21 @@ export const deleteDevice = async (req: AuthRequest, res: Response): Promise<voi
     await cacheDelPattern('devices:*');
     await cacheDelPattern('groups:*');
     await cacheDelPattern('users:*');
+
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'delete_device',
+        targetType: 'device',
+        targetId: deviceId,
+        details: {
+          deviceName: device.name,
+          assignedUserId: device.assignedUserId?.toString() || null,
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
 
     res.json({ success: true });
   } catch (error) {

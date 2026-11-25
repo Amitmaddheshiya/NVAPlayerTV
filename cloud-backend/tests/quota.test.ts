@@ -60,6 +60,58 @@ describe('Quota utils — upload', () => {
     expect(after?.monthlyAssignOps).toBe(0);
     expect(after?.currentMonthUpload).toBe(0);
   });
+
+  it('boundary: storage used + incoming exactly at limit is allowed', async () => {
+    // storageLimitGB=1 → 1 GiB. used=512MiB, incoming=512MiB → exactly at limit → ok (check is `>`)
+    const { user } = await createUser({ storageUsed: 512 * 1024 * 1024 });
+    await setConfig({ storageLimitGB: 1, monthlyUploadLimitGB: 10, monthlyUploadOpsLimit: 10 });
+    const res = await checkUploadQuota(user._id.toString(), 512 * 1024 * 1024);
+    expect(res.ok).toBe(true);
+  });
+
+  it('boundary: one byte over storage limit is rejected', async () => {
+    const { user } = await createUser({ storageUsed: 512 * 1024 * 1024 });
+    await setConfig({ storageLimitGB: 1, monthlyUploadLimitGB: 10, monthlyUploadOpsLimit: 10 });
+    const res = await checkUploadQuota(user._id.toString(), 512 * 1024 * 1024 + 1);
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/Storage limit exceeded/);
+  });
+
+  it('boundary: monthly upload bytes exactly at limit is allowed', async () => {
+    // monthlyUploadLimitGB=1 → 1 GiB. currentMonthUpload=512MiB, incoming=512MiB → ok
+    const { user } = await createUser({ currentMonthUpload: 512 * 1024 * 1024, uploadUsageMonth: new Date().toISOString().slice(0, 7) });
+    await setConfig({ storageLimitGB: 5, monthlyUploadLimitGB: 1, monthlyUploadOpsLimit: 10 });
+    const res = await checkUploadQuota(user._id.toString(), 512 * 1024 * 1024);
+    expect(res.ok).toBe(true);
+  });
+
+  it('boundary: ops counter at limit-1 passes, at limit blocks', async () => {
+    const { user: under } = await createUser({ monthlyUploadOps: 9, uploadUsageMonth: new Date().toISOString().slice(0, 7) });
+    const { user: at } = await createUser({ monthlyUploadOps: 10, uploadUsageMonth: new Date().toISOString().slice(0, 7) });
+    await setConfig({ storageLimitGB: 5, monthlyUploadLimitGB: 10, monthlyUploadOpsLimit: 10 });
+    expect((await checkUploadQuota(under._id.toString(), 1024)).ok).toBe(true);
+    const blocked = await checkUploadQuota(at._id.toString(), 1024);
+    expect(blocked.ok).toBe(false);
+    expect(blocked.status).toBe(429);
+  });
+
+  it('sub-user: quota is enforced on the owner (parent) account counters', async () => {
+    const { user: parent } = await createUser({ monthlyUploadOps: 10, uploadUsageMonth: new Date().toISOString().slice(0, 7) });
+    const sub = await User.create({
+      email: `sub_${Date.now()}@test.com`,
+      password: 'x',
+      role: 'sub-user',
+      parentId: parent._id,
+    });
+    await setConfig({ storageLimitGB: 5, monthlyUploadLimitGB: 10, monthlyUploadOpsLimit: 10 });
+    // Quota checks always run against the OWNER id — parent's exhausted ops block the sub-user's upload too.
+    const res = await checkUploadQuota(parent._id.toString(), 1024);
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(429);
+    // And the sub-user's own (empty) counters are irrelevant — ownerId is what matters.
+    const subRes = await checkUploadQuota(sub._id.toString(), 1024);
+    expect(subRes.ok).toBe(true); // sub-user doc has no counters; enforcement happens via effectiveUserId upstream
+  });
 });
 
 describe('Quota utils — assignment', () => {

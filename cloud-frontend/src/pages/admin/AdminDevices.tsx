@@ -1,27 +1,68 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Select } from '../../components/ui/Select';
-import { Plus, Edit, Trash2, Wifi, WifiOff, Search, CheckCircle, XCircle } from 'lucide-react';
+import { Plus, Edit, Trash2, Search, CheckCircle, XCircle } from 'lucide-react';
 import { subscribeToDeviceUpdates } from '../../services/socket';
+import { DeviceStatusBadge } from '../../components/admin/DeviceStatusBadge';
+import { Pagination } from '../../components/admin/Pagination';
+import { ConfirmDialog } from '../../components/ui/ConfirmDialog';
+import { useToast } from '../../components/ui/Toast';
+import { SkeletonTable } from '../../components/ui/Skeleton';
+import { useUrlParam, useUrlNumberParam, useSortParam } from '../../hooks/useUrlParam';
+import { SortableTh } from '../../components/admin/SortableTh';
 
 export const AdminDevices = () => {
   const navigate = useNavigate();
-  const [filteredDevices, setFilteredDevices] = useState<any[]>([]);
-  const [users, setUsers] = useState<any[]>([]);
+  const queryClient = useQueryClient();
   const [showForm, setShowForm] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
-  const [userFilter, setUserFilter] = useState('all');
-  const [alertMessage, setAlertMessage] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
-  const [currentPage, setCurrentPage] = useState(1);
+  const [searchTerm, setSearchTerm] = useUrlParam('q');
+  const [searchInput, setSearchInput] = useState(searchTerm);
+  const [statusFilter, setStatusFilter] = useUrlParam('status', 'all');
+  const [userFilter, setUserFilter] = useUrlParam('user', 'all');
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkAssignUser, setBulkAssignUser] = useState('');
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const { success, error: toastError } = useToast();
+  const [currentPage, setCurrentPage] = useUrlNumberParam('page', 1);
+  const { sortBy, sortOrder, toggleSort } = useSortParam('updatedAt', 'desc');
   const devicesPerPage = 15;
-  const [totalDevices, setTotalDevices] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
+
+  const devicesQuery = useQuery({
+    queryKey: ['admin-devices', currentPage, searchTerm, statusFilter, userFilter, sortBy, sortOrder],
+    queryFn: async () => {
+      const params: any = { page: currentPage, limit: devicesPerPage };
+      if (statusFilter && statusFilter !== 'all') params.status = statusFilter;
+      if (userFilter && userFilter !== 'all') params.assignedUserId = userFilter;
+      if (searchTerm) params.search = searchTerm;
+      if (sortBy) { params.sortBy = sortBy; params.sortOrder = sortOrder; }
+      const response = await deviceAPI.getDevices(params);
+      return response.data;
+    },
+  });
+
+  const usersQuery = useQuery({
+    queryKey: ['admin-users-list'],
+    queryFn: async () => {
+      const response = await userAPI.getUsers({ page: 1, limit: 1000 });
+      const usersData = response.data.data || response.data;
+      return usersData.filter((user: any) => user.role !== 'sub-user' && !user.parentId);
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const filteredDevices = devicesQuery.data?.data || [];
+  const users = usersQuery.data || [];
+  const loading = devicesQuery.isLoading;
+  const totalDevices = devicesQuery.data?.total || 0;
+  const totalPages = devicesQuery.data?.totalPages || 0;
+  const loadDevices = () => queryClient.invalidateQueries({ queryKey: ['admin-devices'] });
 
   const [formData, setFormData] = useState({
     deviceId: '',
@@ -31,10 +72,22 @@ export const AdminDevices = () => {
     activated: false,
   });
 
+  // Debounce search input -> URL param (400ms)
   useEffect(() => {
-    loadDevices();
-    loadUsers();
-  }, [currentPage, searchTerm, statusFilter, userFilter]);
+    setSearchInput(searchTerm);
+  }, [searchTerm]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (searchInput !== searchTerm) setSearchTerm(searchInput);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, statusFilter, userFilter, sortBy, sortOrder]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -42,54 +95,14 @@ export const AdminDevices = () => {
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        void loadDevices();
+        void queryClient.invalidateQueries({ queryKey: ['admin-devices'] });
       }, 5000);
     });
     return () => {
       unsubscribe();
       if (timer) clearTimeout(timer);
     };
-  }, [currentPage, searchTerm, statusFilter, userFilter]);
-
-  const loadDevices = async () => {
-    try {
-      const params: any = {
-        page: currentPage,
-        limit: devicesPerPage
-      };
-
-      // Send filters to backend for server-side filtering
-      if (statusFilter && statusFilter !== 'all') {
-        params.status = statusFilter;
-      }
-      if (userFilter && userFilter !== 'all') {
-        params.assignedUserId = userFilter;
-      }
-      if (searchTerm) {
-        params.search = searchTerm;
-      }
-
-      const response = await deviceAPI.getDevices(params);
-      const devicesData = response.data.data || response.data;
-      setFilteredDevices(devicesData); // No client-side filtering needed
-      setTotalDevices(response.data.total || 0);
-      setTotalPages(response.data.totalPages || 0);
-    } catch (error) {
-      console.error('Failed to load devices:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadUsers = async () => {
-    try {
-      const response = await userAPI.getUsers({ page: 1, limit: 1000 });
-      const usersData = response.data.data || response.data;
-      setUsers(usersData.filter((user: any) => user.role !== 'sub-user' && !user.parentId));
-    } catch (error) {
-      console.error('Failed to load users:', error);
-    }
-  };
+  }, [queryClient]);
 
   // No client-side filtering - all filtering happens on server
   const paginatedDevices = filteredDevices;
@@ -97,8 +110,19 @@ export const AdminDevices = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    const trimmedId = formData.deviceId.trim();
+    const trimmedName = formData.name.trim();
+    if (!trimmedId) {
+      toastError('Device ID is required');
+      return;
+    }
+    if (!trimmedName) {
+      toastError('Device name is required');
+      return;
+    }
+
     try {
-      await deviceAPI.createDevice(formData);
+      await deviceAPI.createDevice({ ...formData, deviceId: trimmedId, name: trimmedName });
       setShowForm(false);
       setFormData({
         deviceId: '',
@@ -108,38 +132,106 @@ export const AdminDevices = () => {
         activated: false,
       });
       loadDevices();
-      setAlertMessage({ type: 'success', message: 'Device created successfully' });
-      setTimeout(() => setAlertMessage(null), 3000);
+      success('Device created successfully');
     } catch (error: any) {
       const errorMessage = error.response?.data?.error || 'Failed to create device';
-      setAlertMessage({ type: 'error', message: errorMessage });
-      setTimeout(() => setAlertMessage(null), 5000);
+      toastError(errorMessage);
     }
   };
 
-  const handleDelete = async (deviceId: string) => {
-    if (!confirm('Are you sure you want to delete this device?')) return;
+  // Clear selection when the visible page changes
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [currentPage]);
 
+  const toggleSelect = (deviceId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(deviceId)) next.delete(deviceId);
+      else next.add(deviceId);
+      return next;
+    });
+  };
+
+  const allPageSelected = paginatedDevices.length > 0 && paginatedDevices.every((d) => selectedIds.has(d.deviceId));
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      if (allPageSelected) {
+        const next = new Set(prev);
+        paginatedDevices.forEach((d) => next.delete(d.deviceId));
+        return next;
+      }
+      const next = new Set(prev);
+      paginatedDevices.forEach((d) => next.add(d.deviceId));
+      return next;
+    });
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    let ok = 0;
+    let fail = 0;
+    await Promise.all(
+      Array.from(selectedIds).map(async (id) => {
+        try {
+          await deviceAPI.deleteDevice(id);
+          ok++;
+        } catch {
+          fail++;
+        }
+      })
+    );
+    setBulkBusy(false);
+    setBulkDeleteOpen(false);
+    setSelectedIds(new Set());
+    loadDevices();
+    if (fail === 0) success(`${ok} device(s) deleted`);
+    else toastError(`Deleted ${ok}, failed ${fail}`);
+  };
+
+  const handleBulkAssign = async () => {
+    if (selectedIds.size === 0 || !bulkAssignUser) return;
+    setBulkBusy(true);
+    let ok = 0;
+    let fail = 0;
+    await Promise.all(
+      Array.from(selectedIds).map(async (id) => {
+        try {
+          await deviceAPI.updateDevice(id, { assignedUserId: bulkAssignUser });
+          ok++;
+        } catch {
+          fail++;
+        }
+      })
+    );
+    setBulkBusy(false);
+    setBulkAssignUser('');
+    setSelectedIds(new Set());
+    loadDevices();
+    if (fail === 0) success(`${ok} device(s) assigned`);
+    else toastError(`Assigned ${ok}, failed ${fail}`);
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
     try {
-      await deviceAPI.deleteDevice(deviceId);
+      await deviceAPI.deleteDevice(deleteTarget);
+      setDeleteTarget(null);
       loadDevices();
-      setAlertMessage({ type: 'success', message: 'Device deleted successfully' });
-      setTimeout(() => setAlertMessage(null), 3000);
+      success('Device deleted successfully');
     } catch (error) {
-      setAlertMessage({ type: 'error', message: 'Failed to delete device' });
-      setTimeout(() => setAlertMessage(null), 5000);
+      toastError('Failed to delete device');
     }
   };
 
   const toggleActivation = async (deviceId: string, currentStatus: boolean) => {
     try {
       await deviceAPI.updateDevice(deviceId, { activated: !currentStatus });
-      setAlertMessage({ type: 'success', message: `Device ${!currentStatus ? 'activated' : 'deactivated'} successfully` });
+      success(`Device ${!currentStatus ? 'activated' : 'deactivated'} successfully`);
       loadDevices();
-      setTimeout(() => setAlertMessage(null), 3000);
     } catch (error) {
-      setAlertMessage({ type: 'error', message: 'Failed to update device activation' });
-      setTimeout(() => setAlertMessage(null), 5000);
+      toastError('Failed to update device activation');
     }
   };
 
@@ -148,25 +240,64 @@ export const AdminDevices = () => {
     return user ? user.email : 'Unassigned';
   };
 
+  const renderStatusBadge = (device: any) => <DeviceStatusBadge displayStatus={device.displayStatus} />;
+
+  const renderActivationButton = (device: any) => (
+    <Button
+      size="sm"
+      variant={device.activated ? 'success' : 'danger'}
+      onClick={() => toggleActivation(device.deviceId, device.activated || false)}
+      className="text-[10px] px-2 py-1 whitespace-nowrap"
+    >
+      {device.activated ? (
+        <>
+          <CheckCircle className="w-2.5 h-2.5 mr-1" />
+          Active
+        </>
+      ) : (
+        <>
+          <XCircle className="w-2.5 h-2.5 mr-1" />
+          Activate
+        </>
+      )}
+    </Button>
+  );
+
+  const renderDeviceActions = (device: any) => (
+    <div className="flex gap-0.5">
+      <Button
+        size="sm"
+        variant="secondary"
+        onClick={() => navigate(`/admin/devices/${device.deviceId}/edit`)}
+        className="px-2 py-1 text-xs"
+      >
+        <Edit className="w-3 h-3" />
+      </Button>
+      <Button
+        size="sm"
+        variant="danger"
+        onClick={() => setDeleteTarget(device.deviceId)}
+        className="px-2 py-1 text-xs"
+      >
+        <Trash2 className="w-3 h-3" />
+      </Button>
+    </div>
+  );
+
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={10} cols={6} />
+      </div>
+    );
   }
 
   return (
-    <div className="p-2 sm:p-4 md:p-6 max-w-[95vw] sm:max-w-[1200px] mx-auto overflow-x-hidden">
-      {/* Alert Dialog */}
-      {alertMessage && (
-        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg ${
-          alertMessage.type === 'success' ? 'bg-green-500 text-white' : 'bg-red-500 text-white'
-        }`}>
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">{alertMessage.message}</span>
-          </div>
-        </div>
-      )}
+    <div className="p-1 sm:p-1.5 md:p-2 w-full">
+      {/* Alert Dialog removed — toasts via useToast */}
 
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 sm:mb-4 md:mb-6 gap-2 sm:gap-3 md:gap-4">
-        <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900">Devices</h1>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-2 sm:mb-3 gap-2">
+        <h1 className="text-lg sm:text-xl md:text-2xl font-bold text-gray-900">Devices</h1>
         <Button onClick={() => setShowForm(!showForm)} className="text-xs sm:text-sm w-full sm:w-auto">
           <Plus className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2" />
           Add Device
@@ -174,16 +305,16 @@ export const AdminDevices = () => {
       </div>
 
       {/* Search and Filter */}
-      <Card className="mb-2 sm:mb-3 md:mb-4">
-        <CardContent className="p-2 sm:p-3">
+      <Card className="mb-2">
+        <CardContent className="p-2">
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 sm:gap-3">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
               <Input
                 label="Search"
                 placeholder="Search devices..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
                 className="pl-10 text-xs sm:text-sm"
               />
             </div>
@@ -212,7 +343,7 @@ export const AdminDevices = () => {
       </Card>
 
       {showForm && (
-        <Card className="mb-2 sm:mb-3 md:mb-4">
+        <Card className="mb-2">
           <CardHeader>
             <CardTitle className="text-[10px] sm:text-xs md:text-sm">Add New Device</CardTitle>
           </CardHeader>
@@ -265,99 +396,148 @@ export const AdminDevices = () => {
         </Card>
       )}
 
+      {/* Bulk actions bar */}
+      {selectedIds.size > 0 && (
+        <Card className="mb-2 border-blue-200 bg-blue-50">
+          <CardContent className="p-2 flex flex-wrap items-center gap-2">
+            <span className="text-xs sm:text-sm font-medium text-blue-800">
+              {selectedIds.size} selected
+            </span>
+            <Select
+              options={[
+                { value: '', label: 'Assign to user...' },
+                ...users.map((u) => ({ value: u._id, label: u.email })),
+              ]}
+              value={bulkAssignUser}
+              onChange={(e) => setBulkAssignUser(e.target.value)}
+              className="w-40 text-xs sm:text-sm"
+            />
+            <Button
+              size="sm"
+              onClick={handleBulkAssign}
+              disabled={!bulkAssignUser || bulkBusy}
+              className="text-xs sm:text-sm"
+            >
+              Assign
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              onClick={() => setBulkDeleteOpen(true)}
+              disabled={bulkBusy}
+              className="text-xs sm:text-sm"
+            >
+              <Trash2 className="w-3 h-3 mr-1" />
+              Delete
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setSelectedIds(new Set())}
+              disabled={bulkBusy}
+              className="text-xs sm:text-sm"
+            >
+              Clear
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Devices Table */}
       <Card>
         <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs sm:text-sm">
+          {/* Mobile / tablet: card list — no horizontal scroll */}
+          <div className="lg:hidden divide-y divide-gray-200">
+            {paginatedDevices.map((device) => (
+              <div key={device.deviceId} className="p-3 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start gap-2 min-w-0">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(device.deviceId)}
+                      onChange={() => toggleSelect(device.deviceId)}
+                      className="mt-1 w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-gray-900 truncate" title={device.name}>{device.name}</div>
+                      <div className="text-[11px] text-gray-500 truncate" title={device.deviceId}>{device.deviceId}</div>
+                    </div>
+                  </div>
+                  {renderStatusBadge(device)}
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-gray-700">
+                  <div className="truncate"><span className="text-gray-500">Location:</span> {device.location || '—'}</div>
+                  <div className="truncate"><span className="text-gray-500">Assigned:</span> {getUserName(device.assignedUserId)}</div>
+                  <div><span className="text-gray-500">Version:</span> {device.appVersion || '—'}</div>
+                  <div className="truncate"><span className="text-gray-500">Last Seen:</span> {device.lastSeen ? new Date(device.lastSeen).toLocaleString() : '—'}</div>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  {renderActivationButton(device)}
+                  {renderDeviceActions(device)}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Desktop: compact full-width table — all columns visible, no horizontal scroll */}
+          <div className="hidden lg:block">
+            <table className="w-full table-fixed text-[11px]">
+              <colgroup>
+                <col className="w-[4%]" />
+                <col className="w-[19%]" />
+                <col className="w-[10%]" />
+                <col className="w-[12%]" />
+                <col className="w-[14%]" />
+                <col className="w-[16%]" />
+                <col className="w-[8%]" />
+                <col className="w-[12%]" />
+                <col className="w-[8%]" />
+              </colgroup>
               <thead className="bg-gray-50 border-b">
                 <tr>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Device</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Activation</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Assigned To</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Version</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Last Seen</th>
-                  <th className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 text-left text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                  <th className="px-2 py-2 text-left">
+                    <input
+                      type="checkbox"
+                      checked={allPageSelected}
+                      onChange={toggleSelectAll}
+                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                  </th>
+                  <SortableTh label="Device" field="name" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <SortableTh label="Status" field="status" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Activation</th>
+                  <SortableTh label="Location" field="location" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Assigned To</th>
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Version</th>
+                  <SortableTh label="Last Seen" field="lastSeen" sortBy={sortBy} sortOrder={sortOrder} onSort={toggleSort} className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider" />
+                  <th className="px-2 py-2 text-left text-[10px] font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {paginatedDevices.map((device) => (
                   <tr key={device.deviceId} className="hover:bg-gray-50">
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap">
-                      <div>
-                        <div className="text-xs sm:text-sm font-medium text-gray-900">{device.name}</div>
-                        <div className="text-[10px] sm:text-xs text-gray-500">{device.deviceId}</div>
-                      </div>
+                    <td className="px-2 py-2 whitespace-nowrap">
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(device.deviceId)}
+                        onChange={() => toggleSelect(device.deviceId)}
+                        className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap">
-                      {device.displayStatus === 'online' ? (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-green-100 text-green-800">
-                          <Wifi className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          Online
-                        </span>
-                      ) : device.displayStatus === '30D+' ? (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-orange-100 text-orange-800">
-                          <WifiOff className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          30D+
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-xs font-medium bg-red-100 text-red-800">
-                          <WifiOff className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                          Offline
-                        </span>
-                      )}
+                    <td className="px-2 py-2 whitespace-nowrap">
+                      <div className="text-xs font-medium text-gray-900 truncate" title={device.name}>{device.name}</div>
+                      <div className="text-[10px] text-gray-500 truncate" title={device.deviceId}>{device.deviceId}</div>
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap">
-                      <Button
-                        size="sm"
-                        variant={device.activated ? 'success' : 'danger'}
-                        onClick={() => toggleActivation(device.deviceId, device.activated || false)}
-                        className="text-[10px] sm:text-xs px-2 py-1"
-                      >
-                        {device.activated ? (
-                          <>
-                            <CheckCircle className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                            Active
-                          </>
-                        ) : (
-                          <>
-                            <XCircle className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-1" />
-                            Activate
-                          </>
-                        )}
-                      </Button>
+                    <td className="px-2 py-2 whitespace-nowrap">{renderStatusBadge(device)}</td>
+                    <td className="px-2 py-2 whitespace-nowrap">{renderActivationButton(device)}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={device.location || ''}>{device.location || '—'}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={getUserName(device.assignedUserId)}>{getUserName(device.assignedUserId)}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-900 truncate" title={device.appVersion || ''}>{device.appVersion || '—'}</td>
+                    <td className="px-2 py-2 whitespace-nowrap text-gray-500 truncate" title={device.lastSeen ? new Date(device.lastSeen).toLocaleString() : ''}>
+                      {device.lastSeen ? new Date(device.lastSeen).toLocaleString() : '—'}
                     </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
-                      {device.location || '-'}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
-                      {getUserName(device.assignedUserId)}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-900">
-                      {device.appVersion || '-'}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm text-gray-500">
-                      {new Date(device.lastSeen).toLocaleString()}
-                    </td>
-                    <td className="px-3 sm:px-4 md:px-6 py-2 sm:py-3 sm:py-4 whitespace-nowrap text-xs sm:text-sm font-medium">
-                      <div className="flex gap-1 sm:gap-2">
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => navigate(`/admin/devices/${device.deviceId}/edit`)}
-                        >
-                          <Edit className="w-3 h-3 sm:w-4 sm:h-4" />
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          onClick={() => handleDelete(device.deviceId)}
-                        >
-                          <Trash2 className="w-3 h-3 sm:w-4 sm:h-4" />
-                        </Button>
-                      </div>
+                    <td className="px-1.5 py-1.5 whitespace-nowrap font-medium">
+                      {renderDeviceActions(device)}
                     </td>
                   </tr>
                 ))}
@@ -369,38 +549,36 @@ export const AdminDevices = () => {
               No devices found.
             </div>
           )}
-          {totalPages > 1 && (
-            <div className="flex items-center justify-between px-3 sm:px-4 md:px-6 py-3 sm:py-4 border-t">
-              <div className="text-xs sm:text-sm text-gray-600">
-                Showing {(currentPage - 1) * devicesPerPage + 1} to {Math.min(currentPage * devicesPerPage, totalDevices)} of {totalDevices} devices
-              </div>
-              <div className="flex gap-1 sm:gap-2">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
-                  disabled={currentPage === 1}
-                  className="text-xs sm:text-sm"
-                >
-                  Previous
-                </Button>
-                <span className="text-xs sm:text-sm text-gray-600 flex items-center">
-                  Page {currentPage} of {totalPages}
-                </span>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
-                  disabled={currentPage === totalPages}
-                  className="text-xs sm:text-sm"
-                >
-                  Next
-                </Button>
-              </div>
-            </div>
-          )}
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            total={totalDevices}
+            perPage={devicesPerPage}
+            onPageChange={setCurrentPage}
+            itemLabel="devices"
+          />
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={!!deleteTarget}
+        title="Delete Device"
+        message="Are you sure you want to delete this device? This cannot be undone."
+        confirmLabel="Delete"
+        danger
+        onConfirm={handleDelete}
+        onCancel={() => setDeleteTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title="Delete Selected Devices"
+        message={`Delete ${selectedIds.size} selected device(s)? This cannot be undone.`}
+        confirmLabel={bulkBusy ? 'Deleting...' : 'Delete'}
+        danger
+        onConfirm={handleBulkDelete}
+        onCancel={() => setBulkDeleteOpen(false)}
+      />
     </div>
   );
 };

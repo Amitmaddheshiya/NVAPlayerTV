@@ -30,19 +30,24 @@ export const fileAccessAuth = async (req: Request, res: Response, next: NextFunc
     }
 
     // Find media by path — cached (path index is hot: every range request).
-    // Only uploadedBy is needed downstream; the lookup key is the doc path.
+    // uploadedBy gates user access; storageType routes delivery (local vs S3/CDN).
     let mediaUploadedBy: string | undefined;
+    let mediaStorageType: string | undefined;
     const cachedMedia = await getCachedMediaAuth(filePath);
     if (cachedMedia) {
       mediaUploadedBy = cachedMedia.uploadedBy || undefined;
+      mediaStorageType = cachedMedia.storageType || undefined;
     } else {
-      const media = await Media.findOne({ path: filePath }).select('path uploadedBy');
+      const media = await Media.findOne({ path: filePath }).select('path uploadedBy storageType');
       if (!media) {
         return res.status(404).json({ error: 'File not found' });
       }
       mediaUploadedBy = media.uploadedBy?.toString();
-      await setCachedMediaAuth(filePath, mediaUploadedBy);
+      mediaStorageType = media.storageType || undefined;
+      await setCachedMediaAuth(filePath, mediaUploadedBy, mediaStorageType);
     }
+    (req as any).mediaFilePath = filePath;
+    (req as any).mediaStorageType = mediaStorageType;
 
     // The native TV video component cannot attach HTTP headers to range
     // requests, so Cloud playback may carry its short-lived device JWT in the

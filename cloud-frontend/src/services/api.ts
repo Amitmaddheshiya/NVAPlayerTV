@@ -58,7 +58,7 @@ export const authAPI = {
 
 // Devices
 export const deviceAPI = {
-  getDevices: (params?: { status?: string; group?: string; page?: number; limit?: number; assignedUserId?: string; search?: string }) =>
+  getDevices: (params?: { status?: string; group?: string; page?: number; limit?: number; assignedUserId?: string; excludeAssignedUserId?: string; search?: string }) =>
     api.get('/devices', { params }),
   getDevice: (id: string) => api.get(`/devices/${id}`),
   getDeviceMedia: (id: string) => api.get(`/devices/${id}/media`),
@@ -224,9 +224,9 @@ export const mediaAPI = {
       },
     });
   },
-  getMedia: (params?: { section?: number; deviceId?: string; page?: number; limit?: number; search?: string; folder?: string; type?: string }) =>
+  getMedia: (params?: { section?: number; deviceId?: string; page?: number; limit?: number; search?: string; folder?: string; type?: string; uploadedBy?: string }) =>
     api.get('/media', { params }),
-  getFolders: () => api.get('/media/folders'),
+  getFolders: (params?: { uploadedBy?: string }) => api.get('/media/folders', { params }),
   deleteMedia: (id: string) => api.delete(`/media/${id}`),
   assignMedia: (id: string, deviceIds: string[], section?: number) =>
     api.post(`/media/${id}/assign`, { deviceIds, section }),

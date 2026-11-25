@@ -194,6 +194,14 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
           res.status(400).json({ error: `Storage limit exceeded. Your library limit is ${config.storageLimitGB} GB.` });
           return;
         }
+        // Early ops-count check: if the monthly upload-op limit is already
+        // reached, reject before any chunk bytes are transferred.
+        const opsLimit = Number(config.monthlyUploadOpsLimit || 10);
+        const usedOps = user.uploadUsageMonth === month ? Number(user.monthlyUploadOps || 0) : 0;
+        if (usedOps >= opsLimit) {
+          res.status(429).json({ error: `Monthly upload limit reached (${opsLimit} uploads/month). This resets at the start of next month.` });
+          return;
+        }
       }
     }
 

@@ -1,165 +1,150 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Select } from '../../components/ui/Select';
-import { ArrowLeft, Monitor, Plus, Trash2, Wifi, WifiOff, Search } from 'lucide-react';
+import { ArrowLeft, Monitor, Plus, Trash2, Search } from 'lucide-react';
+import { DeviceStatusBadge } from '../../components/admin/DeviceStatusBadge';
+import { Pagination } from '../../components/admin/Pagination';
+import { useToast } from '../../components/ui/Toast';
+import { SkeletonTable } from '../../components/ui/Skeleton';
+import { useUrlParam, useUrlNumberParam } from '../../hooks/useUrlParam';
 
 export const AdminUserDevices = () => {
   const { userId } = useParams<{ userId: string }>();
   const navigate = useNavigate();
   
-  const [user, setUser] = useState<any>(null);
-  const [assignedDevices, setAssignedDevices] = useState<any[]>([]);
-  const [allDevices, setAllDevices] = useState<any[]>([]);
-  const [filteredAllDevices, setFilteredAllDevices] = useState<any[]>([]);
-  
-  const [loading, setLoading] = useState(true);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
-  
+  const queryClient = useQueryClient();
+  const [searchTerm, setSearchTerm] = useUrlParam('q');
+  const [searchInput, setSearchInput] = useState(searchTerm);
+  const [statusFilter, setStatusFilter] = useUrlParam('status', 'all');
+
   // Pagination for assigned devices
-  const [assignedPage, setAssignedPage] = useState(1);
+  const [assignedPage, setAssignedPage] = useUrlNumberParam('apage', 1);
   const assignedPerPage = 10;
-  
-  // Pagination for all devices
-  const [allDevicesPage, setAllDevicesPage] = useState(1);
+
+  // Pagination for available devices
+  const [allDevicesPage, setAllDevicesPage] = useUrlNumberParam('vpage', 1);
   const allDevicesPerPage = 10;
-  
-  const [alertMessage, setAlertMessage] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const { success, error: toastError } = useToast();
+
+  const userQuery = useQuery({
+    queryKey: ['admin-user', userId],
+    queryFn: async () => {
+      const response = await userAPI.getUser(userId);
+      return response.data;
+    },
+    enabled: !!userId,
+  });
+
+  const assignedQuery = useQuery({
+    queryKey: ['admin-user-devices-assigned', userId, assignedPage],
+    queryFn: async () => {
+      const response = await deviceAPI.getDevices({ page: assignedPage, limit: assignedPerPage, assignedUserId: userId });
+      return response.data;
+    },
+    enabled: !!userId,
+  });
+
+  const availableQuery = useQuery({
+    queryKey: ['admin-user-devices-available', userId, allDevicesPage, searchTerm, statusFilter],
+    queryFn: async () => {
+      const response = await deviceAPI.getDevices({
+        page: allDevicesPage,
+        limit: allDevicesPerPage,
+        excludeAssignedUserId: userId,
+        search: searchTerm || undefined,
+        status: statusFilter !== 'all' ? statusFilter : undefined,
+      });
+      return response.data;
+    },
+    enabled: !!userId,
+  });
+
+  const user = userQuery.data || null;
+  const assignedDevices = assignedQuery.data?.data || [];
+  const availableDevices = availableQuery.data?.data || [];
+  const assignedTotal = assignedQuery.data?.total || 0;
+  const availableTotal = availableQuery.data?.total || 0;
+  const assignedTotalPages = assignedQuery.data?.totalPages || 1;
+  const availableTotalPages = availableQuery.data?.totalPages || 1;
+  const loading = assignedQuery.isLoading || userQuery.isLoading;
   const isSubUser = !!user && (user.role === 'sub-user' || !!user.parentId);
   const canAssignDevices = !!user && !isSubUser;
 
+  const reloadBoth = () => {
+    queryClient.invalidateQueries({ queryKey: ['admin-user-devices-assigned', userId] });
+    queryClient.invalidateQueries({ queryKey: ['admin-user-devices-available', userId] });
+  };
+
+  // Debounce search input -> URL param (400ms)
   useEffect(() => {
-    if (userId) {
-      loadUser();
-      loadAssignedDevices();
-      loadAllDevices();
-    }
-  }, [userId]);
+    setSearchInput(searchTerm);
+  }, [searchTerm]);
 
   useEffect(() => {
-    filterAllDevices();
-  }, [allDevices, searchTerm, statusFilter]);
+    const timer = setTimeout(() => {
+      if (searchInput !== searchTerm) setSearchTerm(searchInput);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
 
-  const loadUser = async () => {
-    try {
-      const response = await userAPI.getUser(userId);
-      setUser(response.data);
-    } catch (error) {
-      console.error('Failed to load user:', error);
-    }
-  };
-
-  const loadAssignedDevices = async () => {
-    try {
-      const response = await deviceAPI.getDevices({ page: 1, limit: 1000, assignedUserId: userId });
-      setAssignedDevices(response.data.data || response.data);
-    } catch (error) {
-      console.error('Failed to load assigned devices:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadAllDevices = async () => {
-    try {
-      const response = await deviceAPI.getDevices({ page: 1, limit: 1000 });
-      setAllDevices(response.data.data || response.data);
-    } catch (error) {
-      console.error('Failed to load all devices:', error);
-    }
-  };
-
-  const filterAllDevices = () => {
-    let filtered = [...allDevices];
-
-    // Search filter
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase();
-      filtered = filtered.filter(
-        (d) =>
-          d.name.toLowerCase().includes(term) ||
-          d.deviceId.toLowerCase().includes(term) ||
-          (d.location && d.location.toLowerCase().includes(term))
-      );
-    }
-
-    // Status filter
-    if (statusFilter !== 'all') {
-      filtered = filtered.filter((d) => d.status === statusFilter);
-    }
-
-    // Exclude already assigned devices from the list
-    const assignedIds = assignedDevices.map(d => d.deviceId);
-    filtered = filtered.filter(d => !assignedIds.includes(d.deviceId));
-
-    setFilteredAllDevices(filtered);
-  };
+  // Reset available-devices page when filters change
+  useEffect(() => {
+    setAllDevicesPage(1);
+  }, [searchTerm, statusFilter]);
 
   const handleAssign = async (deviceId: string) => {
     if (!canAssignDevices) {
-      setAlertMessage({ type: 'error', message: 'Devices can only be assigned to the parent account, not a sub-user.' });
+      toastError('Devices can only be assigned to the parent account, not a sub-user.');
       return;
     }
     try {
       await deviceAPI.updateDevice(deviceId, { assignedUserId: userId });
-      setAlertMessage({ type: 'success', message: 'Device assigned successfully' });
-      setTimeout(() => setAlertMessage(null), 3000);
-      loadAssignedDevices();
-      loadAllDevices();
+      success('Device assigned successfully');
+      reloadBoth();
     } catch (error: any) {
       const errorMessage = error.response?.data?.error || 'Failed to assign device';
-      setAlertMessage({ type: 'error', message: errorMessage });
-      setTimeout(() => setAlertMessage(null), 5000);
+      toastError(errorMessage);
     }
   };
 
   const handleUnassign = async (deviceId: string) => {
     try {
       await deviceAPI.updateDevice(deviceId, { assignedUserId: '' });
-      setAlertMessage({ type: 'success', message: 'Device unassigned successfully' });
-      setTimeout(() => setAlertMessage(null), 3000);
-      loadAssignedDevices();
-      loadAllDevices();
+      success('Device unassigned successfully');
+      reloadBoth();
     } catch (error: any) {
       const errorMessage = error.response?.data?.error || 'Failed to unassign device';
-      setAlertMessage({ type: 'error', message: errorMessage });
-      setTimeout(() => setAlertMessage(null), 5000);
+      toastError(errorMessage);
     }
   };
 
-  // Pagination for assigned devices
-  const paginatedAssigned = assignedDevices.slice(
-    (assignedPage - 1) * assignedPerPage,
-    assignedPage * assignedPerPage
-  );
-  const assignedTotalPages = Math.ceil(assignedDevices.length / assignedPerPage);
-
-  // Pagination for all devices
-  const paginatedAllDevices = filteredAllDevices.slice(
-    (allDevicesPage - 1) * allDevicesPerPage,
-    allDevicesPage * allDevicesPerPage
-  );
-  const allDevicesTotalPages = Math.ceil(filteredAllDevices.length / allDevicesPerPage);
+  const renderStatusBadge = (device: any) => <DeviceStatusBadge displayStatus={device.displayStatus} />;
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={8} cols={5} />
+      </div>
+    );
   }
 
   return (
-    <div className="p-4 md:p-6 max-w-[95vw] sm:max-w-[1400px] mx-auto">
+    <div className="p-1 sm:p-1.5 md:p-2 w-full">
       {/* Header */}
-      <div className="flex items-center gap-4 mb-6">
-        <Button variant="secondary" onClick={() => navigate('/admin/users')}>
-          <ArrowLeft className="w-4 h-4 mr-2" />
+      <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-3 sm:mb-4">
+        <Button variant="secondary" onClick={() => navigate('/admin/users')} className="text-xs sm:text-sm w-full sm:w-auto">
+          <ArrowLeft className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2" />
           Back to Users
         </Button>
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold text-gray-900">Device Assignment</h1>
-          <p className="text-sm text-gray-600">
+        <div className="min-w-0">
+          <h1 className="text-lg sm:text-xl md:text-2xl font-bold text-gray-900">Device Assignment</h1>
+          <p className="text-xs sm:text-sm text-gray-600 truncate">
             {user?.email} · {isSubUser ? 'Sub-user' : `${assignedDevices.length} devices assigned`}
           </p>
         </div>
@@ -171,25 +156,14 @@ export const AdminUserDevices = () => {
         </div>
       )}
 
-      {/* Alert Message */}
-      {alertMessage && (
-        <div
-          className={`mb-4 p-4 rounded-lg ${
-            alertMessage.type === 'success' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-          }`}
-        >
-          {alertMessage.message}
-        </div>
-      )}
-
       {/* Two Column Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 lg:gap-4">
         {/* Left Column - Assigned Devices */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Monitor className="w-5 h-5" />
-              Assigned Devices ({assignedDevices.length})
+              Assigned Devices ({assignedTotal})
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -201,7 +175,7 @@ export const AdminUserDevices = () => {
             ) : (
               <>
                 <div className="space-y-2 max-h-[600px] overflow-y-auto">
-                  {paginatedAssigned.map((device) => (
+                  {assignedDevices.map((device) => (
                     <div
                       key={device.deviceId}
                       className="flex items-center justify-between p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition"
@@ -209,31 +183,16 @@ export const AdminUserDevices = () => {
                       <div className="flex-1 min-w-0">
                         <div className="font-medium text-sm text-gray-900 truncate">{device.name}</div>
                         <div className="text-xs text-gray-500">{device.deviceId}</div>
-                        <div className="flex items-center gap-2 mt-1">
-                          {device.displayStatus === 'online' ? (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-800">
-                              <Wifi className="w-2.5 h-2.5 mr-1" />
-                              Online
-                            </span>
-                          ) : device.displayStatus === '30D+' ? (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-100 text-orange-800">
-                              <WifiOff className="w-2.5 h-2.5 mr-1" />
-                              30D+
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-800">
-                              <WifiOff className="w-2.5 h-2.5 mr-1" />
-                              Offline
-                            </span>
-                          )}
-                          <span className="text-[10px] text-gray-500">{device.location || '-'}</span>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          {renderStatusBadge(device)}
+                          <span className="text-[10px] text-gray-500 truncate">{device.location || '-'}</span>
                         </div>
                       </div>
                       <Button
                         size="sm"
                         variant="danger"
                         onClick={() => handleUnassign(device.deviceId)}
-                        className="ml-2"
+                        className="ml-2 shrink-0 px-2 py-1"
                       >
                         <Trash2 className="w-3 h-3" />
                       </Button>
@@ -242,34 +201,13 @@ export const AdminUserDevices = () => {
                 </div>
 
                 {/* Pagination for Assigned Devices */}
-                {assignedDevices.length > assignedPerPage && (
-                  <div className="flex items-center justify-between mt-4 pt-4 border-t">
-                    <div className="text-xs text-gray-600">
-                      Showing {(assignedPage - 1) * assignedPerPage + 1} to {Math.min(assignedPage * assignedPerPage, assignedDevices.length)} of {assignedDevices.length}
-                    </div>
-                    <div className="flex gap-1">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setAssignedPage((prev) => Math.max(1, prev - 1))}
-                        disabled={assignedPage === 1}
-                      >
-                        Previous
-                      </Button>
-                      <span className="text-xs text-gray-600 flex items-center px-2">
-                        {assignedPage} / {assignedTotalPages}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setAssignedPage((prev) => Math.min(assignedTotalPages, prev + 1))}
-                        disabled={assignedPage === assignedTotalPages}
-                      >
-                        Next
-                      </Button>
-                    </div>
-                  </div>
-                )}
+                <Pagination
+                  currentPage={assignedPage}
+                  totalPages={assignedTotalPages}
+                  total={assignedTotal}
+                  perPage={assignedPerPage}
+                  onPageChange={setAssignedPage}
+                />
               </>
             )}
           </CardContent>
@@ -280,7 +218,7 @@ export const AdminUserDevices = () => {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Plus className="w-5 h-5" />
-              Available Devices ({filteredAllDevices.length})
+              Available Devices ({availableTotal})
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -290,8 +228,8 @@ export const AdminUserDevices = () => {
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
                 <Input
                   placeholder="Search devices..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
                   className="pl-10 text-sm"
                 />
               </div>
@@ -308,7 +246,7 @@ export const AdminUserDevices = () => {
               />
             </div>
 
-            {filteredAllDevices.length === 0 ? (
+            {availableDevices.length === 0 ? (
               <div className="text-center py-8 text-gray-500">
                 <Monitor className="w-12 h-12 mx-auto mb-2 text-gray-400" />
                 <p>No available devices found</p>
@@ -316,7 +254,7 @@ export const AdminUserDevices = () => {
             ) : (
               <>
                 <div className="space-y-2 max-h-[500px] overflow-y-auto">
-                  {paginatedAllDevices.map((device) => (
+                  {availableDevices.map((device) => (
                     <div
                       key={device.deviceId}
                       className="flex items-center justify-between p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition"
@@ -324,24 +262,9 @@ export const AdminUserDevices = () => {
                       <div className="flex-1 min-w-0">
                         <div className="font-medium text-sm text-gray-900 truncate">{device.name}</div>
                         <div className="text-xs text-gray-500">{device.deviceId}</div>
-                        <div className="flex items-center gap-2 mt-1">
-                          {device.displayStatus === 'online' ? (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-800">
-                              <Wifi className="w-2.5 h-2.5 mr-1" />
-                              Online
-                            </span>
-                          ) : device.displayStatus === '30D+' ? (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-100 text-orange-800">
-                              <WifiOff className="w-2.5 h-2.5 mr-1" />
-                              30D+
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-800">
-                              <WifiOff className="w-2.5 h-2.5 mr-1" />
-                              Offline
-                            </span>
-                          )}
-                          <span className="text-[10px] text-gray-500">{device.location || '-'}</span>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          {renderStatusBadge(device)}
+                          <span className="text-[10px] text-gray-500 truncate">{device.location || '-'}</span>
                         </div>
                       </div>
                       {canAssignDevices && (
@@ -349,7 +272,7 @@ export const AdminUserDevices = () => {
                           size="sm"
                           variant="primary"
                           onClick={() => handleAssign(device.deviceId)}
-                          className="ml-2"
+                          className="ml-2 shrink-0 px-2 py-1"
                         >
                           <Plus className="w-3 h-3 mr-1" />
                           Assign
@@ -359,35 +282,14 @@ export const AdminUserDevices = () => {
                   ))}
                 </div>
 
-                {/* Pagination for All Devices */}
-                {filteredAllDevices.length > allDevicesPerPage && (
-                  <div className="flex items-center justify-between mt-4 pt-4 border-t">
-                    <div className="text-xs text-gray-600">
-                      Showing {(allDevicesPage - 1) * allDevicesPerPage + 1} to {Math.min(allDevicesPage * allDevicesPerPage, filteredAllDevices.length)} of {filteredAllDevices.length}
-                    </div>
-                    <div className="flex gap-1">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setAllDevicesPage((prev) => Math.max(1, prev - 1))}
-                        disabled={allDevicesPage === 1}
-                      >
-                        Previous
-                      </Button>
-                      <span className="text-xs text-gray-600 flex items-center px-2">
-                        {allDevicesPage} / {allDevicesTotalPages}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setAllDevicesPage((prev) => Math.min(allDevicesTotalPages, prev + 1))}
-                        disabled={allDevicesPage === allDevicesTotalPages}
-                      >
-                        Next
-                      </Button>
-                    </div>
-                  </div>
-                )}
+                {/* Pagination for Available Devices */}
+                <Pagination
+                  currentPage={allDevicesPage}
+                  totalPages={availableTotalPages}
+                  total={availableTotal}
+                  perPage={allDevicesPerPage}
+                  onPageChange={setAllDevicesPage}
+                />
               </>
             )}
           </CardContent>

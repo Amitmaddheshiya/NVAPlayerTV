@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
@@ -7,6 +8,7 @@ import { User, Mail, Phone, Building, Lock, Save, Shield, Clock, HardDrive } fro
 import { userAPI } from '../../services/api';
 
 export const UserSettings = () => {
+  const queryClient = useQueryClient();
   const [user, setUser] = useState(() => JSON.parse(localStorage.getItem('user') || '{}'));
   const [formData, setFormData] = useState({
     email: user.email || '',
@@ -31,15 +33,21 @@ export const UserSettings = () => {
 
   // localStorage 'user' (set at login) does not contain assignedDevices,
   // so fetch the fresh profile which includes device counts.
+  const meQuery = useQuery({
+    queryKey: ['user-me-settings'],
+    queryFn: async () => {
+      const res = await userAPI.getMe();
+      return res.data;
+    },
+  });
+
   useEffect(() => {
-    userAPI.getMe()
-      .then((res) => {
-        const fresh = res.data;
-        setUser((prev: any) => ({ ...prev, ...fresh }));
-        localStorage.setItem('user', JSON.stringify({ ...JSON.parse(localStorage.getItem('user') || '{}'), ...fresh }));
-      })
-      .catch(() => { /* keep localStorage fallback */ });
-  }, []);
+    if (meQuery.data) {
+      const fresh = meQuery.data;
+      setUser((prev: any) => ({ ...prev, ...fresh }));
+      localStorage.setItem('user', JSON.stringify({ ...JSON.parse(localStorage.getItem('user') || '{}'), ...fresh }));
+    }
+  }, [meQuery.data]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -52,6 +60,8 @@ export const UserSettings = () => {
       // Update localStorage with new user data
       localStorage.setItem('user', JSON.stringify(response.data));
       setUser(response.data);
+      queryClient.invalidateQueries({ queryKey: ['user-me-settings'] });
+      queryClient.invalidateQueries({ queryKey: ['user-dashboard-stats'] });
 
       setAlertState({
         isOpen: true,

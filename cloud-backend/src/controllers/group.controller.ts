@@ -150,6 +150,18 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
     await cacheDelPattern('groups:*');
     await cacheDelPattern('devices:*');
 
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'create_group',
+        targetType: 'group',
+        targetId: String(group._id),
+        details: { name: group.name, deviceCount: (group.devices || []).length },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
+
     res.status(201).json(group);
   } catch (error) {
     console.error('Create group error:', error);
@@ -182,6 +194,7 @@ export const updateGroup = async (req: AuthRequest, res: Response): Promise<void
       }
       group.ownerId = new mongoose.Types.ObjectId(ownerId);
     }
+    const previousName = group.name;
     if (name !== undefined) group.name = String(name).trim();
     const previousDevices = devices !== undefined ? [...(group.devices || [])] : null;
     if (devices !== undefined) group.devices = devices;
@@ -193,6 +206,22 @@ export const updateGroup = async (req: AuthRequest, res: Response): Promise<void
     // Invalidate group cache on update
     await cacheDelPattern('groups:*');
     await cacheDelPattern('devices:*');
+
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'update_group',
+        targetType: 'group',
+        targetId: req.params.id,
+        details: {
+          name: group.name,
+          ...(name !== undefined ? { previousName } : {}),
+          deviceCount: (group.devices || []).length,
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
 
     res.json(group);
   } catch (error) {
@@ -225,6 +254,18 @@ export const deleteGroup = async (req: AuthRequest, res: Response): Promise<void
     // Invalidate group cache on delete
     await cacheDelPattern('groups:*');
     await cacheDelPattern('devices:*');
+
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'delete_group',
+        targetType: 'group',
+        targetId: req.params.id,
+        details: { name: group.name, deviceCount: affectedDeviceIds.length },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
 
     res.json({ success: true });
   } catch (error) {

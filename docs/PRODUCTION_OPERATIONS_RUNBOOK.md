@@ -67,12 +67,13 @@ Post-deploy smoke test:
 ### Add admin user
 - `TEST_ADMIN_*` env (dev only) or create via admin UI / `db.users.insertOne` with bcrypt hash.
 
-## Scaling triggers
+## Scaling triggers (locked setup: single EC2 t3.small + Atlas M0 + S3/CloudFront)
 
-- CPU sustained > 70% → add instance (after socket adapter + S3 done).
-- MongoDB ops/sec approaching limits → review indexes, then evaluate read replicas.
-- Media egress high → move to CloudFront (planned).
-- Device count > 100k → re-evaluate socket strategy (SOCKET_SCALING.md).
+- EC2 CPU/mem sustained > 70% → resize t3.small → t3.medium (zero code).
+- Atlas M0 storage approaching 400MB or slow queries → upgrade to M10.
+- Device count > ~200–500 or need HA → multi-node path: ALB + Redis socket
+  adapter + 2nd EC2 (`SOCKET_SCALING.md`, `AWS_DEPLOYMENT_GUIDE.md` Phase C).
+- Media egress → already on CloudFront; watch cost (~$0.1/GB), no action needed.
 
 ## Contacts / escalation
 

@@ -58,6 +58,12 @@ Status values: `NOT STARTED`, `IN PROGRESS`, `IMPLEMENTED`, `TESTED`, `VERIFIED`
 | 29 | Socket.IO multi-node readiness doc (sticky sessions + Redis adapter) | PHASE 1 item 3 / PHASE 5 | IMPLEMENTED — `docs/SOCKET_SCALING.md`: current single-node limits, required changes (sticky sessions, `@socket.io/redis-adapter`, revoke verification), checklist |
 | 30 | NEW: `assignedDevices` completeness — include `config.mediaUrls` + `config.schedule.profiles` media in updateConfig/configureGroup syncs; extend `deleteMedia` scan to schedule profiles; backfill script for existing data | PHASE 2 item 2 | IMPLEMENTED — `getConfiguredMediaUrls` helper; updateConfig + configureGroup (per-device sets) syncs complete; deleteMedia covers schedule profiles + ScheduleTemplate check; `scripts/backfill-assigned-devices.js` (add-only, dry-run verified: 40k test devices, 0 media refs); `tsc` PASS |
 | 31 | Per-account quota system (billing control): 1GB storage, 500MB file, 10 uploads/mo, 15 assigns/mo, 4 TVs, 30-day archived purge; live usage on dashboard | PHASE 3 item 2 | IMPLEMENTED — `src/utils/quota.ts`; GlobalConfig quota fields; User `monthlyUploadOps`/`monthlyAssignOps`; enforcement in uploadMedia/chunkedUpload/assignMedia/configureGroup/createDevice/updateDevice/assignDevices; `GET /users/me` `usage` object; daily `purgeArchivedMedia` job (skips in-use files); CMS dashboard "Your Plan & Usage" card + library error surfacing; `tests/quota.test.ts` (9 tests PASS); `tsc` PASS both sides |
+| 32 | Audit log coverage gaps — user CRUD, role change, bulk assign, group CRUD, device delete were unlogged | PHASE 2 | IMPLEMENTED — `AuditLog.create` added in `createUser`/`updateUser` (role change logs `previousRole`/`newRole`)/`deleteUser`/`assignDevices` (user.controller), `createGroup`/`updateGroup`/`deleteGroup` (group.controller), `deleteDevice` (device.controller); enum extended with `update_user`/`update_group`; `tsc` PASS |
+| 33 | CMS React Query migration + media thumbnails + error boundary | PHASE 3 | IMPLEMENTED — all admin/user pages on `useQuery`/`useQueryClient` (UserDeviceDetail kept manual for polling config editor); `MediaThumbnail` component wired into UserLibrary + AdminUserMediaDetail; `ErrorBoundary` wraps app in `main.tsx`; `tsc` PASS |
+| 34 | Storage reconciliation job (`storageUsed` vs actual `Media.size` sum) | PHASE 2 | IMPLEMENTED — `services/storageReconcile.service.ts` + monthly job in `index.ts` (boot + first daily tick per month); auto-fixes drift ≤5%/≤1MB, logs larger drift; `tsc` PASS |
+| 35 | S3 storage backend + CDN media delivery (no URL migration) | PHASE 1 item / PHASE B | IMPLEMENTED — `S3Storage` (streamed upload, delete, copy+delete move); `serveMediaFile` 302-redirects s3 media to signed URL (CloudFront canned policy when `CDN_BASE_URL`+key pair set, else S3 presign); `Media.url` format unchanged → zero DB/config/APK migration; per-file `storageType` routing in delete/move/purge/user-delete; `fileAccessCache` carries storageType; env vars `CDN_BASE_URL`/`CLOUDFRONT_KEY_PAIR_ID`/`CLOUDFRONT_PRIVATE_KEY`/`MEDIA_URL_EXPIRES_IN`; `tsc` PASS. **AWS console setup pending** (bucket, OAC, key group) per `AWS_DEPLOYMENT_GUIDE.md` Phase B |
+| 36 | APK hash-first cache verification | PHASE 2 | IMPLEMENTED — `isManifestEntryUsable` trusts content hash over mtimeMs/size drift; re-uploaded identical files skip re-download on all TVs; single gate covers prefetch/verify/preflight/generation-copy; jest 30/30 PASS; **APK rebuild required** |
+| 37 | Production setup LOCKED: EC2 t3.small single instance + Atlas M0 (free) + S3/CloudFront + Caddy SSL; no Redis/ALB/NAT; ~$15–20/mo for 20 users/40 devices; scaling path documented | PHASE 5 | DECIDED — zero code changes required (env vars + AWS console only); step-by-step deploy checklist + scaling triggers in `AWS_DEPLOYMENT_GUIDE.md` "LOCKED production setup" section. **Pending:** AWS console execution at go-live |
 
 ## Master plan phases (authoritative gates)
 
@@ -71,16 +77,18 @@ Status values: `NOT STARTED`, `IN PROGRESS`, `IMPLEMENTED`, `TESTED`, `VERIFIED`
 
 | Doc | Status |
 |-----|--------|
-| `docs/PRODUCTION_READINESS_AUDIT.md` | NOT STARTED |
-| `docs/PRODUCTION_IMPLEMENTATION_PLAN.md` | NOT STARTED (this file covers progress; plan doc pending) |
+| `docs/PRODUCTION_READINESS_AUDIT.md` | REMOVED (point-in-time audit, superseded by this file) |
+| `docs/PRODUCTION_IMPLEMENTATION_PLAN.md` | REMOVED (superseded by `AWS_DEPLOYMENT_GUIDE.md` locked setup + this file) |
 | `docs/PRODUCTION_PROGRESS.md` | THIS FILE |
-| `docs/AWS_DEPLOYMENT_GUIDE.md` | NOT STARTED |
-| `docs/DATABASE_MIGRATION_GUIDE.md` | NOT STARTED |
-| `docs/SECURITY_CHECKLIST.md` | NOT STARTED |
-| `docs/LOAD_TEST_REPORT.md` | NOT STARTED |
-| `docs/ROLLBACK_AND_DISASTER_RECOVERY.md` | NOT STARTED |
-| `docs/ENVIRONMENT_VARIABLES.md` | NOT STARTED |
-| `docs/PRODUCTION_OPERATIONS_RUNBOOK.md` | NOT STARTED |
+| `docs/AWS_DEPLOYMENT_GUIDE.md` | EXISTS — locked lean setup + scale-up phases |
+| `docs/DATABASE_MIGRATION_GUIDE.md` | EXISTS — index verify + backfill for prod DB |
+| `docs/SECURITY_CHECKLIST.md` | EXISTS |
+| `docs/LOAD_TEST_REPORT.md` | EXISTS — harness usage + baseline numbers |
+| `docs/ROLLBACK_AND_DISASTER_RECOVERY.md` | EXISTS |
+| `docs/ENVIRONMENT_VARIABLES.md` | EXISTS |
+| `docs/PRODUCTION_OPERATIONS_RUNBOOK.md` | EXISTS |
+| `docs/SOCKET_SCALING.md` | EXISTS — multi-node path reference |
+| `docs/ENTERPRISE_PRODUCTION_MASTER_PLAN.md` | EXISTS — authoritative phase brief |
 
 ## Rules reminder
 

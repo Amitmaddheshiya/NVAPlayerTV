@@ -107,16 +107,15 @@ Document multi-AZ availability, disaster recovery, horizontal scaling and no-dow
 
 Create and update these as work begins:
 
-1. `docs/PRODUCTION_READINESS_AUDIT.md`
-2. `docs/PRODUCTION_IMPLEMENTATION_PLAN.md`
-3. `docs/PRODUCTION_PROGRESS.md`
-4. `docs/AWS_DEPLOYMENT_GUIDE.md`
-5. `docs/DATABASE_MIGRATION_GUIDE.md`
-6. `docs/SECURITY_CHECKLIST.md`
-7. `docs/LOAD_TEST_REPORT.md`
-8. `docs/ROLLBACK_AND_DISASTER_RECOVERY.md`
-9. `docs/ENVIRONMENT_VARIABLES.md`
-10. `docs/PRODUCTION_OPERATIONS_RUNBOOK.md`
+1. `docs/PRODUCTION_PROGRESS.md`
+2. `docs/AWS_DEPLOYMENT_GUIDE.md`
+3. `docs/DATABASE_MIGRATION_GUIDE.md`
+4. `docs/SECURITY_CHECKLIST.md`
+5. `docs/LOAD_TEST_REPORT.md`
+6. `docs/ROLLBACK_AND_DISASTER_RECOVERY.md`
+7. `docs/ENVIRONMENT_VARIABLES.md`
+8. `docs/PRODUCTION_OPERATIONS_RUNBOOK.md`
+9. `docs/SOCKET_SCALING.md`
 
 Track each item as `NOT STARTED`, `IN PROGRESS`, `IMPLEMENTED`, `TESTED`, `VERIFIED`, or `BLOCKED`.
 

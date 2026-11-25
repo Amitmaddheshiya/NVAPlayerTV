@@ -32,6 +32,10 @@ AWS Secrets Manager / Parameter Store in production. **Never commit `.env`.**
 | `AWS_SECRET_ACCESS_KEY` | — | Only for `STORAGE_TYPE=s3` |
 | `AWS_REGION` | — | e.g. `ap-south-1` |
 | `S3_BUCKET_NAME` | — | Private media bucket |
+| `CDN_BASE_URL` | — | CloudFront distribution domain (e.g. `https://d111.cloudfront.net`). When set with the key pair below, S3 media redirects to edge-signed URLs instead of S3 presigns. |
+| `CLOUDFRONT_KEY_PAIR_ID` | — | CloudFront public key ID from the trusted key group |
+| `CLOUDFRONT_PRIVATE_KEY` | — | RSA private key PEM (matching the CloudFront public key). Keep in Secrets Manager — never commit. |
+| `MEDIA_URL_EXPIRES_IN` | `3600` | Seconds a signed delivery URL stays valid. Each range request gets a fresh redirect, so this only bounds a single transfer. |
 
 ## Redis (optional but recommended)
 

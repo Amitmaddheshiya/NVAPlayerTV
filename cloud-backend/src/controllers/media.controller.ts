@@ -148,7 +148,7 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
 
 export const getMedia = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { section, deviceId, page = '1', limit = '10', search, folder, type } = req.query;
+    const { section, deviceId, page = '1', limit = '10', search, folder, type, uploadedBy, sortBy, sortOrder } = req.query;
     const filter: any = { deletedFromLibrary: { $ne: true } };
 
     if (section) filter.section = parseInt(section as string);
@@ -171,6 +171,9 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
     // Sub-users share the parent account's library.
     if (req.userRole !== 'admin' && req.userId) {
       filter.uploadedBy = req.effectiveUserId || req.userId;
+    } else if (req.userRole === 'admin' && uploadedBy) {
+      // Admin-only: view a specific user's library (e.g. admin user media page).
+      filter.uploadedBy = uploadedBy;
     }
 
     // Parse pagination parameters
@@ -180,7 +183,7 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
 
     // Create cache key from raw query params — JSON.stringify(filter) cannot
     // serialize RegExp (becomes {}), which made every search share one entry.
-    const cacheKey = `media:${req.userRole}:${req.userId || 'admin'}:${section || ''}:${deviceId || ''}:${folder || ''}:${type || ''}:${search || ''}:page:${pageNum}:limit:${limitNum}`;
+    const cacheKey = `media:${req.userRole}:${req.userId || 'admin'}:${section || ''}:${deviceId || ''}:${folder || ''}:${type || ''}:${uploadedBy || ''}:${search || ''}:sort:${sortBy || ''}:${sortOrder || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -193,9 +196,16 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
     // Get total count
     const total = await Media.countDocuments(filter);
 
+    // Whitelist sortable fields to prevent arbitrary field injection
+    const SORTABLE_FIELDS: Record<string, 1 | -1> = {
+      filename: 1, type: 1, size: 1, createdAt: 1, updatedAt: 1, folder: 1,
+    };
+    const sortField = (sortBy && SORTABLE_FIELDS[sortBy as string]) ? (sortBy as string) : 'createdAt';
+    const sortDir = sortOrder === 'asc' ? 1 : -1;
+
     // Get paginated media
     const mediaList = await Media.find(filter)
-      .sort({ createdAt: -1 })
+      .sort({ [sortField]: sortDir })
       .skip(skip)
       .limit(limitNum);
 
@@ -227,12 +237,18 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
 
 export const getMediaFolders = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const { uploadedBy } = req.query;
     const filter: any = { deletedFromLibrary: { $ne: true } };
     // Mirror getMedia ownership: non-admin users only see their own uploads.
     // NOTE: aggregation pipelines do NOT apply schema casting, so uploadedBy
     // (ObjectId) must be cast manually or the match returns zero documents.
     if (req.userRole !== 'admin' && req.userId) {
       const ownerId = String(req.effectiveUserId || req.userId);
+      filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
+        ? new mongoose.Types.ObjectId(ownerId)
+        : ownerId;
+    } else if (req.userRole === 'admin' && uploadedBy) {
+      const ownerId = String(uploadedBy);
       filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
         ? new mongoose.Types.ObjectId(ownerId)
         : ownerId;
@@ -375,8 +391,9 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
     }
 
     // No saved device config references the media, so it is safe to remove the
-    // stored file and record permanently.
-    const storage = getStorageService();
+    // stored file and record permanently. Use the record's own storageType so
+    // mixed local/S3 libraries delete from the right backend.
+    const storage = getStorageService(media.storageType);
     await storage.delete(media.path);
     await Media.findByIdAndDelete(req.params.id);
     await invalidateMediaAuth(media.path);
@@ -489,7 +506,7 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const storage = getStorageService();
+    const storage = getStorageService(media.storageType);
     const oldFolder = media.folder || 'general';
     const newFolder = normalizeUserFolder(folder === undefined ? oldFolder : folder);
     if (!newFolder) {
@@ -503,17 +520,17 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
       const oldPath = media.path || `users/${userId}/${oldFolder}/${media.filename}`;
       const newPath = `users/${userId}/${newFolder}/${media.filename}`;
 
-      // Move file in storage
-      const fs = require('fs').promises;
-      const fullOldPath = `${process.env.UPLOAD_DIR || './uploads'}/${oldPath}`;
-      const fullNewPath = `${process.env.UPLOAD_DIR || './uploads'}/${newPath}`;
-
-      // Ensure new directory exists
-      const newDir = fullNewPath.substring(0, fullNewPath.lastIndexOf('/'));
-      await fs.mkdir(newDir, { recursive: true });
-
-      // Move file
-      await fs.rename(fullOldPath, fullNewPath);
+      // Move file via the storage backend (fs.rename locally, copy+delete on S3)
+      if (storage.move) {
+        await storage.move(oldPath, newPath);
+      } else {
+        const fs = require('fs').promises;
+        const fullOldPath = `${process.env.UPLOAD_DIR || './uploads'}/${oldPath}`;
+        const fullNewPath = `${process.env.UPLOAD_DIR || './uploads'}/${newPath}`;
+        const newDir = fullNewPath.substring(0, fullNewPath.lastIndexOf('/'));
+        await fs.mkdir(newDir, { recursive: true });
+        await fs.rename(fullOldPath, fullNewPath);
+      }
 
       // Update media record
       media.path = newPath;
@@ -555,9 +572,7 @@ export const purgeArchivedMedia = async (): Promise<{ purged: number; skipped: n
     const candidates = await Media.find({
       deletedFromLibrary: true,
       updatedAt: { $lt: cutoff },
-    }).select('_id path url uploadedBy size originalName assignedDevices').lean();
-
-    const storage = getStorageService();
+    }).select('_id path url uploadedBy size originalName assignedDevices storageType').lean();
     for (const media of candidates) {
       try {
         // Re-check references — config may have changed since archiving.
@@ -583,7 +598,7 @@ export const purgeArchivedMedia = async (): Promise<{ purged: number; skipped: n
           continue;
         }
 
-        await storage.delete(media.path);
+        await getStorageService((media as any).storageType).delete(media.path);
         await Media.findByIdAndDelete(media._id);
         await invalidateMediaAuth(media.path);
         if (media.uploadedBy) {

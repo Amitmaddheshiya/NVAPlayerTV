@@ -13,6 +13,10 @@ interface Env {
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_REGION?: string;
   S3_BUCKET_NAME?: string;
+  CDN_BASE_URL?: string;
+  CLOUDFRONT_KEY_PAIR_ID?: string;
+  CLOUDFRONT_PRIVATE_KEY?: string;
+  MEDIA_URL_EXPIRES_IN: number;
   FRONTEND_URL: string;
   SERVER_URL: string;
   RATE_LIMIT_WINDOW_MS: number;
@@ -30,6 +34,10 @@ const env: Env = {
   AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
   AWS_REGION: process.env.AWS_REGION,
   S3_BUCKET_NAME: process.env.S3_BUCKET_NAME,
+  CDN_BASE_URL: (process.env.CDN_BASE_URL || '').replace(/\/+$/, ''),
+  CLOUDFRONT_KEY_PAIR_ID: process.env.CLOUDFRONT_KEY_PAIR_ID,
+  CLOUDFRONT_PRIVATE_KEY: process.env.CLOUDFRONT_PRIVATE_KEY,
+  MEDIA_URL_EXPIRES_IN: parseInt(process.env.MEDIA_URL_EXPIRES_IN || '3600', 10),
   FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:5173',
   SERVER_URL: process.env.SERVER_URL || 'http://localhost:3000',
   RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10), // 15 minutes default

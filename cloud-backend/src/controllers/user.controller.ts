@@ -3,6 +3,7 @@ import User from '../models/User';
 import Device from '../models/Device';
 import Media from '../models/Media';
 import Group from '../models/Group';
+import AuditLog from '../models/AuditLog';
 import ScheduleTemplate from '../models/Schedule';
 import GlobalConfig from '../models/GlobalConfig';
 import { getStorageService } from '../config/storage';
@@ -22,7 +23,7 @@ const presentUser = (user: any): any => {
 
 export const getUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { page = '1', limit = '10', search, role } = req.query;
+    const { page = '1', limit = '10', search, role, sortBy, sortOrder } = req.query;
     const filter: any = {};
 
     // Search filter - search in email, name
@@ -51,7 +52,7 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
 
     // Create cache key from raw query params — JSON.stringify(filter) cannot
     // serialize RegExp (becomes {}), which made every search share one entry.
-    const cacheKey = `users:${search || ''}:${role || ''}:page:${pageNum}:limit:${limitNum}`;
+    const cacheKey = `users:${search || ''}:${role || ''}:sort:${sortBy || ''}:${sortOrder || ''}:page:${pageNum}:limit:${limitNum}`;
 
     // Try to get from cache first
     const cached = await cacheGet(cacheKey);
@@ -65,18 +66,59 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     // Get total count
     const total = await User.countDocuments(filter);
 
+    // Whitelist sortable fields to prevent arbitrary field injection
+    const SORTABLE_FIELDS: Record<string, 1 | -1> = {
+      email: 1, name: 1, businessName: 1, role: 1, createdAt: 1, updatedAt: 1,
+    };
+    const sortField = (sortBy && SORTABLE_FIELDS[sortBy as string]) ? (sortBy as string) : 'createdAt';
+    const sortDir = sortOrder === 'asc' ? 1 : -1;
+
     // Get paginated users
     const users = await User.find(filter)
       .select('-password')
-      .sort({ createdAt: -1 })
+      .sort({ [sortField]: sortDir })
       .skip(skip)
       .limit(limitNum);
 
     const totalPages = Math.ceil(total / limitNum);
 
+    // Effective quota display values. User.monthlyUploadLimit is a legacy
+    // field and is NOT used for enforcement — GlobalConfig is the source of
+    // truth. Sub-user uploads count toward the parent account, so their row
+    // shows the parent's monthly usage. Admins are unmetered.
+    const GlobalConfig = (await import('../models/GlobalConfig')).default;
+    const globalConfig = await (GlobalConfig as any).getConfig();
+    const monthlyLimitGB = Number(globalConfig?.monthlyUploadLimitGB ?? 10);
+    const currentMonth = new Date().toISOString().slice(0, 7);
+
+    const parentIds = [...new Set(
+      users.filter((u: any) => u.parentId).map((u: any) => String(u.parentId))
+    )];
+    const parents = parentIds.length
+      ? await User.find({ _id: { $in: parentIds } }).select('currentMonthUpload uploadUsageMonth storageUsed').lean()
+      : [];
+    const parentUsageById = new Map(parents.map((p: any) => [String(p._id), p]));
+
+    const enrichedUsers = users.map((u: any) => {
+      const presented = presentUser(u);
+      const isAdmin = presented.role === 'admin';
+      const isSub = isSubUserAccount(u);
+      const usageSource: any = isSub ? parentUsageById.get(String(u.parentId)) : u;
+      const usedBytes = usageSource && usageSource.uploadUsageMonth === currentMonth
+        ? Number(usageSource.currentMonthUpload || 0)
+        : 0;
+      return {
+        ...presented,
+        monthlyUploadLimit: isAdmin ? null : monthlyLimitGB,
+        currentMonthUpload: usedBytes,
+        storageUsed: isSub ? Number(usageSource?.storageUsed || 0) : Number(u.storageUsed || 0),
+        quotaAccountId: isSub ? String(u.parentId) : String(u._id),
+      };
+    });
+
     // Cache the result (TTL: 60 seconds)
     const response = {
-      data: users.map(presentUser),
+      data: enrichedUsers,
       total,
       page: pageNum,
       limit: limitNum,
@@ -127,13 +169,21 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
       res.status(404).json({ error: 'User not found' });
       return;
     }
+    // Quota counters (storage, monthly upload/ops) live on the OWNER account.
+    // Sub-user uploads/assignments accrue to the parent, so the sub-user's own
+    // counters are always 0 — show the parent's usage instead.
+    const isSub = isSubUserAccount(user);
+    const quotaUser = (isSub && user.parentId
+      ? await User.findById(user.parentId).select('-password')
+      : null) || user;
+
     const currentMonth = new Date().toISOString().slice(0, 7);
-    if (user.uploadUsageMonth !== currentMonth) {
-      user.uploadUsageMonth = currentMonth;
-      user.currentMonthUpload = 0;
-      user.monthlyUploadOps = 0;
-      user.monthlyAssignOps = 0;
-      await user.save();
+    if (quotaUser.uploadUsageMonth !== currentMonth) {
+      quotaUser.uploadUsageMonth = currentMonth;
+      quotaUser.currentMonthUpload = 0;
+      quotaUser.monthlyUploadOps = 0;
+      quotaUser.monthlyAssignOps = 0;
+      await quotaUser.save();
     }
     const ownerId = req.effectiveUserId || req.userId;
     const [totalDevices, onlineDevices, config] = await Promise.all([
@@ -144,28 +194,29 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
     const GB = 1024 * 1024 * 1024;
     res.json({
       ...presentUser(user),
-      isSubUser: isSubUserAccount(user),
+      isSubUser: isSub,
+      quotaAccountId: String(quotaUser._id),
       totalDevices,
       onlineDevices,
       offlineDevices: Math.max(0, totalDevices - onlineDevices),
       monthlyUploadLimit: config?.monthlyUploadLimitGB ?? 10,
       usage: {
         storage: {
-          usedBytes: Number(user.storageUsed || 0),
+          usedBytes: Number(quotaUser.storageUsed || 0),
           limitBytes: Number(config?.storageLimitGB ?? 1) * GB,
           limitGB: Number(config?.storageLimitGB ?? 1),
         },
         monthlyUpload: {
-          usedBytes: Number(user.currentMonthUpload || 0),
+          usedBytes: Number(quotaUser.currentMonthUpload || 0),
           limitBytes: Number(config?.monthlyUploadLimitGB ?? 10) * GB,
           limitGB: Number(config?.monthlyUploadLimitGB ?? 10),
         },
         uploadOps: {
-          used: Number(user.monthlyUploadOps || 0),
+          used: Number(quotaUser.monthlyUploadOps || 0),
           limit: Number(config?.monthlyUploadOpsLimit ?? 10),
         },
         assignOps: {
-          used: Number(user.monthlyAssignOps || 0),
+          used: Number(quotaUser.monthlyAssignOps || 0),
           limit: Number(config?.monthlyAssignOpsLimit ?? 15),
         },
         devices: {
@@ -225,6 +276,18 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
     });
 
     await user.save();
+
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'create_user',
+        targetType: 'user',
+        targetId: String(user._id),
+        details: { email: user.email, role: user.role, businessName: user.businessName },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
 
     res.status(201).json({
       id: user._id,
@@ -293,6 +356,25 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
     await cacheDelPattern('users:*');
     await cacheDel(`user:${req.params.id}`);
 
+    // Audit log — especially important for role changes
+    if (req.userId) {
+      const roleChanged = role && role !== existingUser.role;
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'update_user',
+        targetType: 'user',
+        targetId: req.params.id,
+        details: {
+          email: user?.email,
+          ...(roleChanged ? { previousRole: existingUser.role, newRole: role } : {}),
+          ...(subUserLimit !== undefined ? { subUserLimit } : {}),
+          fieldsUpdated: Object.keys(updateData).filter((k) => k !== 'password'),
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
+
     res.json(presentUser(user));
   } catch (error) {
     console.error('Update user error:', error);
@@ -315,12 +397,11 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
     const assignedDevices = await Device.find({ assignedUserId: req.params.id });
     const assignedDeviceIds = assignedDevices.map((device) => device.deviceId);
     const userMedia = await Media.find({ uploadedBy: req.params.id });
-    const storage = getStorageService();
     const io = getSocketInstance();
 
     // Remove this user's content from stored device configs before deleting the files.
     for (const media of userMedia) {
-      await storage.delete(media.path);
+      await getStorageService(media.storageType).delete(media.path);
       await invalidateMediaAuth(media.path);
       const devices = await Device.find({
         $or: [
@@ -381,6 +462,23 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
     await cacheDelPattern('users:*');
     await cacheDel(`user:${req.params.id}`);
 
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'delete_user',
+        targetType: 'user',
+        targetId: req.params.id,
+        details: {
+          email: user.email,
+          role: user.role,
+          devicesUnassigned: assignedDeviceIds.length,
+          mediaDeleted: userMedia.length,
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
+
     res.json({ success: true });
   } catch (error) {
     console.error('Delete user error:', error);
@@ -418,20 +516,15 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     // Per-account device limit (plan-based, admin-tunable via GlobalConfig).
-    // Count only NEWLY added devices — devices already assigned to this user
-    // don't consume extra quota when the list is re-saved.
+    // After this save, exactly `normalizedDeviceIds.length` devices will be
+    // assigned to the user (devices not in the list are unassigned below), so
+    // compare the FINAL count against the limit — not current + additions,
+    // which over-counts when swapping devices.
     const deviceLimit = await checkDeviceLimit(userId, 0);
-    if (!deviceLimit.ok) {
-      res.status(400).json({ error: deviceLimit.error });
-      return;
-    }
-    const currentlyAssigned = await Device.countDocuments({ assignedUserId: userId });
-    const newAssignments = normalizedDeviceIds.filter((id: string) =>
-      !requestedDevices.find((d: any) => String(d.deviceId) === id && String(d.assignedUserId) === userId)
-    );
-    if (currentlyAssigned + newAssignments.length > (deviceLimit.limit || 4)) {
+    const deviceLimitValue = deviceLimit.limit || 4;
+    if (normalizedDeviceIds.length > deviceLimitValue) {
       res.status(400).json({
-        error: `Device limit reached. Your plan allows ${deviceLimit.limit} TV(s); this account already has ${currentlyAssigned}. Remove a device or upgrade your plan.`,
+        error: `Device limit reached. Your plan allows ${deviceLimitValue} TV(s); this assignment would give the account ${normalizedDeviceIds.length}. Remove a device or upgrade your plan.`,
       });
       return;
     }
@@ -494,6 +587,23 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
     await cacheDelPattern('devices:*');
     await cacheDelPattern('groups:*');
     await cacheDelPattern('users:*');
+
+    // Audit log for bulk device assignment
+    if (req.userId) {
+      await AuditLog.create({
+        userId: req.userId,
+        action: 'assign_device',
+        targetType: 'user',
+        targetId: userId,
+        details: {
+          userEmail: user.email,
+          deviceIds: normalizedDeviceIds,
+          deviceCount: normalizedDeviceIds.length,
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
 
     res.json({ success: true, user });
   } catch (error) {

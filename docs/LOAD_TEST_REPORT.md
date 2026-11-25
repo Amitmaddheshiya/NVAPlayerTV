@@ -33,7 +33,7 @@ Flags: `--seed N` (create N devices + 8MB media), `--devices N`,
 Run against compiled backend (`npm run build && npm start`) on a prod-like
 instance, then against staging ASG. Record:
 
-### Executed run — 2026-11-24 (dev machine, localhost:3000)
+### Executed run — 2026-11-24 (dev machine, localhost:3000, ts-node dev)
 
 500 seeded devices (`lt-dev-*`), 100 workers, 60s per phase, `phase=both`.
 
@@ -42,14 +42,25 @@ instance, then against staging ASG. Record:
 | heartbeat | 8332 | 138.9 req/s | 0 (0.00%) | 687ms | 1122ms | 1515ms | 3023ms |
 | media (1MB ranges) | 1481 | 24.7 req/s (~25MB/s) | 6 (0.41%) | 4341ms | 5060ms | 5611ms | 6837ms |
 
-Status codes: heartbeat 100% `200`; media 1475×`206` + 6 errors.
+### Executed run — 2026-11-25 (dev machine, localhost:3000, **compiled `npm start`**)
 
-**Reading**: heartbeat scales fine at 500 devices / 100 concurrent. Media
-throughput (~25MB/s, p50 4.3s per 1MB range) is the bottleneck — expected on
-dev hardware with `express.static` on local disk; re-measure on prod-like
-instance and after S3/CloudFront. The 6 media errors (0.41%) should be
-investigated if they reproduce on staging (likely connection resets under
-concurrency, not app errors — all completed requests returned 206).
+500 seeded devices, 100 workers, 60s per phase, `phase=both`.
+
+| Phase | Requests | Throughput | Errors | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| heartbeat | 9817 | 163.6 req/s | 0 (0.00%) | 583ms | 861ms | 1127ms | 2185ms |
+| media (1MB ranges) | 1467 | 24.4 req/s (~24MB/s) | 0 (0.00%) | 4370ms | 4862ms | 5291ms | 5666ms |
+
+Status codes: heartbeat 100% `200`; media 100% `206`.
+
+**Reading**: compiled build is faster than ts-node dev (heartbeat +18%,
+zero errors vs 6 transient errors before). Media ~24MB/s is `express.static`
+on local disk — **in production this path becomes a 302 redirect to
+CloudFront**, so EC2 never serves media bytes; the media-phase bottleneck
+disappears. Heartbeat 163 req/s on a dev laptop ⇒ 40 devices heartbeating
+every ~60s needs <1 req/s — enormous headroom; t3.small is sufficient for
+the locked setup (20 users / 40 devices). Re-run on the actual EC2 instance
+post-deploy to confirm.
 
 - [ ] Heartbeat req/s at 1k / 5k / 10k devices
 - [ ] Media ranged-GET throughput (MB/s) at concurrent viewers

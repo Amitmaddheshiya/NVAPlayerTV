@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, groupAPI, userAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Plus, Edit, Trash2, Users, ShieldCheck } from 'lucide-react';
+import { SkeletonTable } from '../../components/ui/Skeleton';
 
 const PERMISSION_OPTIONS = [
   { key: 'devices', label: 'Devices', description: 'View and manage devices & configuration' },
@@ -16,9 +18,7 @@ const PERMISSION_OPTIONS = [
 const defaultPermissions = () => ({ devices: true, groups: true, library: true, settings: true });
 
 export const UserSubUsers = () => {
-  const [subUsers, setSubUsers] = useState<any[]>([]);
-  const [limit, setLimit] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<any>(null);
   const [saving, setSaving] = useState(false);
@@ -29,23 +29,37 @@ export const UserSubUsers = () => {
 
   const [formData, setFormData] = useState({ email: '', password: '' });
   const [permissions, setPermissions] = useState<Record<string, boolean>>(defaultPermissions());
-  const [availableDevices, setAvailableDevices] = useState<any[]>([]);
-  const [availableGroups, setAvailableGroups] = useState<any[]>([]);
   const [resourceAccess, setResourceAccess] = useState({ devices: [] as string[], groups: [] as string[] });
 
-  useEffect(() => { loadSubUsers(); loadResourceOptions(); }, []);
-
-  const loadSubUsers = async () => {
-    try {
+  const subUsersQuery = useQuery({
+    queryKey: ['user-subusers'],
+    queryFn: async () => {
       const res = await userAPI.getSubUsers();
-      setSubUsers(res.data.data || []);
-      setLimit(res.data.limit || 0);
-    } catch (error) {
-      console.error('Failed to load sub-users:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+      return res.data;
+    },
+  });
+
+  const resourceOptionsQuery = useQuery({
+    queryKey: ['user-subusers-options'],
+    queryFn: async () => {
+      const [deviceResponse, groupResponse] = await Promise.all([
+        deviceAPI.getDevices({ page: 1, limit: 1000 }),
+        groupAPI.getGroups({ page: 1, limit: 1000 }),
+      ]);
+      return {
+        devices: deviceResponse.data.data || deviceResponse.data || [],
+        groups: groupResponse.data.data || groupResponse.data || [],
+      };
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const subUsers = subUsersQuery.data?.data || [];
+  const limit = subUsersQuery.data?.limit || 0;
+  const loading = subUsersQuery.isLoading;
+  const availableDevices = resourceOptionsQuery.data?.devices || [];
+  const availableGroups = resourceOptionsQuery.data?.groups || [];
+  const loadSubUsers = () => queryClient.invalidateQueries({ queryKey: ['user-subusers'] });
 
   const openCreate = () => {
     setEditing(null);
@@ -95,19 +109,6 @@ export const UserSubUsers = () => {
     }
   };
 
-  const loadResourceOptions = async () => {
-    try {
-      const [deviceResponse, groupResponse] = await Promise.all([
-        deviceAPI.getDevices({ page: 1, limit: 1000 }),
-        groupAPI.getGroups({ page: 1, limit: 1000 }),
-      ]);
-      setAvailableDevices(deviceResponse.data.data || deviceResponse.data || []);
-      setAvailableGroups(groupResponse.data.data || groupResponse.data || []);
-    } catch (error) {
-      console.error('Failed to load access options:', error);
-    }
-  };
-
   const toggleResource = (kind: 'devices' | 'groups', id: string, checked: boolean) => {
     setResourceAccess((current) => ({
       ...current,
@@ -135,7 +136,11 @@ export const UserSubUsers = () => {
   const permissionSummary = (perms: any) =>
     PERMISSION_OPTIONS.filter((o) => perms?.[o.key] !== false).map((o) => o.label).join(', ') || 'No access';
 
-  if (loading) return <div className="flex items-center justify-center h-64">Loading...</div>;
+  if (loading) return (
+    <div className="p-1 sm:p-1.5 md:p-2 w-full">
+      <SkeletonTable rows={6} cols={5} />
+    </div>
+  );
 
   const atLimit = limit <= 0 || subUsers.length >= limit;
 

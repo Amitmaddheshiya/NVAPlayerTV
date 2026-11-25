@@ -1,6 +1,7 @@
 import { type ReactNode, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Layout, LayoutDashboard, Library, Monitor, Users, LogOut, Cog, Menu, X } from 'lucide-react';
+import { ToastProvider } from './ui/Toast';
 
 interface AdminLayoutProps {
   children: ReactNode;
@@ -28,6 +29,7 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
   const user = JSON.parse(localStorage.getItem('user') || '{}');
 
   return (
+    <ToastProvider>
     <div className="min-h-screen bg-gray-100 flex flex-col">
       {/* Mobile Top Navbar */}
       <header className="lg:hidden bg-gray-900 text-white p-4 sticky top-0 z-50">
@@ -134,5 +136,6 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
         </main>
       </div>
     </div>
+    </ToastProvider>
   );
 };

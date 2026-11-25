@@ -1,25 +1,49 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { deviceAPI, groupAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Plus, Edit, Trash2, Monitor, Layers, Settings, Search } from 'lucide-react';
+import { SkeletonTable } from '../../components/ui/Skeleton';
 
 export const UserGroups = () => {
   const navigate = useNavigate();
-  const [groups, setGroups] = useState<any[]>([]);
-  const [filteredGroups, setFilteredGroups] = useState<any[]>([]);
-  const [devices, setDevices] = useState<any[]>([]);
+  const queryClient = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editingGroup, setEditingGroup] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const groupsPerPage = 10;
-  const [totalGroups, setTotalGroups] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
+
+  const groupsQuery = useQuery({
+    queryKey: ['user-groups', currentPage, searchTerm],
+    queryFn: async () => {
+      const params: any = { page: currentPage, limit: groupsPerPage };
+      if (searchTerm) params.search = searchTerm;
+      const response = await groupAPI.getGroups(params);
+      return response.data;
+    },
+  });
+
+  const devicesQuery = useQuery({
+    queryKey: ['user-groups-devices'],
+    queryFn: async () => {
+      const response = await deviceAPI.getDevices({ page: 1, limit: 1000 });
+      return response.data.data || response.data;
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const groups = groupsQuery.data?.data || [];
+  const filteredGroups = groups;
+  const devices = devicesQuery.data || [];
+  const loading = groupsQuery.isLoading;
+  const totalGroups = groupsQuery.data?.total || 0;
+  const totalPages = groupsQuery.data?.totalPages || 0;
+  const loadGroups = () => queryClient.invalidateQueries({ queryKey: ['user-groups'] });
 
   const [alertState, setAlertState] = useState<{
     isOpen: boolean;
@@ -41,46 +65,6 @@ export const UserGroups = () => {
   });
   const [deviceSearchTerm, setDeviceSearchTerm] = useState('');
   const [visibleDeviceCount, setVisibleDeviceCount] = useState(10);
-
-  useEffect(() => {
-    loadGroups();
-    loadDevices();
-  }, [currentPage, searchTerm]);
-
-  const loadGroups = async () => {
-    try {
-      const params: any = {
-        page: currentPage,
-        limit: groupsPerPage
-      };
-
-      // Send search to backend for server-side filtering
-      if (searchTerm) {
-        params.search = searchTerm;
-      }
-
-      const response = await groupAPI.getGroups(params);
-      const groupsData = response.data.data || response.data;
-      setGroups(groupsData);
-      setFilteredGroups(groupsData); // No client-side filtering needed
-      setTotalGroups(response.data.total || 0);
-      setTotalPages(response.data.totalPages || 0);
-    } catch (error) {
-      console.error('Failed to load groups:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadDevices = async () => {
-    try {
-      const response = await deviceAPI.getDevices({ page: 1, limit: 1000 });
-      // Backend already filters devices by assignedUserId for non-admin users
-      setDevices(response.data.data || response.data);
-    } catch (error) {
-      console.error('Failed to load devices:', error);
-    }
-  };
 
   // No client-side filtering - all filtering happens on server
 
@@ -205,7 +189,11 @@ export const UserGroups = () => {
   const paginatedGroups = filteredGroups;
 
   if (loading) {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+    return (
+      <div className="p-1 sm:p-1.5 md:p-2 w-full">
+        <SkeletonTable rows={8} cols={5} />
+      </div>
+    );
   }
 
   return (

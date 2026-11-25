@@ -21,7 +21,6 @@ export interface IUser extends Document {
     groups: string[];
   };
   storageUsed: number;
-  monthlyUploadLimit: number;
   currentMonthUpload: number;
   uploadUsageMonth?: string;
   monthlyUploadOps: number;
@@ -52,7 +51,6 @@ const UserSchema = new Schema<IUser>(
       groups: [{ type: String, trim: true }],
     },
     storageUsed: { type: Number, default: 0, min: 0 },
-    monthlyUploadLimit: { type: Number, default: 10, min: 0 },
     currentMonthUpload: { type: Number, default: 0, min: 0 },
     uploadUsageMonth: { type: String, default: '' },
     monthlyUploadOps: { type: Number, default: 0, min: 0 },

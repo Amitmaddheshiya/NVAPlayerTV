@@ -12,7 +12,8 @@ Key fields: `email`, `password` (bcrypt), `role`, `parentId`,
 `resourceAccess`, `permissions`.
 
 Quota/usage fields (enforced by `src/utils/quota.ts`, limits live in
-`globalconfigs`):
+`globalconfigs`). NOTE: the legacy `monthlyUploadLimit` field was removed —
+the effective limit always comes from `globalconfigs.monthlyUploadLimitGB`:
 - `storageUsed` — bytes currently stored in the user's library
 - `currentMonthUpload` — bytes uploaded in the current usage month
 - `uploadUsageMonth` — `YYYY-MM` marker; counters reset lazily when it rolls
@@ -54,7 +55,10 @@ priority, config snapshot), `ownerId`.
 
 ### `auditlogs`
 Admin/security audit trail. TTL index on `timestamp` — **90 days**
-auto-delete.
+auto-delete. `action` values: `upload_media`, `delete_media`,
+`configure_device`, `assign_device`, `unassign_device`, `delete_device`,
+`create_user`, `update_user` (role changes log `previousRole`/`newRole`),
+`delete_user`, `create_group`, `update_group`, `delete_group`.
 
 ### `globalconfigs`
 Singleton app config: upload limits, APK version/url, feature flags.

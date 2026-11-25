@@ -61,7 +61,9 @@ Three deployables + two data stores:
 - **Config processing** (`src/utils/configProcessor.ts`): validates media
   ownership/existence, converts to absolute URLs, builds per-section
   `mediaItems` metadata (size/hash/mtimeMs) for TV cache verification.
-- **Background jobs**: upload-session cleanup, index `autoIndex` on boot.
+- **Background jobs**: upload-session cleanup, index `autoIndex` on boot,
+  offline-device detection (60s), archived-media purge (daily), storage
+  reconciliation (`storageUsed` vs `Media.size` sum, monthly).
 
 ## Cloud CMS (`cloud-frontend/`)
 

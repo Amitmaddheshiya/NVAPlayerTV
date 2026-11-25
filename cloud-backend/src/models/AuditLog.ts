@@ -2,7 +2,7 @@ import mongoose, { Schema, Document } from 'mongoose';
 
 export interface IAuditLog extends Document {
   userId: mongoose.Types.ObjectId;
-  action: 'upload_media' | 'configure_device' | 'assign_device' | 'unassign_device' | 'delete_media' | 'delete_device' | 'create_user' | 'delete_user' | 'create_group' | 'delete_group';
+  action: 'upload_media' | 'configure_device' | 'assign_device' | 'unassign_device' | 'delete_media' | 'delete_device' | 'create_user' | 'update_user' | 'delete_user' | 'create_group' | 'update_group' | 'delete_group';
   targetType: 'user' | 'device' | 'media' | 'group';
   targetId: string;
   details: {
@@ -23,7 +23,7 @@ const AuditLogSchema = new Schema<IAuditLog>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   action: {
     type: String,
-    enum: ['upload_media', 'configure_device', 'assign_device', 'unassign_device', 'delete_media', 'delete_device', 'create_user', 'delete_user', 'create_group', 'delete_group'],
+    enum: ['upload_media', 'configure_device', 'assign_device', 'unassign_device', 'delete_media', 'delete_device', 'create_user', 'update_user', 'delete_user', 'create_group', 'update_group', 'delete_group'],
     required: true
   },
   targetType: {

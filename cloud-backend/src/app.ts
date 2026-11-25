@@ -6,6 +6,7 @@ import env from './config/env';
 import { errorHandler, notFound } from './middleware/error.middleware';
 import { fileAccessAuth } from './middleware/fileAccess.middleware';
 import { rateLimit } from './middleware/rateLimit.middleware';
+import { getStorageService } from './config/storage';
 
 import authRoutes from './routes/auth.routes';
 import deviceRoutes from './routes/device.routes';
@@ -32,8 +33,31 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // Apply rate limiting to all API routes
 app.use('/api', rateLimit());
 
-// Serve uploaded files with authentication
-app.use('/api/media/file', fileAccessAuth, express.static(path.join(process.cwd(), 'uploads')));
+// Serve uploaded files with authentication. Local files go through
+// express.static (Range-capable); S3 files 302-redirect to a short-lived
+// signed URL (S3 presign or CloudFront) so bytes never transit EC2.
+const localMediaStatic = express.static(path.join(process.cwd(), 'uploads'));
+
+const serveMediaFile: express.RequestHandler = async (req, res, next) => {
+  const storageType = String((req as any).mediaStorageType || '');
+  const filePath = String((req as any).mediaFilePath || '');
+  if (storageType === 's3' && filePath) {
+    try {
+      const storage = getStorageService('s3');
+      if (storage.getDeliveryUrl) {
+        const deliveryUrl = await storage.getDeliveryUrl(filePath);
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.redirect(302, deliveryUrl);
+      }
+    } catch (error) {
+      console.error('Media delivery URL error:', error);
+      return res.status(502).json({ error: 'Media delivery failed' });
+    }
+  }
+  return localMediaStatic(req, res, next);
+};
+
+app.use('/api/media/file', fileAccessAuth, serveMediaFile);
 
 // Routes
 app.use('/api/auth', authRoutes);

@@ -6,14 +6,15 @@
 
 ```bash
 cd cloud-backend
-npm test          # Jest + ts-jest + supertest, 36 tests / 6 suites
+npm test          # Jest + ts-jest + supertest, 41 tests / 6 suites
 ```
 
 Runs against dedicated `signage_test` DB (same Mongo instance, collections
 wiped per test); Redis mocked. Covers: auth register/login, device ownership,
 group access (incl. sub-user resourceAccess), schedule sub-user enforcement,
 media-delete in-use protection, quota enforcement (storage/upload-ops/
-assign-ops/device-limit, `tests/quota.test.ts`).
+assign-ops/device-limit incl. exact-limit boundaries and sub-user owner
+accounting, `tests/quota.test.ts`).
 
 Note: `Jest did not exit...` warning is benign (open Mongo handle) — tests
 still pass.
