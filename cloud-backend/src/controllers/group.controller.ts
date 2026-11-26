@@ -16,6 +16,47 @@ import { countConfiguredMedia, getConfiguredMediaBytes, getConfiguredMediaUrls }
 import { invalidateDevicePaths } from '../utils/fileAccessCache';
 import { checkAssignQuota, recordAssign } from '../utils/quota';
 
+/** Device ids assigned to any account in the dealer's tree (null for non-dealers). */
+const dealerScopeDeviceIds = async (req: AuthRequest): Promise<string[] | null> => {
+  if (req.userRole !== 'dealer' || !req.scopeUserIds?.length) return null;
+  const devices = await Device.find({ assignedUserId: { $in: req.scopeUserIds } }).select('deviceId').lean();
+  return devices.map((d: any) => String(d.deviceId));
+};
+
+/**
+ * Resolve the account that effectively owns a group for the current request.
+ * Returns { ok, ownerId } — ownerId is the group's real owner account (a
+ * customer for dealer requests), used for device-membership and media checks.
+ */
+const resolveGroupOwner = async (req: AuthRequest, group: any): Promise<{ ok: boolean; ownerId?: string }> => {
+  if (req.userRole === 'admin') return { ok: true };
+  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))) return { ok: false };
+  const ownerId = req.effectiveUserId || req.userId;
+
+  if (group.ownerId) {
+    const owner = String(group.ownerId);
+    if (req.userRole === 'dealer') {
+      return (req.scopeUserIds || []).map(String).includes(owner) ? { ok: true, ownerId: owner } : { ok: false };
+    }
+    return owner === String(ownerId) ? { ok: true, ownerId: owner } : { ok: false };
+  }
+
+  // Legacy group without ownerId: every device must be assigned to one
+  // single account that the requester may act for.
+  const groupDevices = Array.isArray(group.devices) ? group.devices : [];
+  if (!groupDevices.length) return { ok: false };
+  const deviceOwners = await Device.find({ deviceId: { $in: groupDevices } }).distinct('assignedUserId');
+  const validOwners = [...new Set(deviceOwners.filter(Boolean).map(String))];
+  if (validOwners.length !== 1) return { ok: false };
+  const candidate = validOwners[0];
+  const allOwned = await Device.countDocuments({ deviceId: { $in: groupDevices }, assignedUserId: candidate }) === groupDevices.length;
+  if (!allOwned) return { ok: false };
+  if (req.userRole === 'dealer') {
+    return (req.scopeUserIds || []).map(String).includes(candidate) ? { ok: true, ownerId: candidate } : { ok: false };
+  }
+  return candidate === String(ownerId) ? { ok: true, ownerId: candidate } : { ok: false };
+};
+
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { page = '1', limit = '10', search } = req.query;
@@ -28,7 +69,32 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
     }
 
     let userDeviceIds: string[] | null = null;
-    if (req.userRole !== 'admin') {
+    if (req.userRole === 'dealer' && req.scopeUserIds?.length) {
+      // Dealer sees groups owned by any account in their customer tree.
+      // Optional ?ownerId=<customerId> narrows to one customer.
+      const scopeIds = req.scopeUserIds.map(String);
+      const requestedOwner = typeof req.query.ownerId === 'string' && req.query.ownerId ? String(req.query.ownerId) : null;
+      if (requestedOwner && !scopeIds.includes(requestedOwner)) {
+        res.status(403).json({ error: 'Groups can only be viewed for your customer accounts' });
+        return;
+      }
+      const ownerFilterValue = requestedOwner || { $in: scopeIds };
+      const scopeDevices = requestedOwner
+        ? (await Device.find({ assignedUserId: requestedOwner }).select('deviceId').lean()).map((d: any) => String(d.deviceId))
+        : await dealerScopeDeviceIds(req);
+      const ownershipClauses: any[] = [{ ownerId: ownerFilterValue }];
+      if (scopeDevices?.length) {
+        ownershipClauses.push({
+          ownerId: { $exists: false },
+          devices: { $ne: [], $not: { $elemMatch: { $nin: scopeDevices } } },
+        });
+      }
+      filter.$and = [
+        ...(filter.name ? [{ name: filter.name }] : []),
+        { $or: ownershipClauses },
+      ];
+      delete filter.name;
+    } else if (req.userRole !== 'admin') {
       const ownerId = req.effectiveUserId || req.userId;
       const assignedDevices = await Device.find({ assignedUserId: ownerId }).select('deviceId').lean();
       userDeviceIds = assignedDevices.map((device: any) => String(device.deviceId));
@@ -128,11 +194,23 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const ownerId = req.effectiveUserId || req.userId;
+    let ownerId = req.effectiveUserId || req.userId;
+    // Dealers create groups on behalf of one of their customer accounts.
+    if (req.userRole === 'dealer') {
+      const targetOwner = String(req.body.ownerId || '');
+      const customer = targetOwner
+        ? await User.findById(targetOwner).select('role parentId').lean()
+        : null;
+      if (!customer || (customer as any).role !== 'user' || String((customer as any).parentId || '') !== String(req.userId)) {
+        res.status(403).json({ error: 'Groups can only be created for your customer accounts' });
+        return;
+      }
+      ownerId = targetOwner;
+    }
     if (req.userRole !== 'admin') {
       const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: ownerId }).select('deviceId').lean();
       if (allowed.length !== (devices || []).length) {
-        res.status(403).json({ error: 'Groups can only contain devices assigned to your account' });
+        res.status(403).json({ error: 'Groups can only contain devices assigned to the selected account' });
         return;
       }
     }
@@ -190,20 +268,18 @@ export const updateGroup = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const ownerId = req.effectiveUserId || req.userId;
     if (req.userRole !== 'admin') {
-      const ownsLegacyGroup = !group.ownerId && group.devices.length > 0 &&
-        (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
-      if (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id)))) {
+      const access = await resolveGroupOwner(req, group);
+      if (!access.ok || !access.ownerId) {
         res.status(403).json({ error: 'Access denied: group does not belong to your account' });
         return;
       }
-      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: ownerId }).select('deviceId').lean();
+      const allowed = await Device.find({ deviceId: { $in: devices || [] }, assignedUserId: access.ownerId }).select('deviceId').lean();
       if (allowed.length !== (devices || []).length) {
-        res.status(403).json({ error: 'Groups can only contain devices assigned to your account' });
+        res.status(403).json({ error: 'Groups can only contain devices assigned to the group owner account' });
         return;
       }
-      group.ownerId = new mongoose.Types.ObjectId(ownerId);
+      group.ownerId = new mongoose.Types.ObjectId(access.ownerId);
     }
 
     // One device can belong to only one group — exclude this group itself
@@ -260,12 +336,12 @@ export const deleteGroup = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Group not found' });
       return;
     }
-    const ownerId = req.effectiveUserId || req.userId;
-    const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
-    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
-      res.status(403).json({ error: 'Access denied: group does not belong to your account' });
-      return;
+    if (req.userRole !== 'admin') {
+      const access = await resolveGroupOwner(req, group);
+      if (!access.ok) {
+        res.status(403).json({ error: 'Access denied: group does not belong to your account' });
+        return;
+      }
     }
     const affectedDeviceIds = [...(group.devices || [])];
     // Remove schedule templates targeting this group before deleting it
@@ -312,20 +388,23 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const ownerId = req.effectiveUserId || req.userId;
-    const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
-    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
-      res.status(403).json({ error: 'Access denied: group does not belong to your account' });
-      return;
+    let groupOwnerId: string | undefined;
+    if (req.userRole !== 'admin') {
+      const access = await resolveGroupOwner(req, group);
+      if (!access.ok || !access.ownerId) {
+        res.status(403).json({ error: 'Access denied: group does not belong to your account' });
+        return;
+      }
+      groupOwnerId = access.ownerId;
     }
 
-    // Get all devices in this group
+    // Get all devices in this group — they must belong to the group's owner
+    // account (a customer, when a dealer configures on their behalf).
     const deviceFilter: any = { deviceId: { $in: group.devices } };
-    if (req.userRole !== 'admin') deviceFilter.assignedUserId = ownerId;
+    if (req.userRole !== 'admin') deviceFilter.assignedUserId = groupOwnerId;
     const devices = await Device.find(deviceFilter);
     if (devices.length !== group.devices.length) {
-      res.status(403).json({ error: 'One or more group devices are not assigned to your account' });
+      res.status(403).json({ error: 'One or more group devices are not assigned to the group owner account' });
       return;
     }
 
@@ -335,9 +414,10 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     }
 
     // Monthly assignment-operation quota: 1 group configure = 1 op
-    // (regardless of how many devices are in the group).
-    if (req.userRole !== 'admin' && ownerId) {
-      const assignQuota = await checkAssignQuota(ownerId);
+    // (regardless of how many devices are in the group). Charged to the
+    // group's owner account.
+    if (req.userRole !== 'admin' && groupOwnerId) {
+      const assignQuota = await checkAssignQuota(groupOwnerId);
       if (!assignQuota.ok) {
         res.status(assignQuota.status || 429).json({ error: assignQuota.error });
         return;
@@ -348,7 +428,7 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     // URLs, mediaItems metadata, section field cleaning, legacy mediaUrls.
     const processed = await processConfigForStorage(
       submittedConfig,
-      req.userRole === 'admin' ? undefined : ownerId
+      req.userRole === 'admin' ? undefined : groupOwnerId
     );
     if (processed.error || !processed.config) {
       res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
@@ -486,8 +566,8 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
     const failedDeviceIds = updateResults.flatMap((result, index) => result.status === 'rejected' ? [devices[index].deviceId] : []);
 
     if (appliedDeviceIds.length > 0) {
-      if (req.userRole !== 'admin' && ownerId) {
-        await recordAssign(ownerId);
+      if (req.userRole !== 'admin' && groupOwnerId) {
+        await recordAssign(groupOwnerId);
       }
       if (previousGroupConfig && JSON.stringify(previousGroupConfig) !== JSON.stringify(config)) {
         group.configHistory = [
@@ -572,17 +652,17 @@ export const configureGroup = async (req: AuthRequest, res: Response): Promise<v
 };
 
 const canAccessGroup = async (group: any, req: AuthRequest): Promise<boolean> => {
-  if (req.userRole === 'admin') return true;
-  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))) return false;
-  const ownerId = req.effectiveUserId || req.userId;
-  const ownsLegacyGroup = !group.ownerId && group.devices.length > 0 &&
-    (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
-  return group.ownerId?.toString() === ownerId || ownsLegacyGroup;
+  const access = await resolveGroupOwner(req, group);
+  return access.ok;
 };
 
 const findGroupDevices = async (group: any, req: AuthRequest) => {
   const deviceFilter: any = { deviceId: { $in: group.devices } };
-  if (req.userRole !== 'admin') deviceFilter.assignedUserId = req.effectiveUserId || req.userId;
+  if (req.userRole !== 'admin') {
+    // Devices must belong to the group's owner account (a customer for dealers).
+    const access = await resolveGroupOwner(req, group);
+    deviceFilter.assignedUserId = access.ownerId || req.effectiveUserId || req.userId;
+  }
   return Device.find(deviceFilter);
 };
 
@@ -602,7 +682,12 @@ export const triggerGroupEmergency = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
-    const { alert, error } = await buildEmergencyAlert(req.body, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId), req.userId);
+    const emergencyAccess = await resolveGroupOwner(req, group);
+    const { alert, error } = await buildEmergencyAlert(
+      req.body,
+      req.userRole === 'admin' ? undefined : (emergencyAccess.ownerId || req.effectiveUserId || req.userId),
+      req.userId
+    );
     if (!alert) {
       res.status(400).json({ error: error || 'Invalid emergency alert payload' });
       return;
@@ -692,12 +777,12 @@ export const getGroupConfigHistory = async (req: AuthRequest, res: Response): Pr
       res.status(404).json({ error: 'Group not found' });
       return;
     }
-    const ownerId = req.effectiveUserId || req.userId;
-    const ownsLegacyGroup = req.userRole !== 'admin' && !group.ownerId && group.devices.length > 0 &&
-      (await Device.countDocuments({ deviceId: { $in: group.devices }, assignedUserId: ownerId })) === group.devices.length;
-    if (req.userRole !== 'admin' && (group.ownerId?.toString() !== ownerId && !ownsLegacyGroup || (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String(group._id))))) {
-      res.status(403).json({ error: 'Access denied' });
-      return;
+    if (req.userRole !== 'admin') {
+      const access = await resolveGroupOwner(req, group);
+      if (!access.ok) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
     }
     res.json({ entries: [...(group.configHistory || [])].slice(0, 2).reverse() });
   } catch (error) {

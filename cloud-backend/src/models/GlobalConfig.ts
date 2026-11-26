@@ -10,21 +10,24 @@ export interface IGlobalConfig extends Document {
   archivedMediaRetentionDays: number;
   apkVersion: string;
   apkUrl?: string;
+  /** Global CMS logo filename served via /api/branding/:file (fallback when no dealer logo). */
+  logoUrl?: string;
   createdAt: Date;
   updatedAt: Date;
 }
 
 const GlobalConfigSchema = new Schema<IGlobalConfig>(
   {
-    monthlyUploadLimitGB: { type: Number, default: 10 },
+    monthlyUploadLimitGB: { type: Number, default: 2 },
     singleUploadLimitMB: { type: Number, default: 500 },
     storageLimitGB: { type: Number, default: 1 },
-    monthlyUploadOpsLimit: { type: Number, default: 10 },
+    monthlyUploadOpsLimit: { type: Number, default: 100 },
     monthlyAssignOpsLimit: { type: Number, default: 15 },
     maxDevicesPerUser: { type: Number, default: 4 },
     archivedMediaRetentionDays: { type: Number, default: 30 },
     apkVersion: { type: String, default: '1.0.0' },
     apkUrl: { type: String },
+    logoUrl: { type: String, trim: true },
   },
   { timestamps: true }
 );

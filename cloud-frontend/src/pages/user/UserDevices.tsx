@@ -9,6 +9,7 @@ import { Wifi, WifiOff, Settings, Layers, Clock, Monitor } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { subscribeToDeviceUpdates } from '../../services/socket';
 import { SkeletonTable } from '../../components/ui/Skeleton';
+import { areaBasePath, getUserArea, readStoredUser } from '../../utils/userArea';
 
 const formatLastSeen = (lastSeen: string | Date): string => {
   const date = new Date(lastSeen);
@@ -81,7 +82,7 @@ export const UserDevices = () => {
   };
 
   const handleConfigure = (deviceId: string) => {
-    navigate(`/user/devices/${deviceId}`);
+    navigate(`${areaBasePath(getUserArea(readStoredUser()))}/devices/${deviceId}`);
   };
 
   const paginatedDevices = filteredDevices;

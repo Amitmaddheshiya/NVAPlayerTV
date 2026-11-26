@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import User from '../models/User';
 import Device from '../models/Device';
 import Media from '../models/Media';
@@ -15,10 +16,33 @@ import { cacheGet, cacheSet, cacheDel, cacheDelPattern } from '../config/redis';
 import { invalidateDevicePaths, invalidateMediaAuth } from '../utils/fileAccessCache';
 import { checkDeviceLimit } from '../utils/quota';
 
-const isSubUserAccount = (user: any): boolean => user?.role === 'sub-user' || !!user?.parentId;
+// Sub-user is an explicit role. Dealer customers also carry parentId but are
+// full 'user' accounts — they must NOT be treated as sub-users.
+const isSubUserAccount = (user: any): boolean => user?.role === 'sub-user';
 const presentUser = (user: any): any => {
   const value = typeof user?.toObject === 'function' ? user.toObject() : user;
   return value ? { ...value, role: isSubUserAccount(value) ? 'sub-user' : value.role } : value;
+};
+
+/**
+ * Account origin for display: admin / dealer / user / d-user (dealer
+ * customer) / sub-user / d-sub-user (sub-user of a dealer customer).
+ */
+export const resolveAccountType = async (user: any): Promise<string> => {
+  if (!user) return 'user';
+  if (user.role === 'admin') return 'admin';
+  if (user.role === 'dealer') return 'dealer';
+  const parent = user.parentId
+    ? await User.findById(user.parentId).select('role parentId').lean()
+    : null;
+  if (user.role === 'sub-user') {
+    if (parent?.parentId) {
+      const grand = await User.findById(parent.parentId).select('role').lean();
+      if ((grand as any)?.role === 'dealer') return 'd-sub-user';
+    }
+    return 'sub-user';
+  }
+  return (parent as any)?.role === 'dealer' ? 'd-user' : 'user';
 };
 
 export const getUsers = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -35,14 +59,25 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
       ];
     }
 
-    // Role filter
-    if (role === 'sub-user') {
-      filter.$and = [{ $or: [{ role: 'sub-user' }, { parentId: { $exists: true, $ne: null } }] }];
+    // Role filter — dealers only ever see their own customer accounts.
+    if (req.userRole === 'dealer') {
+      filter.parentId = req.userId;
+      filter.role = 'user';
+    } else if (role === 'sub-user') {
+      filter.$and = [{ $or: [{ role: 'sub-user' }, { role: 'user', parentId: { $exists: true, $ne: null } }] }];
     } else if (role === 'user') {
-      // Legacy child accounts may still have role=user; keep them in the Sub-user filter.
-      filter.$and = [{ role: 'user' }, { parentId: null }];
+      // 'user' role = standalone accounts only; dealer customers are managed
+      // from the dealer screen and legacy child accounts stay under sub-user.
+      filter.$and = [{ role: 'user' }, { $or: [{ parentId: null }, { parentId: { $exists: false } }] }];
     } else if (role) {
       filter.role = role;
+    } else if (req.userRole !== 'admin') {
+      // Default list hides sub-users and dealer accounts.
+      filter.$and = [
+        { $or: [{ role: { $exists: false } }, { role: { $ne: 'sub-user' } }] },
+        { $or: [{ role: { $exists: false } }, { role: { $ne: 'dealer' } }] },
+        { $or: [{ parentId: { $exists: false } }, { parentId: null }] },
+      ];
     }
 
     // Parse pagination parameters
@@ -94,10 +129,27 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
     const parentIds = [...new Set(
       users.filter((u: any) => u.parentId).map((u: any) => String(u.parentId))
     )];
-    const parents = parentIds.length
-      ? await User.find({ _id: { $in: parentIds } }).select('currentMonthUpload uploadUsageMonth storageUsed').lean()
-      : [];
+    const [parents, dealerDocs] = await Promise.all([
+      parentIds.length
+        ? User.find({ _id: { $in: parentIds } }).select('currentMonthUpload uploadUsageMonth storageUsed role parentId').lean()
+        : Promise.resolve([]),
+      User.find({ role: 'dealer' }).select('_id').lean(),
+    ]);
     const parentUsageById = new Map(parents.map((p: any) => [String(p._id), p]));
+    const parentById = new Map(parents.map((p: any) => [String(p._id), p]));
+    const dealerIds = new Set(dealerDocs.map((d: any) => String(d._id)));
+
+    // Account origin: admin / dealer / user / d-user (dealer customer) /
+    // sub-user / d-sub-user (sub-user of a dealer customer).
+    const accountTypeOf = (u: any): string => {
+      if (u.role === 'admin') return 'admin';
+      if (u.role === 'dealer') return 'dealer';
+      const parent: any = u.parentId ? parentById.get(String(u.parentId)) : null;
+      if (u.role === 'sub-user') {
+        return parent?.parentId && dealerIds.has(String(parent.parentId)) ? 'd-sub-user' : 'sub-user';
+      }
+      return parent?.role === 'dealer' ? 'd-user' : 'user';
+    };
 
     const enrichedUsers = users.map((u: any) => {
       const presented = presentUser(u);
@@ -109,6 +161,7 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
         : 0;
       return {
         ...presented,
+        accountType: accountTypeOf(u),
         monthlyUploadLimit: isAdmin ? null : monthlyLimitGB,
         currentMonthUpload: usedBytes,
         storageUsed: isSub ? Number(usageSource?.storageUsed || 0) : Number(u.storageUsed || 0),
@@ -152,7 +205,7 @@ export const getUser = async (req: AuthRequest, res: Response): Promise<void> =>
     }
 
     // Cache the result (TTL: 300 seconds = 5 minutes)
-    const response = presentUser(user);
+    const response = { ...presentUser(user), accountType: await resolveAccountType(user) };
     await cacheSet(cacheKey, JSON.stringify(response), 300);
 
     res.json(response);
@@ -176,6 +229,7 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
     const quotaUser = (isSub && user.parentId
       ? await User.findById(user.parentId).select('-password')
       : null) || user;
+    const accountType = await resolveAccountType(user);
 
     const currentMonth = new Date().toISOString().slice(0, 7);
     if (quotaUser.uploadUsageMonth !== currentMonth) {
@@ -194,6 +248,7 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
     const GB = 1024 * 1024 * 1024;
     res.json({
       ...presentUser(user),
+      accountType,
       isSubUser: isSub,
       quotaAccountId: String(quotaUser._id),
       totalDevices,
@@ -235,7 +290,7 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
 
 export const createUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { email, password, phone, businessName, role, subUserLimit } = req.body;
+    const { email, password, phone, city, businessName, role, subUserLimit, deviceLimit, userLimit, logoUrl } = req.body;
 
     // Validation
     if (!email || !password) {
@@ -253,8 +308,8 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    if (role && !['admin', 'user'].includes(role)) {
-      res.status(400).json({ error: 'Invalid role. Must be admin or user' });
+    if (role && !['admin', 'user', 'dealer'].includes(role)) {
+      res.status(400).json({ error: 'Invalid role. Must be admin, user, or dealer' });
       return;
     }
 
@@ -265,15 +320,25 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    const effectiveRole = role || 'user';
 
-    const user = new User({
+    const userData: any = {
       email,
       password: hashedPassword,
       phone,
+      city,
       businessName,
-      role: role || 'user',
-      subUserLimit: role === 'admin' ? 0 : Math.max(0, parseInt(subUserLimit, 10) || 0),
-    });
+      role: effectiveRole,
+    };
+    if (effectiveRole === 'dealer') {
+      userData.deviceLimit = Math.max(0, parseInt(deviceLimit, 10) || 0);
+      userData.userLimit = Math.max(0, parseInt(userLimit, 10) || 0);
+      if (logoUrl) userData.logoUrl = String(logoUrl).trim();
+    } else {
+      userData.subUserLimit = effectiveRole === 'admin' ? 0 : Math.max(0, parseInt(subUserLimit, 10) || 0);
+    }
+
+    const user = new User(userData);
 
     await user.save();
 
@@ -304,14 +369,14 @@ export const createUser = async (req: AuthRequest, res: Response): Promise<void>
 
 export const updateUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { email, password, phone, businessName, role, subUserLimit } = req.body;
+    const { email, password, phone, city, businessName, role, subUserLimit, deviceLimit, userLimit, logoUrl } = req.body;
     const existingUser = await User.findById(req.params.id);
     if (!existingUser) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
-    if (role && !['admin', 'user', 'sub-user'].includes(role)) {
-      res.status(400).json({ error: 'Invalid role. Must be admin, user, or sub-user' });
+    if (role && !['admin', 'user', 'dealer', 'sub-user'].includes(role)) {
+      res.status(400).json({ error: 'Invalid role. Must be admin, user, dealer, or sub-user' });
       return;
     }
     if (isSubUserAccount(existingUser) && role && role !== 'sub-user') {
@@ -341,15 +406,36 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
       updateData.email = normalizedEmail;
     }
     if (phone) updateData.phone = phone;
+    if (city !== undefined) updateData.city = city;
     if (businessName) updateData.businessName = businessName;
     if (role) updateData.role = role;
-    if (subUserLimit !== undefined) updateData.subUserLimit = Math.max(0, parseInt(subUserLimit, 10) || 0);
+
+    // Role-aware limit fields: dealers carry deviceLimit/userLimit/logoUrl,
+    // regular accounts carry subUserLimit. Switching roles resets the other set.
+    const effectiveRole = role || existingUser.role;
+    if (effectiveRole === 'dealer') {
+      if (deviceLimit !== undefined) updateData.deviceLimit = Math.max(0, parseInt(deviceLimit, 10) || 0);
+      if (userLimit !== undefined) updateData.userLimit = Math.max(0, parseInt(userLimit, 10) || 0);
+      if (logoUrl !== undefined) updateData.logoUrl = logoUrl ? String(logoUrl).trim() : null;
+      updateData.subUserLimit = 0;
+    } else {
+      if (subUserLimit !== undefined) updateData.subUserLimit = Math.max(0, parseInt(subUserLimit, 10) || 0);
+      if (effectiveRole !== 'dealer') {
+        updateData.deviceLimit = 0;
+        updateData.userLimit = 0;
+        updateData.logoUrl = null;
+      }
+    }
     if (password) {
       updateData.password = await bcrypt.hash(password, 10);
     }
 
-    // Normalize legacy child accounts the next time an admin edits them.
-    if (existingUser.parentId) updateData.role = 'sub-user';
+    // Normalize legacy child accounts the next time an admin edits them —
+    // but NOT dealer customers (parentId → dealer is a legitimate account).
+    if (existingUser.parentId) {
+      const parent = await User.findById(existingUser.parentId).select('role').lean();
+      if (parent?.role !== 'dealer') updateData.role = 'sub-user';
+    }
     const user = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).select('-password');
 
     // Invalidate user cache on update
@@ -386,6 +472,100 @@ export const updateUser = async (req: AuthRequest, res: Response): Promise<void>
   }
 };
 
+/**
+ * Fully removes a user account and everything it owns: media files, device
+ * configs, schedule templates, group memberships, sub-users — and, for dealer
+ * accounts, the entire customer tree. Shared by admin user delete and dealer
+ * customer delete so both paths clean up identically.
+ */
+export const purgeUserAccount = async (user: any): Promise<{ devicesUnassigned: number; mediaDeleted: number }> => {
+  const io = getSocketInstance();
+
+  // Dealer accounts own a whole customer tree — every account in the tree
+  // gets the same cleanup a standalone user delete would get.
+  const treeUsers = user.role === 'dealer'
+    ? await User.find({ parentId: user._id, role: 'user' }).select('_id').lean()
+    : [];
+  const treeIdStrings = [String(user._id), ...treeUsers.map((u: any) => String(u._id))];
+
+  let totalDevicesUnassigned = 0;
+  let totalMediaDeleted = 0;
+
+  for (const accountId of treeIdStrings) {
+      const assignedDevices = await Device.find({ assignedUserId: accountId });
+      const assignedDeviceIds = assignedDevices.map((device) => device.deviceId);
+      const userMedia = await Media.find({ uploadedBy: accountId });
+      totalDevicesUnassigned += assignedDeviceIds.length;
+      totalMediaDeleted += userMedia.length;
+
+      // Remove this account's content from stored device configs before deleting the files.
+      for (const media of userMedia) {
+        await getStorageService(media.storageType).delete(media.path);
+        await invalidateMediaAuth(media.path);
+        const devices = await Device.find({
+          $or: [
+            { 'config.mediaUrls': media.url },
+            { 'config.sections.mediaUrls': media.url },
+          ],
+        });
+        for (const device of devices) {
+          device.config.mediaUrls = (device.config.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== media.path);
+          if (Array.isArray(device.config.sections)) {
+            device.config.sections = device.config.sections.map((section: any) => ({
+              ...section,
+              mediaUrls: (section.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== media.path),
+              mediaItems: (section.mediaItems || []).filter((item: any) => getMediaPathFromUrl(item.url) !== media.path),
+            }));
+            if (device.config.layout === 'fullscreen') device.config.mediaUrls = device.config.sections[0]?.mediaUrls || [];
+          }
+          if (device.cacheInfo) device.cacheInfo.configVersion += 1;
+          await device.save();
+          await invalidateDevicePaths(device.deviceId);
+          io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
+        }
+      }
+
+      for (const device of assignedDevices) {
+        device.config = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;
+        delete (device.config as any).schedule;
+        if (device.cacheInfo) {
+          device.cacheInfo.configVersion += 1;
+          device.cacheInfo.lastSyncTime = new Date();
+          device.cacheInfo.cachedMedia = [];
+        }
+        await device.save();
+        await invalidateDevicePaths(device.deviceId);
+        io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
+      }
+
+      // Remove schedule templates owned by this account (and its sub-users)
+      const subUserIds = await User.find({ parentId: accountId }).select('_id').lean();
+      await ScheduleTemplate.deleteMany({ ownerId: { $in: [accountId, ...subUserIds.map((u: any) => u._id)] } });
+
+      // Unassign devices and detach them from groups owned by this account.
+      await Device.updateMany(
+        { assignedUserId: accountId },
+        { assignedUserId: undefined }
+      );
+      await Media.deleteMany({ uploadedBy: accountId });
+      if (assignedDeviceIds.length) {
+        await Group.updateMany({ devices: { $in: assignedDeviceIds } }, { $pull: { devices: { $in: assignedDeviceIds } } });
+      }
+      await Group.deleteMany({ ownerId: accountId });
+    }
+
+    // Delete the user(s): the account itself, its customers (dealer tree) and
+    // every sub-user under any of them. Data cleanup already ran above.
+    await User.deleteMany({ parentId: { $in: treeIdStrings } });
+    await User.deleteMany({ _id: { $in: treeIdStrings } });
+
+    // Invalidate user cache on delete
+    await cacheDelPattern('users:*');
+    for (const id of treeIdStrings) await cacheDel(`user:${id}`);
+
+    return { devicesUnassigned: totalDevicesUnassigned, mediaDeleted: totalMediaDeleted };
+};
+
 export const deleteUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = await User.findById(req.params.id);
@@ -394,73 +574,7 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const assignedDevices = await Device.find({ assignedUserId: req.params.id });
-    const assignedDeviceIds = assignedDevices.map((device) => device.deviceId);
-    const userMedia = await Media.find({ uploadedBy: req.params.id });
-    const io = getSocketInstance();
-
-    // Remove this user's content from stored device configs before deleting the files.
-    for (const media of userMedia) {
-      await getStorageService(media.storageType).delete(media.path);
-      await invalidateMediaAuth(media.path);
-      const devices = await Device.find({
-        $or: [
-          { 'config.mediaUrls': media.url },
-          { 'config.sections.mediaUrls': media.url },
-        ],
-      });
-      for (const device of devices) {
-        device.config.mediaUrls = (device.config.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== media.path);
-        if (Array.isArray(device.config.sections)) {
-          device.config.sections = device.config.sections.map((section: any) => ({
-            ...section,
-            mediaUrls: (section.mediaUrls || []).filter((url: string) => getMediaPathFromUrl(url) !== media.path),
-            mediaItems: (section.mediaItems || []).filter((item: any) => getMediaPathFromUrl(item.url) !== media.path),
-          }));
-          if (device.config.layout === 'fullscreen') device.config.mediaUrls = device.config.sections[0]?.mediaUrls || [];
-        }
-        if (device.cacheInfo) device.cacheInfo.configVersion += 1;
-        await device.save();
-        await invalidateDevicePaths(device.deviceId);
-        io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
-      }
-    }
-
-    for (const device of assignedDevices) {
-      device.config = { ...device.config, layout: 'fullscreen', sections: [], mediaUrls: [], ticker: { text: '' } } as any;
-      delete (device.config as any).schedule;
-      if (device.cacheInfo) {
-        device.cacheInfo.configVersion += 1;
-        device.cacheInfo.lastSyncTime = new Date();
-        device.cacheInfo.cachedMedia = [];
-      }
-      await device.save();
-      await invalidateDevicePaths(device.deviceId);
-      io.to(`device:${device.deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo?.configVersion || 0 });
-    }
-
-    // Remove schedule templates owned by this account (and its sub-users)
-    const subUserIds = await User.find({ parentId: req.params.id }).select('_id').lean();
-    await ScheduleTemplate.deleteMany({ ownerId: { $in: [req.params.id, ...subUserIds.map((u: any) => u._id)] } });
-
-    // Unassign devices and detach them from groups owned by this account.
-    await Device.updateMany(
-      { assignedUserId: req.params.id },
-      { assignedUserId: undefined }
-    );
-    await Media.deleteMany({ uploadedBy: req.params.id });
-    if (assignedDeviceIds.length) {
-      await Group.updateMany({ devices: { $in: assignedDeviceIds } }, { $pull: { devices: { $in: assignedDeviceIds } } });
-    }
-    await Group.deleteMany({ ownerId: req.params.id });
-
-    // Delete the user (and any sub-users they created)
-    await User.deleteMany({ parentId: req.params.id });
-    await User.findByIdAndDelete(req.params.id);
-
-    // Invalidate user cache on delete
-    await cacheDelPattern('users:*');
-    await cacheDel(`user:${req.params.id}`);
+    const totals = await purgeUserAccount(user);
 
     if (req.userId) {
       await AuditLog.create({
@@ -471,8 +585,8 @@ export const deleteUser = async (req: AuthRequest, res: Response): Promise<void>
         details: {
           email: user.email,
           role: user.role,
-          devicesUnassigned: assignedDeviceIds.length,
-          mediaDeleted: userMedia.length,
+          devicesUnassigned: totals.devicesUnassigned,
+          mediaDeleted: totals.mediaDeleted,
         },
         ipAddress: req.ip,
         userAgent: req.get('user-agent'),
@@ -502,17 +616,80 @@ export const assignDevices = async (req: AuthRequest, res: Response): Promise<vo
       res.status(404).json({ error: 'User not found' });
       return;
     }
-    if (isSubUserAccount(user)) {
-      res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
+    if (isSubUserAccount(user) || user.role === 'dealer') {
+      res.status(400).json({ error: 'Devices cannot be assigned to a sub-user or dealer account. Assign them to a customer account instead.' });
+      return;
+    }
+
+    // Dealers may only assign devices to their own customer accounts.
+    if (req.userRole === 'dealer' && (String(user.parentId || '') !== String(req.userId) || user.role !== 'user')) {
+      res.status(403).json({ error: 'Devices can only be assigned to your customer accounts' });
       return;
     }
 
     const requestedDevices = normalizedDeviceIds.length
-      ? await Device.find({ deviceId: { $in: normalizedDeviceIds } }).select('deviceId assignedUserId').lean()
+      ? await Device.find({ deviceId: { $in: normalizedDeviceIds } }).select('deviceId assignedUserId createdBy').lean()
       : [];
     if (requestedDevices.length !== normalizedDeviceIds.length) {
       res.status(400).json({ error: 'One or more device IDs do not exist' });
       return;
+    }
+
+    // Dealer deviceLimit caps the whole customer tree. Projected tree total =
+    // current tree devices − this user's devices leaving the tree + devices
+    // entering the tree from outside it.
+    if (req.userRole === 'dealer' && req.scopeUserIds?.length) {
+      const scopeIds = req.scopeUserIds.map(String);
+      // Scope guard: a dealer may only assign devices that are already inside
+      // their tree, or unassigned devices they created themselves. Devices
+      // owned by other accounts (admin pool, other dealers, other customers)
+      // must never be assignable by deviceId alone.
+      const outOfScope = requestedDevices.filter((d: any) => {
+        const owner = String(d.assignedUserId || '');
+        if (owner) return !scopeIds.includes(owner);
+        return String(d.createdBy || '') !== String(req.userId);
+      });
+      if (outOfScope.length) {
+        res.status(403).json({ error: 'Devices can only be assigned from your own inventory or customer accounts' });
+        return;
+      }
+      const dealer = await User.findById(req.userId).select('deviceLimit').lean();
+      const treeLimit = Number((dealer as any)?.deviceLimit || 0);
+      if (treeLimit > 0) {
+        const currentTreeCount = await Device.countDocuments({
+          $or: [
+            { assignedUserId: { $in: scopeIds } },
+            { createdBy: new mongoose.Types.ObjectId(req.userId!), assignedUserId: { $in: [...scopeIds, null] } },
+          ],
+        });
+        const userCurrentCount = await Device.countDocuments({ assignedUserId: userId });
+        const stayingCount = requestedDevices.filter((d: any) => String(d.assignedUserId || '') === userId).length;
+        // Devices already inside the tree (in-scope assignees, or unassigned
+        // dealer-created devices counted via createdBy) do not "enter" — only
+        // devices coming from outside the tree would, and the scope guard
+        // above makes those impossible.
+        const enteringCount = requestedDevices.filter((d: any) => {
+          const owner = String(d.assignedUserId || '');
+          if (owner) return !scopeIds.includes(owner);
+          return String(d.createdBy || '') !== String(req.userId);
+        }).length;
+        // Devices leaving this user but created by the dealer stay inside the
+        // tree via createdBy even after unassignment — they must not count as
+        // leaving or the projected total would under-count.
+        const leavingButStillInTree = await Device.countDocuments({
+          assignedUserId: userId,
+          deviceId: { $nin: normalizedDeviceIds },
+          createdBy: new mongoose.Types.ObjectId(req.userId!),
+        });
+        const leavingCount = userCurrentCount - stayingCount - leavingButStillInTree;
+        const projected = currentTreeCount - leavingCount + enteringCount;
+        if (projected > treeLimit) {
+          res.status(400).json({
+            error: `Dealer device limit reached. Your plan allows ${treeLimit} TV(s) across all customer accounts; this assignment would give the tree ${projected}. Remove a device or contact your administrator.`,
+          });
+          return;
+        }
+      }
     }
 
     // Per-account device limit (plan-based, admin-tunable via GlobalConfig).
@@ -719,6 +896,26 @@ const SUB_USER_PERMISSION_KEYS = ['devices', 'groups', 'library', 'settings'] as
 
 const isParentUser = (req: AuthRequest): boolean => req.userRole === 'user' && !req.isSubUser;
 
+/**
+ * Resolve which account's sub-users may be managed by this request.
+ * - 'user' role → their own account
+ * - 'dealer' → one of their customer accounts (req.params.customerId)
+ */
+const resolveSubUserParent = async (req: AuthRequest): Promise<{ parent?: any; error?: string; status?: number }> => {
+  if (isParentUser(req)) {
+    const parent = await User.findById(req.userId).select('subUserLimit role');
+    return { parent };
+  }
+  if (req.userRole === 'dealer' && req.params.customerId) {
+    const parent = await User.findById(req.params.customerId).select('subUserLimit role parentId').lean();
+    if (!parent || (parent as any).role !== 'user' || String((parent as any).parentId || '') !== String(req.userId)) {
+      return { error: 'Sub-users can only be managed for your customer accounts', status: 403 };
+    }
+    return { parent };
+  }
+  return { error: 'Only account owners can manage sub-users', status: 403 };
+};
+
 const sanitizePermissions = (input: any) => {
   const permissions: Record<string, boolean> = {};
   for (const key of SUB_USER_PERMISSION_KEYS) {
@@ -754,13 +951,23 @@ const validateResourceAccess = async (parentId: string, access: { devices: strin
 
 export const getSubUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!isParentUser(req)) {
-      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+    const { parent, error, status } = await resolveSubUserParent(req);
+    if (!parent) {
+      res.status(status || 403).json({ error: error || 'Only account owners can manage sub-users' });
       return;
     }
-    const parent = await User.findById(req.userId).select('subUserLimit');
-    const subUsers = await User.find({ parentId: req.userId }).select('-password').sort({ createdAt: -1 });
-    res.json({ data: subUsers.map(presentUser), limit: parent?.subUserLimit || 0, count: subUsers.length });
+    const subUsers = await User.find({ parentId: parent._id }).select('-password').sort({ createdAt: -1 });
+    // Sub-users of a dealer customer are 'd-sub-user'; of a normal user 'sub-user'.
+    let accountType = 'sub-user';
+    if (parent.parentId) {
+      const grand = await User.findById(parent.parentId).select('role').lean();
+      if ((grand as any)?.role === 'dealer') accountType = 'd-sub-user';
+    }
+    res.json({
+      data: subUsers.map((su: any) => ({ ...presentUser(su), accountType })),
+      limit: parent.subUserLimit || 0,
+      count: subUsers.length,
+    });
   } catch (error) {
     console.error('Get sub-users error:', error);
     res.status(500).json({ error: 'Failed to fetch sub-users' });
@@ -769,8 +976,9 @@ export const getSubUsers = async (req: AuthRequest, res: Response): Promise<void
 
 export const createSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!isParentUser(req)) {
-      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+    const { parent, error, status } = await resolveSubUserParent(req);
+    if (!parent) {
+      res.status(status || 403).json({ error: error || 'Only account owners can manage sub-users' });
       return;
     }
     const { email, password, permissions, resourceAccess } = req.body;
@@ -788,13 +996,8 @@ export const createSubUser = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    const parent = await User.findById(req.userId);
-    if (!parent) {
-      res.status(404).json({ error: 'Account not found' });
-      return;
-    }
     const limit = Number(parent.subUserLimit || 0);
-    const existingCount = await User.countDocuments({ parentId: req.userId });
+    const existingCount = await User.countDocuments({ parentId: parent._id });
     if (limit <= 0 || existingCount >= limit) {
       res.status(400).json({ error: `Sub-user limit reached (${existingCount}/${limit}). Ask admin to increase the limit.` });
       return;
@@ -817,7 +1020,7 @@ export const createSubUser = async (req: AuthRequest, res: Response): Promise<vo
       email: normalizedEmail,
       password: await bcrypt.hash(password, 10),
       role: 'sub-user',
-      parentId: req.userId,
+      parentId: parent._id,
       permissions: sanitizePermissions(permissions),
       resourceAccess: safeResourceAccess,
       subUserLimit: 0,
@@ -834,11 +1037,12 @@ export const createSubUser = async (req: AuthRequest, res: Response): Promise<vo
 
 export const updateSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!isParentUser(req)) {
-      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+    const { parent, error, status } = await resolveSubUserParent(req);
+    if (!parent) {
+      res.status(status || 403).json({ error: error || 'Only account owners can manage sub-users' });
       return;
     }
-    const subUser = await User.findOne({ _id: req.params.id, parentId: req.userId });
+    const subUser = await User.findOne({ _id: req.params.id, parentId: parent._id });
     if (!subUser) {
       res.status(404).json({ error: 'Sub-user not found' });
       return;
@@ -871,7 +1075,7 @@ export const updateSubUser = async (req: AuthRequest, res: Response): Promise<vo
     }
     if (resourceAccess !== undefined) {
       const safeResourceAccess = sanitizeResourceAccess(resourceAccess);
-      const resourceAccessError = await validateResourceAccess(String(req.userId), safeResourceAccess);
+      const resourceAccessError = await validateResourceAccess(String(parent._id), safeResourceAccess);
       if (resourceAccessError) {
         res.status(403).json({ error: resourceAccessError });
         return;
@@ -894,11 +1098,12 @@ export const updateSubUser = async (req: AuthRequest, res: Response): Promise<vo
 
 export const deleteSubUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!isParentUser(req)) {
-      res.status(403).json({ error: 'Only account owners can manage sub-users' });
+    const { parent, error, status } = await resolveSubUserParent(req);
+    if (!parent) {
+      res.status(status || 403).json({ error: error || 'Only account owners can manage sub-users' });
       return;
     }
-    const subUser = await User.findOne({ _id: req.params.id, parentId: req.userId });
+    const subUser = await User.findOne({ _id: req.params.id, parentId: parent._id });
     if (!subUser) {
       res.status(404).json({ error: 'Sub-user not found' });
       return;

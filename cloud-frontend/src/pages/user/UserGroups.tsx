@@ -8,8 +8,10 @@ import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Plus, Edit, Trash2, Monitor, Layers, Settings, Search } from 'lucide-react';
 import { SkeletonTable } from '../../components/ui/Skeleton';
+import { areaBasePath, getUserArea, readStoredUser } from '../../utils/userArea';
 
-export const UserGroups = () => {
+export const UserGroups = ({ ownerId, basePath }: { ownerId?: string; basePath?: string } = {}) => {
+  const resolvedBasePath = basePath || areaBasePath(getUserArea(readStoredUser()));
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [showForm, setShowForm] = useState(false);
@@ -19,19 +21,20 @@ export const UserGroups = () => {
   const groupsPerPage = 10;
 
   const groupsQuery = useQuery({
-    queryKey: ['user-groups', currentPage, searchTerm],
+    queryKey: ['user-groups', currentPage, searchTerm, ownerId],
     queryFn: async () => {
       const params: any = { page: currentPage, limit: groupsPerPage };
       if (searchTerm) params.search = searchTerm;
+      if (ownerId) params.ownerId = ownerId;
       const response = await groupAPI.getGroups(params);
       return response.data;
     },
   });
 
   const devicesQuery = useQuery({
-    queryKey: ['user-groups-devices'],
+    queryKey: ['user-groups-devices', ownerId],
     queryFn: async () => {
-      const response = await deviceAPI.getDevices({ page: 1, limit: 1000 });
+      const response = await deviceAPI.getDevices({ page: 1, limit: 1000, assignedUserId: ownerId || undefined });
       return response.data.data || response.data;
     },
     staleTime: 5 * 60 * 1000,
@@ -40,9 +43,9 @@ export const UserGroups = () => {
   // All groups (unpaginated) — needed to know which group each device belongs
   // to when creating/editing, since the table only loads one page at a time.
   const allGroupsQuery = useQuery({
-    queryKey: ['user-groups-all'],
+    queryKey: ['user-groups-all', ownerId],
     queryFn: async () => {
-      const response = await groupAPI.getGroups({ page: 1, limit: 1000 });
+      const response = await groupAPI.getGroups({ page: 1, limit: 1000, ownerId });
       return response.data?.data || response.data || [];
     },
     staleTime: 30 * 1000,
@@ -89,7 +92,7 @@ export const UserGroups = () => {
       if (editingGroup) {
         await groupAPI.updateGroup(editingGroup._id, formData.name, formData.devices);
       } else {
-        await groupAPI.createGroup(formData.name, formData.devices);
+        await groupAPI.createGroup(formData.name, formData.devices, ownerId);
       }
       setShowForm(false);
       setEditingGroup(null);
@@ -187,7 +190,7 @@ export const UserGroups = () => {
   };
 
   const handleConfigure = (groupId: string) => {
-    navigate(`/user/groups/${groupId}/configure`);
+    navigate(`${resolvedBasePath}/groups/${groupId}/configure`);
   };
 
   const getDeviceCount = (deviceIds: string[]) => {

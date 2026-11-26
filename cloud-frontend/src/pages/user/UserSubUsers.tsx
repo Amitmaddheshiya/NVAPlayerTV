@@ -7,6 +7,7 @@ import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
 import { Plus, Edit, Trash2, Users, ShieldCheck } from 'lucide-react';
 import { SkeletonTable } from '../../components/ui/Skeleton';
+import { RoleBadge } from '../../components/ui/RoleBadge';
 
 const PERMISSION_OPTIONS = [
   { key: 'devices', label: 'Devices', description: 'View and manage devices & configuration' },
@@ -272,7 +273,9 @@ export const UserSubUsers = () => {
               <tbody className="divide-y divide-gray-200">
                 {subUsers.map((sub) => (
                   <tr key={sub._id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 font-medium text-gray-900">{sub.email}</td>
+                    <td className="px-4 py-3 font-medium text-gray-900">
+                      <div className="flex items-center gap-2">{sub.email}<RoleBadge accountType={sub.accountType} role={sub.role} /></div>
+                    </td>
                     <td className="px-4 py-3 text-gray-600 text-xs">{permissionSummary(sub.permissions)}</td>
                     <td className="px-4 py-3 text-gray-500 text-xs">{new Date(sub.createdAt).toLocaleDateString()}</td>
                     <td className="px-4 py-3">

@@ -1,7 +1,9 @@
-import { type ReactNode, useState } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Layout, LayoutDashboard, Monitor, Layers, Library, Settings, LogOut, Menu, X, Users } from 'lucide-react';
-import { authAPI } from '../services/api';
+import { LayoutDashboard, Monitor, Layers, Library, Settings, LogOut, Menu, X, Users } from 'lucide-react';
+import { authAPI, userAPI } from '../services/api';
+import { areaBasePath, getUserArea } from '../utils/userArea';
+import { BrandLogo } from './BrandLogo';
 
 interface UserLayoutProps {
   children: ReactNode;
@@ -12,18 +14,33 @@ export const UserLayout = ({ children }: UserLayoutProps) => {
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const user = JSON.parse(localStorage.getItem('user') || '{}');
+  const [user, setUser] = useState<any>(() => JSON.parse(localStorage.getItem('user') || '{}'));
+
+  // Refresh the stored profile on mount — dealer/admin may have changed
+  // subUserLimit, permissions or role since the last login.
+  useEffect(() => {
+    userAPI.getMe().then((res) => {
+      const fresh = res.data || {};
+      setUser((prev: any) => {
+        const merged = { ...prev, ...fresh };
+        localStorage.setItem('user', JSON.stringify(merged));
+        return merged;
+      });
+    }).catch(() => {});
+  }, []);
+
   const isSubUser = user.role === 'sub-user' || !!user.isSubUser;
   const permissions = user.permissions || {};
   const canAccess = (key: string) => !isSubUser || permissions[key] !== false;
 
+  const base = areaBasePath(getUserArea(user));
   const menuItems = [
-    { path: '/user/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/user/devices', icon: Monitor, label: 'Devices', permission: 'devices' },
-    { path: '/user/groups', icon: Layers, label: 'Groups', permission: 'groups' },
-    { path: '/user/library', icon: Library, label: 'Library', permission: 'library' },
-    { path: '/user/sub-users', icon: Users, label: 'Sub-users', subUsersOnly: true },
-    { path: '/user/settings', icon: Settings, label: 'Settings', permission: 'settings' },
+    { path: `${base}/dashboard`, icon: LayoutDashboard, label: 'Dashboard' },
+    { path: `${base}/devices`, icon: Monitor, label: 'Devices', permission: 'devices' },
+    { path: `${base}/groups`, icon: Layers, label: 'Groups', permission: 'groups' },
+    { path: `${base}/library`, icon: Library, label: 'Library', permission: 'library' },
+    { path: `${base}/sub-users`, icon: Users, label: 'Sub-users', subUsersOnly: true },
+    { path: `${base}/settings`, icon: Settings, label: 'Settings', permission: 'settings' },
   ].filter((item: any) => {
     if (item.subUsersOnly) return !isSubUser && Number(user.subUserLimit || 0) > 0;
     return !item.permission || canAccess(item.permission);
@@ -48,8 +65,7 @@ export const UserLayout = ({ children }: UserLayoutProps) => {
             {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
           </button>
           <h1 className="text-lg font-bold flex items-center gap-2">
-            <Layout className="w-5 h-5" />
-            User CMS
+            <BrandLogo fallback="User CMS" />
           </h1>
           <button
             onClick={handleLogout}
@@ -96,8 +112,7 @@ export const UserLayout = ({ children }: UserLayoutProps) => {
         <aside className="hidden lg:flex w-64 bg-gray-900 text-white flex-col fixed h-full">
           <div className="p-6 border-b border-gray-700">
             <h1 className="text-xl font-bold flex items-center gap-2">
-              <Layout className="w-6 h-6" />
-              User CMS
+              <BrandLogo fallback="User CMS" />
             </h1>
           </div>
 

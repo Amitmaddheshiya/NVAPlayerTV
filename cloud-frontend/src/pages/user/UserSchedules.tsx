@@ -13,6 +13,7 @@ import {
   ArrowLeft, CalendarClock, Plus, Save, Trash2, Edit3, X, Check,
   Monitor, Layers, AlertTriangle,
 } from 'lucide-react';
+import { areaBasePath, getUserArea, readStoredUser } from '../../utils/userArea';
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MODES = [
@@ -73,7 +74,15 @@ export default function UserSchedules() {
   const [config, setConfig] = useState<any>(cloneConfig(null));
   const [dateInput, setDateInput] = useState('');
 
-  const backPath = deviceId ? `/user/devices/${deviceId}` : `/user/groups/${groupId}/configure`;
+  // Dealers manage schedules on behalf of customers — keep them inside the
+  // dealer section; regular users stay in the user section.
+  const storedUser = readStoredUser();
+  const storedRole = storedUser?.role;
+  const userBase = areaBasePath(getUserArea(storedUser));
+  const basePath = storedRole === 'dealer' ? '/dealer' : userBase;
+  const backPath = deviceId
+    ? (storedRole === 'dealer' ? '/dealer/devices' : `${userBase}/devices/${deviceId}`)
+    : `${basePath}/groups/${groupId}/configure`;
 
   const schedulesQuery = useQuery({
     queryKey: ['user-schedules', targetType, targetId],

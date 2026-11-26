@@ -17,9 +17,24 @@ import { cacheGet, cacheSet, cacheDelPattern } from '../config/redis';
 import { countConfiguredMedia, getConfiguredMediaBytes, getConfiguredMediaUrls } from '../utils/configMedia';
 import { invalidateDevicePaths, invalidateDeviceActive } from '../utils/fileAccessCache';
 import { checkDeviceLimit, checkAssignQuota, recordAssign } from '../utils/quota';
+import { canAccessOwnedResource, ownerScopeFilter } from '../middleware/auth.middleware';
 
 const hasDeviceScope = (req: AuthRequest, deviceId: string): boolean =>
   !req.isSubUser || (req.resourceAccess?.devices || []).includes(String(deviceId));
+
+/**
+ * Device access check. In addition to the assignee scope, a dealer keeps
+ * access to devices they created (createdBy) even while unassigned.
+ */
+const canAccessDevice = (req: AuthRequest, device: any): boolean => {
+  if (canAccessOwnedResource(req, device.assignedUserId) && hasDeviceScope(req, device.deviceId)) return true;
+  // Dealer-created devices stay manageable only while unassigned (or assigned
+  // inside their tree — already covered above). Once assigned outside the
+  // dealer's scope the createdBy link no longer grants access.
+  if (req.userRole === 'dealer' && device.createdBy && String(device.createdBy) === String(req.userId)
+      && !device.assignedUserId) return true;
+  return false;
+};
 
 export const getDeviceStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -84,8 +99,28 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
       ];
     }
 
-    // Non-admin users can only see their assigned devices (sub-users see parent's devices)
-    if (req.userRole !== 'admin' && req.userId) {
+    // Non-admin users can only see their assigned devices (sub-users see parent's devices; dealers see their whole customer tree)
+    if (req.userRole === 'dealer' && req.scopeUserIds?.length) {
+      // Dealers see devices assigned anywhere in their customer tree plus
+      // devices they created that are not assigned yet. A specific
+      // assignedUserId param narrows to that customer only.
+      const scopeIds = req.scopeUserIds.map(String);
+      const assignedFilter = assignedUserId && scopeIds.includes(String(assignedUserId))
+        ? { assignedUserId }
+        : { assignedUserId: { $in: req.scopeUserIds } };
+      filter.$and = filter.$and || [];
+      // createdBy devices count only while unassigned or assigned inside the
+      // dealer tree — a device reassigned outside the scope drops out.
+      filter.$and.push({ $or: [
+        assignedFilter,
+        { createdBy: new mongoose.Types.ObjectId(req.userId!), assignedUserId: { $in: [...scopeIds, null] } },
+      ] });
+      // "Available devices" view: hide devices already assigned to the
+      // requested customer (unassigned devices still match $ne).
+      if (excludeAssignedUserId && scopeIds.includes(String(excludeAssignedUserId))) {
+        filter.$and.push({ assignedUserId: { $ne: excludeAssignedUserId } });
+      }
+    } else if (req.userRole !== 'admin' && req.userId) {
       filter.assignedUserId = req.effectiveUserId || req.userId;
       if (req.isSubUser) filter.deviceId = { $in: req.resourceAccess?.devices || [] };
     }
@@ -118,20 +153,20 @@ export const getDevices = async (req: AuthRequest, res: Response): Promise<void>
     let summary: any;
     if (req.userRole !== 'admin') {
       const ownerId = req.effectiveUserId || req.userId;
-      // Summary costs 2 extra queries per page request — cache it briefly.
-      const summaryKey = `devices:summary:${ownerId}`;
+      const summaryScope = req.userRole === 'dealer' && req.scopeUserIds?.length ? { $in: req.scopeUserIds } : ownerId;
+      const summaryKey = `devices:summary:${req.userRole === 'dealer' ? ownerId : ownerId}`;
       const cachedSummary = await cacheGet(summaryKey);
       if (cachedSummary) {
         summary = JSON.parse(cachedSummary);
       } else {
-        const assigned = await Device.find({ assignedUserId: ownerId }).select('deviceId status').lean();
+        const assigned = await Device.find({ assignedUserId: summaryScope }).select('deviceId status').lean();
         const assignedIds = assigned.map((device: any) => String(device.deviceId));
         const groups = assignedIds.length
           ? await Group.find({ $or: [
-              { ownerId },
+              { ownerId: summaryScope },
               { ownerId: { $exists: false }, devices: { $in: assignedIds } },
             ] }).select('devices').lean()
-          : await Group.find({ ownerId }).select('devices').lean();
+          : await Group.find({ ownerId: summaryScope }).select('devices').lean();
         const groupedIds = new Set(groups.flatMap((group: any) => group.devices || []));
         summary = {
           totalDevices: assigned.length,
@@ -208,7 +243,7 @@ export const getDevice = async (req: AuthRequest, res: Response): Promise<void> 
     });
 
     // Non-admin users can only access their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       console.log('Access denied: Device not assigned to user');
       res.status(403).json({ error: 'Access denied: Device not assigned to your account' });
       return;
@@ -228,7 +263,7 @@ export const getDeviceConfigHistory = async (req: AuthRequest, res: Response): P
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && (device.assignedUserId?.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -251,7 +286,7 @@ export const retryCloudSync = async (req: AuthRequest, res: Response): Promise<v
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && (device.assignedUserId?.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -498,7 +533,7 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     console.log(`Config update: device ${deviceId} (${device.name})`);
 
     // Non-admin users can only update their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       console.log(`Config update: access denied for user ${req.userId} on device ${deviceId}`);
       res.status(403).json({ error: 'Access denied' });
       return;
@@ -526,7 +561,11 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
 
     // Validate media and convert the submitted config into the stored shape
     // (absolute URLs, mediaItems metadata, cleaned fields, legacy mediaUrls).
-    const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId));
+    // Dealers may use media uploaded by any account in their customer tree.
+    const mediaOwnerScope = req.userRole === 'admin' ? undefined
+      : req.userRole === 'dealer' ? (req.scopeUserIds || [])
+      : (req.effectiveUserId || req.userId);
+    const processed = await processConfigForStorage(config, mediaOwnerScope);
     if (processed.error || !processed.config) {
       res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
       return;
@@ -681,7 +720,7 @@ export const sendCommand = async (req: AuthRequest, res: Response): Promise<void
     }
 
     // Non-admin users can only send commands to their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -707,7 +746,7 @@ export const deleteDevice = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Non-admin users can only delete their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -764,9 +803,9 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
   try {
     const { deviceId, name, group, location, activated, assignedUserId } = req.body;
 
-    // Only admins can create devices
-    if (req.userRole !== 'admin') {
-      res.status(403).json({ error: 'Access denied: Only admins can create devices' });
+    // Admins and dealers can create devices; everyone else is rejected.
+    if (req.userRole !== 'admin' && req.userRole !== 'dealer') {
+      res.status(403).json({ error: 'Access denied: Only admins and dealers can create devices' });
       return;
     }
 
@@ -777,6 +816,33 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    // Dealers may create devices unassigned or assign them to one of their
+    // customer accounts. Unassigned dealer-created devices stay visible and
+    // manageable via the createdBy field.
+    if (req.userRole === 'dealer') {
+      const scopeIds = (req.scopeUserIds || []).map(String);
+      if (assignedUserId && (!scopeIds.includes(String(assignedUserId)) || String(assignedUserId) === String(req.userId))) {
+        res.status(403).json({ error: 'Devices can only be assigned to your customer accounts' });
+        return;
+      }
+      // Dealer tree-wide device limit (admin-set; 0 = unlimited). Counts
+      // customer-assigned devices plus dealer-created unassigned ones.
+      const dealer = await User.findById(req.userId).select('deviceLimit').lean();
+      const treeLimit = Number((dealer as any)?.deviceLimit || 0);
+      if (treeLimit > 0) {
+        const treeCount = await Device.countDocuments({
+          $or: [
+            { assignedUserId: { $in: scopeIds } },
+            { createdBy: new mongoose.Types.ObjectId(req.userId!), assignedUserId: { $in: [...scopeIds, null] } },
+          ],
+        });
+        if (treeCount >= treeLimit) {
+          res.status(400).json({ error: `Device limit reached (${treeCount}/${treeLimit}). Ask admin to increase your limit.` });
+          return;
+        }
+      }
+    }
+
     // Validate assignedUserId if provided
     if (assignedUserId) {
       const user = await User.findById(assignedUserId);
@@ -784,8 +850,8 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
         res.status(400).json({ error: 'Invalid user ID provided' });
         return;
       }
-      if (user.role === 'sub-user' || user.parentId) {
-        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
+      if (user.role === 'sub-user' || user.role === 'dealer') {
+        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user or dealer account. Assign them to a customer account instead.' });
         return;
       }
       // Per-account device limit (plan-based).
@@ -804,6 +870,7 @@ export const createDevice = async (req: AuthRequest, res: Response): Promise<voi
       location: location || '',
       activated: activated || false,
       assignedUserId: assignedUserId || undefined,
+      createdBy: req.userId ? new mongoose.Types.ObjectId(req.userId) : undefined,
       status: 'offline',
       lastSeen: new Date(),
       appVersion: '1.0.0',
@@ -870,7 +937,7 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Non-admin users can only update their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -882,8 +949,8 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         res.status(400).json({ error: 'Invalid user ID provided' });
         return;
       }
-      if (user.role === 'sub-user' || user.parentId) {
-        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user. Assign them to the parent account instead.' });
+      if (user.role === 'sub-user' || user.role === 'dealer') {
+        res.status(400).json({ error: 'Devices cannot be assigned to a sub-user or dealer account. Assign them to a customer account instead.' });
         return;
       }
       // Per-account device limit (plan-based) — skip when the assignment is
@@ -897,6 +964,39 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
         res.status(400).json({ error: 'Device is already assigned to another user. Unassign it first.' });
         return;
       }
+
+      // Dealers may only assign devices to their own customer accounts, and
+      // the dealer's deviceLimit caps the whole customer tree.
+      if (req.userRole === 'dealer') {
+        if (user.role !== 'user' || String(user.parentId || '') !== String(req.userId)) {
+          res.status(403).json({ error: 'Devices can only be assigned to your customer accounts' });
+          return;
+        }
+        const dealer = await User.findById(req.userId).select('deviceLimit').lean();
+        const treeLimit = Number((dealer as any)?.deviceLimit || 0);
+        if (treeLimit > 0 && req.scopeUserIds?.length && currentAssignee !== targetUserId) {
+          const scopeIds = req.scopeUserIds.map(String);
+          const currentTreeCount = await Device.countDocuments({
+            $or: [
+              { assignedUserId: { $in: scopeIds } },
+              { createdBy: new mongoose.Types.ObjectId(req.userId!), assignedUserId: { $in: [...scopeIds, null] } },
+            ],
+          });
+          // A dealer-created device is already counted via createdBy even
+          // while unassigned — assigning it must not double-count.
+          const alreadyCounted = (currentAssignee && scopeIds.includes(currentAssignee))
+            || String(device.createdBy || '') === String(req.userId);
+          const entering = alreadyCounted ? 0 : 1;
+          const leaving = scopeIds.includes(targetUserId) ? 0 : 1;
+          if (currentTreeCount + entering - leaving > treeLimit) {
+            res.status(400).json({
+              error: `Dealer device limit reached. Your plan allows ${treeLimit} TV(s) across all customer accounts. Remove a device or contact your administrator.`,
+            });
+            return;
+          }
+        }
+      }
+
       if (currentAssignee !== targetUserId) {
         const deviceLimit = await checkDeviceLimit(targetUserId, 1);
         if (!deviceLimit.ok) {
@@ -918,6 +1018,12 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
       const newAssignedUserId = updates.assignedUserId || undefined;
 
       device.assignedUserId = newAssignedUserId;
+
+      // A dealer who unassigns a device keeps it in their scope via
+      // createdBy — otherwise it would vanish from their device list.
+      if (req.userRole === 'dealer' && !newAssignedUserId && req.userId) {
+        device.createdBy = new mongoose.Types.ObjectId(req.userId);
+      }
 
       // Update user's assignedDevices arrays
       // Remove from old user's assignedDevices if changed
@@ -1052,7 +1158,7 @@ export const getDeviceConfigForDevice = async (req: AuthRequest, res: Response):
 
 export const buildEmergencyAlert = async (
   body: any,
-  mediaOwnerId?: string,
+  mediaOwnerId?: string | string[],
   triggeredById?: string
 ): Promise<{ alert?: any; error?: string }> => {
   const mediaUrl = String(body?.mediaUrl || '').trim();
@@ -1074,7 +1180,8 @@ export const buildEmergencyAlert = async (
     if (!media) {
       return { error: 'Selected media file was not found' };
     }
-    if (mediaOwnerId && String(media.uploadedBy || '') !== String(mediaOwnerId)) {
+    const mediaOwnerIds = Array.isArray(mediaOwnerId) ? mediaOwnerId.map(String) : (mediaOwnerId ? [String(mediaOwnerId)] : []);
+    if (mediaOwnerIds.length && !mediaOwnerIds.includes(String((media as any).uploadedBy || ''))) {
       return { error: 'You can only use media files uploaded by your account' };
     }
     mediaType = String((media as any).mimeType || '');
@@ -1104,12 +1211,15 @@ export const triggerEmergency = async (req: AuthRequest, res: Response): Promise
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const { alert, error } = await buildEmergencyAlert(req.body, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId), req.userId);
+    const emergencyMediaScope = req.userRole === 'admin' ? undefined
+      : req.userRole === 'dealer' ? (req.scopeUserIds || [])
+      : (req.effectiveUserId || req.userId);
+    const { alert, error } = await buildEmergencyAlert(req.body, emergencyMediaScope, req.userId);
     if (!alert) {
       res.status(400).json({ error: error || 'Invalid emergency alert payload' });
       return;
@@ -1137,7 +1247,7 @@ export const clearEmergency = async (req: AuthRequest, res: Response): Promise<v
       res.status(404).json({ error: 'Device not found' });
       return;
     }
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -1167,7 +1277,7 @@ export const getDeviceMedia = async (req: AuthRequest, res: Response): Promise<v
     }
 
     // Non-admin users can only access their assigned devices
-    if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
+    if (req.userRole !== 'admin' && !canAccessDevice(req, device)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }

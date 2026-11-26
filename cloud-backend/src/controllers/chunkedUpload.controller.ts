@@ -7,7 +7,7 @@ import { pipeline } from 'stream/promises';
 import GlobalConfig from '../models/GlobalConfig';
 import Device from '../models/Device';
 import User from '../models/User';
-import { AuthRequest } from '../middleware/auth.middleware';
+import { AuthRequest, ownerScopeFilter } from '../middleware/auth.middleware';
 import { normalizeUserFolder } from '../utils/mediaUrl';
 import { uploadMedia } from './media.controller';
 
@@ -151,7 +151,7 @@ export async function initializeChunkedUpload(req: AuthRequest, res: Response): 
     const deviceId = String(req.body?.deviceId || '');
     const ownerId = req.effectiveUserId || req.userId;
     if (deviceId && req.userRole !== 'admin') {
-      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: ownerId }).select('_id');
+      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: ownerScopeFilter(req) }).select('_id');
       if (!assignedDevice) {
         res.status(403).json({ error: 'Media can only be uploaded to a device assigned to your account' });
         return;

@@ -64,7 +64,8 @@ describe("sourcePolicy", () => {
 
   test("keeps CMS playback while CMS Only is enabled", () => {
     const cmsOnline = reduceBrowserCmsState(createInitialSourcePolicyState(), true);
-    const withUsb = reduceUsbState(cmsOnline, {
+    const cmsOnly = reduceCmsOnlyMode(cmsOnline, true);
+    const withUsb = reduceUsbState(cmsOnly, {
       mounted: true,
       hasPlayableMedia: true,
       mountPath: "/storage/usb1",

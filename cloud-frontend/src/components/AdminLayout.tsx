@@ -1,8 +1,9 @@
 import { type ReactNode, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Layout, LayoutDashboard, Library, Monitor, Users, LogOut, Cog, Menu, X } from 'lucide-react';
+import { LayoutDashboard, Library, Monitor, Users, LogOut, Cog, Menu, X, Store } from 'lucide-react';
 import { ToastProvider } from './ui/Toast';
 import { authAPI } from '../services/api';
+import { BrandLogo } from './BrandLogo';
 
 interface AdminLayoutProps {
   children: ReactNode;
@@ -18,6 +19,7 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
     { path: '/admin/devices', icon: Monitor, label: 'Devices' },
     { path: '/admin/library', icon: Library, label: 'Media Library' },
     { path: '/admin/users', icon: Users, label: 'Users' },
+    { path: '/admin/dealers', icon: Store, label: 'Dealers' },
     { path: '/admin/config', icon: Cog, label: 'Config' },
   ];
 
@@ -43,8 +45,7 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
             {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
           </button>
           <h1 className="text-lg font-bold flex items-center gap-2">
-            <Layout className="w-5 h-5" />
-            Admin CMS
+            <BrandLogo fallback="Admin CMS" />
           </h1>
           <button
             onClick={handleLogout}
@@ -91,8 +92,7 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
         <aside className="hidden lg:flex w-64 bg-gray-900 text-white flex-col fixed h-full">
           <div className="p-6 border-b border-gray-700">
             <h1 className="text-xl font-bold flex items-center gap-2">
-              <Layout className="w-6 h-6" />
-              Admin CMS
+              <BrandLogo fallback="Admin CMS" />
             </h1>
           </div>
 

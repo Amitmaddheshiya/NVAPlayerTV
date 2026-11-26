@@ -13,8 +13,10 @@ import { EmergencyAlertBox } from '../../components/EmergencyAlertBox';
 import { Alert } from '../../components/ui/Alert';
 import { ArrowLeft, Save, Monitor, Layers, Settings, History, RotateCcw, CalendarClock } from 'lucide-react';
 import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
+import { areaBasePath, getUserArea, readStoredUser } from '../../utils/userArea';
 
-export const UserGroupConfigure = () => {
+export const UserGroupConfigure = ({ basePath }: { basePath?: string } = {}) => {
+  const resolvedBasePath = basePath || areaBasePath(getUserArea(readStoredUser()));
   const { groupId } = useParams<{ groupId: string }>();
   const navigate = useNavigate();
   const [group, setGroup] = useState<any>(null);
@@ -125,6 +127,13 @@ export const UserGroupConfigure = () => {
     }
   }, [groupId]);
 
+  // Dealers configure groups on behalf of a customer — the device list must
+  // be narrowed to that customer's devices once the group owner is known.
+  useEffect(() => {
+    if (group?.ownerId) loadDevices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [group?.ownerId]);
+
   useEffect(() => {
     const deviceIds: string[] = Array.isArray(group?.devices) ? group.devices.map((id: string) => String(id)) : [];
     if (!deviceIds.length) return;
@@ -222,7 +231,7 @@ export const UserGroupConfigure = () => {
 
   const loadDevices = async () => {
     try {
-      const response = await deviceAPI.getDevices({ page: 1, limit: 1000 });
+      const response = await deviceAPI.getDevices({ page: 1, limit: 1000, assignedUserId: group?.ownerId || undefined });
       setDevices(response.data.data || response.data);
     } catch (error) {
       console.error('Failed to load devices:', error);
@@ -455,7 +464,7 @@ export const UserGroupConfigure = () => {
       <header className="bg-white border-b sticky top-0 z-10">
         <div className="max-w-[95vw] sm:max-w-[1200px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 md:px-4 xl:px-8 py-2 sm:py-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
           <div className="flex items-center gap-2 sm:gap-3">
-            <Button variant="secondary" onClick={() => navigate('/user/groups')} className="text-[10px] sm:text-xs">
+            <Button variant="secondary" onClick={() => navigate(`${resolvedBasePath}/groups`)} className="text-[10px] sm:text-xs">
               <ArrowLeft className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
               <span className="hidden sm:inline">Back</span>
               <span className="sm:hidden">←</span>
@@ -472,7 +481,7 @@ export const UserGroupConfigure = () => {
             <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
               <History className="mr-1 h-3 w-3" />History
             </Button>
-            <Button onClick={() => navigate(`/user/groups/${groupId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
+            <Button onClick={() => navigate(`${resolvedBasePath}/groups/${groupId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
               <CalendarClock className="mr-1 h-3 w-3" />Schedule
             </Button>
             <Button onClick={handleClearConfig} variant="secondary" className="text-[10px] sm:text-xs">

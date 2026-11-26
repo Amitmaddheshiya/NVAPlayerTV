@@ -9,6 +9,7 @@ import { CloudConfigEditor, getCloudSectionCount } from '../../components/CloudC
 import { EmergencyAlertBox } from '../../components/EmergencyAlertBox';
 import { ArrowLeft, Save, CheckCircle2, XCircle, AlertTriangle, Info, X, History, RotateCcw, CalendarClock } from 'lucide-react';
 import { formatStorageBytes, getInsufficientStorageDevices } from '../../utils/configCacheStorage';
+import { areaBasePath, getUserArea, readStoredUser } from '../../utils/userArea';
 
 type DialogState = {
   type: 'success' | 'error' | 'warning' | 'info';
@@ -361,7 +362,7 @@ export const UserDeviceDetail = () => {
       <header className="bg-white border-b sticky top-0 z-10">
         <div className="max-w-[95vw] sm:max-w-[1120px] xl:max-w-none xl:w-full mx-auto px-2 sm:px-3 xl:px-6 py-1.5 sm:py-2 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-1.5 sm:gap-2">
           <div className="flex items-center gap-2 sm:gap-3">
-            <Button variant="secondary" onClick={() => navigate('/user/devices')} className="text-[10px] sm:text-xs">
+            <Button variant="secondary" onClick={() => navigate(`${areaBasePath(getUserArea(readStoredUser()))}/devices`)} className="text-[10px] sm:text-xs">
               <ArrowLeft className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
               <span className="hidden sm:inline">Back</span>
               <span className="sm:hidden">←</span>
@@ -381,7 +382,7 @@ export const UserDeviceDetail = () => {
             <Button onClick={openConfigHistory} variant="secondary" className="text-[10px] sm:text-xs">
               <History className="mr-1 h-3 w-3" />History
             </Button>
-            <Button onClick={() => navigate(`/user/devices/${deviceId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
+            <Button onClick={() => navigate(`${areaBasePath(getUserArea(readStoredUser()))}/devices/${deviceId}/schedules`)} variant="secondary" className="text-[10px] sm:text-xs">
               <CalendarClock className="mr-1 h-3 w-3" />Schedule
             </Button>
             <Button onClick={handleSaveConfig} disabled={savingConfig} className="bg-blue-600 hover:bg-blue-700 text-[10px] sm:text-xs">

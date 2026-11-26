@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { userAPI } from '../../services/api';
+import { userAPI, brandingAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
@@ -10,7 +10,11 @@ import { Alert } from '../../components/ui/Alert';
 import { SkeletonTable } from '../../components/ui/Skeleton';
 import { useUrlParam, useUrlNumberParam, useSortParam } from '../../hooks/useUrlParam';
 import { SortableTh } from '../../components/admin/SortableTh';
-import { Plus, Edit, Trash2, Monitor, HardDrive, Upload, Shield, ShieldAlert } from 'lucide-react';
+import { Plus, Edit, Trash2, Monitor, HardDrive, Upload, Image as ImageIcon } from 'lucide-react';
+import { RoleBadge } from '../../components/ui/RoleBadge';
+import { invalidateBrandingCache } from '../../components/BrandLogo';
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
 
 export const AdminUsers = () => {
   const navigate = useNavigate();
@@ -41,7 +45,10 @@ export const AdminUsers = () => {
     businessName: '',
     role: 'user',
     subUserLimit: 0,
+    deviceLimit: 0,
+    userLimit: 0,
   });
+  const logoInputRef = useRef<HTMLInputElement>(null);
 
   const [currentPage, setCurrentPage] = useUrlNumberParam('page', 1);
   const { sortBy, sortOrder, toggleSort } = useSortParam('createdAt', 'desc');
@@ -65,7 +72,9 @@ export const AdminUsers = () => {
   const totalPages = usersQuery.data?.totalPages || 0;
   const loadUsers = () => queryClient.invalidateQueries({ queryKey: ['admin-users'] });
 
-  const isSubUser = (user: any) => user?.role === 'sub-user' || !!user?.parentId;
+  // Sub-user is an explicit role — dealer customers carry parentId but are
+  // full 'user' accounts and must not be treated as sub-users.
+  const isSubUser = (user: any) => user?.role === 'sub-user';
 
   // Debounce search input -> URL param (400ms)
   useEffect(() => {
@@ -116,6 +125,8 @@ export const AdminUsers = () => {
         businessName: '',
         role: 'user',
         subUserLimit: 0,
+        deviceLimit: 0,
+        userLimit: 0,
       });
       loadUsers();
     } catch (error: any) {
@@ -137,8 +148,39 @@ export const AdminUsers = () => {
       businessName: user.businessName || '',
       role: isSubUser(user) ? 'sub-user' : user.role,
       subUserLimit: user.subUserLimit || 0,
+      deviceLimit: user.deviceLimit || 0,
+      userLimit: user.userLimit || 0,
     });
     setShowForm(true);
+  };
+
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !editingUser) return;
+    try {
+      const res = await brandingAPI.uploadUserLogo(editingUser._id, file);
+      invalidateBrandingCache();
+      setEditingUser({ ...editingUser, logoUrl: res.data?.logoUrl || editingUser.logoUrl });
+      loadUsers();
+      setAlertState({ isOpen: true, title: 'Success', message: 'Dealer logo updated', type: 'success' });
+    } catch (error: any) {
+      setAlertState({ isOpen: true, title: 'Upload Failed', message: error?.response?.data?.error || 'Failed to upload logo', type: 'error' });
+    } finally {
+      if (logoInputRef.current) logoInputRef.current.value = '';
+    }
+  };
+
+  const handleLogoDelete = async () => {
+    if (!editingUser) return;
+    try {
+      await brandingAPI.deleteUserLogo(editingUser._id);
+      invalidateBrandingCache();
+      setEditingUser({ ...editingUser, logoUrl: null });
+      loadUsers();
+      setAlertState({ isOpen: true, title: 'Success', message: 'Dealer logo removed', type: 'success' });
+    } catch (error: any) {
+      setAlertState({ isOpen: true, title: 'Failed', message: error?.response?.data?.error || 'Failed to remove logo', type: 'error' });
+    }
   };
 
   const handleDelete = async (userId: string) => {
@@ -185,30 +227,7 @@ export const AdminUsers = () => {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   };
 
-  const renderRoleBadge = (user: any) => {
-    if (user.role === 'admin') {
-      return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-purple-100 text-purple-800 whitespace-nowrap">
-          <Shield className="w-2.5 h-2.5 mr-1" />
-          Admin
-        </span>
-      );
-    }
-    if (isSubUser(user)) {
-      return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-100 text-amber-800 whitespace-nowrap">
-          <ShieldAlert className="w-2.5 h-2.5 mr-1" />
-          Sub-user
-        </span>
-      );
-    }
-    return (
-      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-100 text-blue-800 whitespace-nowrap">
-        <ShieldAlert className="w-2.5 h-2.5 mr-1" />
-        User
-      </span>
-    );
-  };
+  const renderRoleBadge = (user: any) => <RoleBadge accountType={user.accountType} role={user.role} />;
 
   const renderUploadUsage = (user: any) =>
     user.role === 'admin'
@@ -272,6 +291,7 @@ export const AdminUsers = () => {
                   { value: 'all', label: 'All Roles' },
                   { value: 'admin', label: 'Admin' },
                   { value: 'user', label: 'User' },
+                  { value: 'dealer', label: 'Dealer' },
                   { value: 'sub-user', label: 'Sub-user' },
                 ]}
                 value={roleFilter}
@@ -326,6 +346,7 @@ export const AdminUsers = () => {
                     ? [{ value: 'sub-user', label: 'Sub-user' }]
                     : [
                       { value: 'user', label: 'User' },
+                      { value: 'dealer', label: 'Dealer' },
                       { value: 'admin', label: 'Admin' },
                     ]}
                   value={formData.role}
@@ -343,7 +364,45 @@ export const AdminUsers = () => {
                     className="text-xs sm:text-sm"
                   />
                 )}
+                {formData.role === 'dealer' && (
+                  <>
+                    <Input
+                      label="Device Limit (whole tree, 0 = unlimited)"
+                      type="number"
+                      min={0}
+                      value={formData.deviceLimit}
+                      onChange={(e) => setFormData({ ...formData, deviceLimit: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+                      className="text-xs sm:text-sm"
+                    />
+                    <Input
+                      label="Customer Limit (0 = unlimited)"
+                      type="number"
+                      min={0}
+                      value={formData.userLimit}
+                      onChange={(e) => setFormData({ ...formData, userLimit: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+                      className="text-xs sm:text-sm"
+                    />
+                  </>
+                )}
               </div>
+              {formData.role === 'dealer' && editingUser && (
+                <div className="pt-2 border-t">
+                  <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Dealer Logo</label>
+                  <div className="flex items-center gap-2">
+                    {editingUser.logoUrl && (
+                      <img src={`${API_URL}/branding/${editingUser.logoUrl}`} alt="Dealer logo" className="h-10 object-contain border border-gray-200 rounded p-1" />
+                    )}
+                    <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={handleLogoUpload} />
+                    <Button type="button" variant="secondary" size="sm" onClick={() => logoInputRef.current?.click()}>
+                      <ImageIcon className="w-3 h-3 mr-1" /> {editingUser.logoUrl ? 'Replace' : 'Upload'}
+                    </Button>
+                    {editingUser.logoUrl && (
+                      <Button type="button" variant="danger" size="sm" onClick={handleLogoDelete}>Remove</Button>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-gray-400 mt-1">Shown on this dealer's CMS and all their customers' CMS.</p>
+                </div>
+              )}
               <div className="flex gap-2">
                 <Button type="submit" className="text-xs sm:text-sm">
                   {editingUser ? 'Update' : 'Create'}

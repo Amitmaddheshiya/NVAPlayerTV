@@ -14,8 +14,61 @@ const VALID_MODES = ['dayWise', 'dateWise', 'timeWise'];
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-const ownerFilter = (req: AuthRequest) =>
-  req.userRole === 'admin' ? {} : { ownerId: new mongoose.Types.ObjectId(req.effectiveUserId || req.userId) };
+/**
+ * Resolve which account owns a schedule target (device/group) for this request.
+ * For dealers this is the customer account inside their tree that owns the
+ * target — schedules always belong to the target's real owner, never the dealer.
+ */
+const resolveTargetOwner = async (req: AuthRequest, targetType: string, targetId: string): Promise<{ ok: boolean; error?: string; ownerId?: string }> => {
+  if (targetType === 'device') {
+    const device = await Device.findOne({ deviceId: targetId }).select('deviceId assignedUserId').lean();
+    if (!device) return { ok: false, error: 'Device not found' };
+    const owner = String((device as any).assignedUserId || '');
+    if (!owner) return { ok: false, error: 'Access denied: device is not assigned to your account' };
+    if (req.userRole === 'admin') return { ok: true, ownerId: owner };
+    if (req.userRole === 'dealer') {
+      return (req.scopeUserIds || []).map(String).includes(owner)
+        ? { ok: true, ownerId: owner }
+        : { ok: false, error: 'Access denied: device is outside your dealer scope' };
+    }
+    if (owner !== String(req.effectiveUserId || req.userId)) {
+      return { ok: false, error: 'Access denied: device is not assigned to your account' };
+    }
+    if (req.isSubUser && !(req.resourceAccess?.devices || []).includes(String(targetId))) {
+      return { ok: false, error: 'Access denied: device is outside your assigned resources' };
+    }
+    return { ok: true, ownerId: owner };
+  }
+
+  const group = await Group.findById(targetId).select('ownerId devices').lean();
+  if (!group) return { ok: false, error: 'Group not found' };
+  if (req.userRole === 'admin') return { ok: true };
+
+  let owner = (group as any).ownerId ? String((group as any).ownerId) : '';
+  if (!owner) {
+    // Legacy group: single owning account inferred from its devices.
+    const groupDevices = Array.isArray((group as any).devices) ? (group as any).devices : [];
+    if (!groupDevices.length) return { ok: false, error: 'Access denied: group does not belong to your account' };
+    const deviceOwners = await Device.find({ deviceId: { $in: groupDevices } }).distinct('assignedUserId');
+    const validOwners = [...new Set(deviceOwners.filter(Boolean).map(String))];
+    if (validOwners.length !== 1) return { ok: false, error: 'Access denied: group does not belong to your account' };
+    const allOwned = await Device.countDocuments({ deviceId: { $in: groupDevices }, assignedUserId: validOwners[0] }) === groupDevices.length;
+    if (!allOwned) return { ok: false, error: 'Access denied: group does not belong to your account' };
+    owner = validOwners[0];
+  }
+
+  if (req.userRole === 'dealer') {
+    if (!(req.scopeUserIds || []).map(String).includes(owner)) {
+      return { ok: false, error: 'Access denied: group is outside your dealer scope' };
+    }
+  } else if (owner !== String(req.effectiveUserId || req.userId)) {
+    return { ok: false, error: 'Access denied: group does not belong to your account' };
+  }
+  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String((group as any)._id))) {
+    return { ok: false, error: 'Access denied: group is outside your assigned resources' };
+  }
+  return { ok: true, ownerId: owner };
+};
 
 const subUserModuleAllowed = (req: AuthRequest, targetType: string): boolean => {
   if (req.userRole === 'admin' || !req.isSubUser) return true;
@@ -41,34 +94,6 @@ const validateSchedule = (schedule: any): string | null => {
   return null;
 };
 
-const canAccessTarget = async (req: AuthRequest, targetType: string, targetId: string): Promise<{ ok: boolean; error?: string }> => {
-  if (targetType === 'device') {
-    const device = await Device.findOne({ deviceId: targetId }).select('deviceId assignedUserId').lean();
-    if (!device) return { ok: false, error: 'Device not found' };
-    if (req.userRole !== 'admin' && String((device as any).assignedUserId || '') !== String(req.effectiveUserId || req.userId)) {
-      return { ok: false, error: 'Access denied: device is not assigned to your account' };
-    }
-    if (req.isSubUser && !(req.resourceAccess?.devices || []).includes(String(targetId))) {
-      return { ok: false, error: 'Access denied: device is outside your assigned resources' };
-    }
-    return { ok: true };
-  }
-  const group = await Group.findById(targetId).select('ownerId devices').lean();
-  if (!group) return { ok: false, error: 'Group not found' };
-  if (req.userRole === 'admin') return { ok: true };
-  const ownerId = String(req.effectiveUserId || req.userId);
-  const groupDevices = Array.isArray((group as any).devices) ? (group as any).devices : [];
-  const ownsLegacy = !(group as any).ownerId && groupDevices.length > 0 &&
-    (await Device.countDocuments({ deviceId: { $in: groupDevices }, assignedUserId: ownerId })) === groupDevices.length;
-  if (String((group as any).ownerId || '') !== ownerId && !ownsLegacy) {
-    return { ok: false, error: 'Access denied: group does not belong to your account' };
-  }
-  if (req.isSubUser && !(req.resourceAccess?.groups || []).includes(String((group as any)._id))) {
-    return { ok: false, error: 'Access denied: group is outside your assigned resources' };
-  }
-  return { ok: true };
-};
-
 const sanitizeSchedule = (input: any) => ({
   mode: input.mode,
   days: Array.isArray(input.days) ? [...new Set(input.days.map(Number).filter((d: number) => Number.isInteger(d) && d >= 0 && d <= 6))] : [],
@@ -84,12 +109,15 @@ export const getScheduleTemplates = async (req: AuthRequest, res: Response): Pro
       res.status(400).json({ error: 'targetType and targetId are required' });
       return;
     }
-    const access = await canAccessTarget(req, String(targetType), String(targetId));
+    const access = await resolveTargetOwner(req, String(targetType), String(targetId));
     if (!access.ok) {
       res.status(access.error === 'Device not found' || access.error === 'Group not found' ? 404 : 403).json({ error: access.error });
       return;
     }
-    const templates = await ScheduleTemplate.find({ ...ownerFilter(req), targetType: String(targetType), targetId: String(targetId) }).sort({ createdAt: -1 }).lean();
+    const ownerClause = req.userRole === 'admin'
+      ? {}
+      : { ownerId: new mongoose.Types.ObjectId(access.ownerId) };
+    const templates = await ScheduleTemplate.find({ ...ownerClause, targetType: String(targetType), targetId: String(targetId) }).sort({ createdAt: -1 }).lean();
     res.json({ data: templates, limit: MAX_TEMPLATES_PER_TARGET, count: templates.length });
   } catch (error) {
     console.error('Get schedule templates error:', error);
@@ -117,20 +145,21 @@ export const createScheduleTemplate = async (req: AuthRequest, res: Response): P
       res.status(400).json({ error: scheduleError });
       return;
     }
-    const access = await canAccessTarget(req, targetType, String(targetId));
+    const access = await resolveTargetOwner(req, targetType, String(targetId));
     if (!access.ok) {
       res.status(access.error === 'Device not found' || access.error === 'Group not found' ? 404 : 403).json({ error: access.error });
       return;
     }
 
-    const ownerId = req.userRole === 'admin' ? undefined : new mongoose.Types.ObjectId(req.effectiveUserId || req.userId);
+    // Schedules belong to the target's real owner (a customer for dealers).
+    const ownerId = req.userRole === 'admin' ? undefined : new mongoose.Types.ObjectId(access.ownerId);
     const existingCount = await ScheduleTemplate.countDocuments({ targetType, targetId: String(targetId), ...(ownerId ? { ownerId } : {}) });
     if (existingCount >= MAX_TEMPLATES_PER_TARGET) {
       res.status(400).json({ error: `Schedule limit reached (${MAX_TEMPLATES_PER_TARGET} templates per target)` });
       return;
     }
 
-    const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId));
+    const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : access.ownerId);
     if (processed.error || !processed.config) {
       res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
       return;
@@ -157,8 +186,12 @@ export const createScheduleTemplate = async (req: AuthRequest, res: Response): P
 
 export const updateScheduleTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const template = await ScheduleTemplate.findOne({ _id: req.params.id, ...ownerFilter(req) });
+    const template = await ScheduleTemplate.findById(req.params.id);
     if (!template) {
+      res.status(404).json({ error: 'Schedule template not found' });
+      return;
+    }
+    if (req.userRole !== 'admin' && String(template.ownerId || '') !== String(req.effectiveUserId || req.userId) && req.userRole !== 'dealer') {
       res.status(404).json({ error: 'Schedule template not found' });
       return;
     }
@@ -166,9 +199,14 @@ export const updateScheduleTemplate = async (req: AuthRequest, res: Response): P
       res.status(403).json({ error: 'Access denied for this schedule target' });
       return;
     }
-    const targetAccess = await canAccessTarget(req, template.targetType, template.targetId);
+    const targetAccess = await resolveTargetOwner(req, template.targetType, template.targetId);
     if (!targetAccess.ok) {
       res.status(403).json({ error: targetAccess.error || 'Access denied for this schedule target' });
+      return;
+    }
+    // The template must belong to the target's real owner account.
+    if (req.userRole !== 'admin' && String(template.ownerId || '') !== String(targetAccess.ownerId || '')) {
+      res.status(404).json({ error: 'Schedule template not found' });
       return;
     }
 
@@ -184,7 +222,7 @@ export const updateScheduleTemplate = async (req: AuthRequest, res: Response): P
       template.schedule = sanitizeSchedule(schedule) as any;
     }
     if (config !== undefined) {
-      const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : (req.effectiveUserId || req.userId));
+      const processed = await processConfigForStorage(config, req.userRole === 'admin' ? undefined : targetAccess.ownerId);
       if (processed.error || !processed.config) {
         res.status(processed.status || 400).json({ error: processed.error || 'Invalid configuration' });
         return;
@@ -204,7 +242,7 @@ export const updateScheduleTemplate = async (req: AuthRequest, res: Response): P
 
 export const deleteScheduleTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const template = await ScheduleTemplate.findOne({ _id: req.params.id, ...ownerFilter(req) });
+    const template = await ScheduleTemplate.findById(req.params.id);
     if (!template) {
       res.status(404).json({ error: 'Schedule template not found' });
       return;
@@ -213,9 +251,14 @@ export const deleteScheduleTemplate = async (req: AuthRequest, res: Response): P
       res.status(403).json({ error: 'Access denied for this schedule target' });
       return;
     }
-    const targetAccess = await canAccessTarget(req, template.targetType, template.targetId);
+    const targetAccess = await resolveTargetOwner(req, template.targetType, template.targetId);
     if (!targetAccess.ok) {
       res.status(403).json({ error: targetAccess.error || 'Access denied for this schedule target' });
+      return;
+    }
+    // The template must belong to the target's real owner account.
+    if (req.userRole !== 'admin' && String(template.ownerId || '') !== String(targetAccess.ownerId || '')) {
+      res.status(404).json({ error: 'Schedule template not found' });
       return;
     }
     const { targetType, targetId } = template;

@@ -19,7 +19,7 @@ import {
   triggerEmergency,
   clearEmergency,
 } from '../controllers/device.controller';
-import { auth, adminOnly, deviceAuth } from '../middleware/auth.middleware';
+import { auth, adminOrDealer, deviceAuth } from '../middleware/auth.middleware';
 import { requirePermission } from '../middleware/permission.middleware';
 
 const router = Router();
@@ -40,7 +40,7 @@ router.post('/:id/emergency', auth, requirePermission('devices'), triggerEmergen
 router.post('/:id/emergency/clear', auth, requirePermission('devices'), clearEmergency);
 router.post('/:id/retry-cloud-sync', auth, requirePermission('devices'), retryCloudSync);
 router.post('/:id/command', auth, requirePermission('devices'), sendCommand);
-router.put('/:id', auth, adminOnly, updateDevice);
-router.delete('/:id', auth, adminOnly, deleteDevice);
+router.put('/:id', auth, adminOrDealer, updateDevice);
+router.delete('/:id', auth, adminOrDealer, deleteDevice);
 
 export default router;

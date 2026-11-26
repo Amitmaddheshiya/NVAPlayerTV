@@ -2,6 +2,138 @@
 
 Important code changes, bug fixes and features. Newest first.
 
+## 2026-11-27 (later) — Dealer full admin-parity + dedicated admin Dealers page
+
+- **Admin Dealers page** (`/admin/dealers`, `AdminDealers.tsx` + sidebar
+  item): dedicated dealer CRUD — business name, email, password, phone,
+  city, `deviceLimit`, `userLimit`, logo upload/remove, delete. Dealer
+  fields remain in `AdminUsers` too.
+- **Dealer = admin-parity inside its tree**: dealers can now create/edit/
+  delete devices (`POST/PUT/DELETE /api/devices` via new `adminOrDealer`
+  middleware; dealer must assign to a customer and stays under the tree
+  `deviceLimit`) and manage customer sub-users
+  (`GET/POST/PUT/DELETE /api/dealer/customers/:customerId/sub-users` —
+  same logic as the customer's own CMS via `resolveSubUserParent`).
+- **Dealer has NO group/schedule control** (same as admin): group and
+  schedule routes now reject `role === 'dealer'` with 403 via a `noDealer`
+  middleware in `group.routes.ts`/`schedule.routes.ts`. Groups,
+  group-config, emergency and schedules are managed only by the owning
+  customer/sub-user accounts in their own CMS — dealer customers and
+  sub-users keep the exact same features as normal users.
+- **`city` field** added to `User` (dealer + customers), admin dealer
+  form, dealer profile (`PUT /api/dealer/profile`), dealer customer
+  create/update, and `DealerSettings`/`DealerUsers` forms.
+- **Dealer devices can be unassigned**: `Device.createdBy` tracks the
+  creator; dealers may add/activate/edit/delete devices without a
+  customer (`assignedUserId` optional in `createDevice`). Dealer-created
+  unassigned devices stay visible/manageable via `createdBy` in
+  `getDevices`, `canAccessDevice` (all device endpoints), dashboard
+  stats and the `deviceLimit` count (no double-count on later
+  assignment). The add-device form's customer dropdown lists the same
+  customers managed on the Users page.
+- **Account-area URL routing**: every user-type account now has its own
+  URL prefix — `/user/*` (normal user), `/duser/*` (dealer customer),
+  `/sub-user/*` (sub-user), `/dsub-user/*` (dealer customer's sub-user).
+  New `utils/userArea.ts` (`getUserArea`/`areaBasePath`/`areaHomePath`)
+  derives the area from `accountType`; `USER_ROUTE_DEFS` in `App.tsx`
+  renders the same pages under all four prefixes and `ProtectedRoute`
+  redirects mismatched areas to the correct home. Login response now
+  includes `accountType`; `UserLayout` refreshes the stored profile on
+  mount so area/permissions stay current without re-login.
+- **Account-origin identification (`accountType`)**: every user payload
+  now carries `accountType` — `admin` | `dealer` | `user` | `d-user`
+  (dealer customer) | `sub-user` | `d-sub-user` (sub-user of a dealer
+  customer) — computed in `getUsers`, `getUser`, `getMe`, `getSubUsers`
+  (user.controller) and `getDealerUsers`/`getDealerUser`
+  (dealer.controller). New shared `RoleBadge` component renders a
+  distinct coloured badge everywhere: AdminUsers, DealerUsers,
+  UserSubUsers, DealerSubUsers.
+- **Dealer user device assignment page**: new `DealerUserDevices`
+  (`/dealer/users/:userId/devices`) — admin-parity two-panel assign UI
+  (assigned vs available devices, search/status filter, pagination,
+  assignee labels) scoped to the dealer tree. `getDevices` now honours
+  `excludeAssignedUserId` for dealers; unassigning a device sets
+  `createdBy` to the dealer so it stays in their scope.
+- **Dealer pages = admin parity, tree-scoped**:
+  - `DealerDashboard` mirrors `AdminDashboard` (total users/devices,
+    online/offline, storage, device-status bars, recent uploads, system
+    health) fed by the extended `GET /api/dealer/dashboard` (now returns
+    `users.{customers,subUsers,total}` + `recentUploads`).
+  - `DealerMediaLibrary` mirrors `AdminMediaLibrary` — per-customer
+    storage grid → new `DealerUserMediaDetail`
+    (`/dealer/library/user/:userId`) with search/folder filter, bulk
+    delete, thumbnails. Backend: `GET /api/dealer/users/:id` + dealer
+    `uploadedBy` filter support in `getMedia`/`getMediaFolders` (only
+    for accounts inside the dealer tree).
+  - `DealerUsers` mirrors `AdminUsers` — same table (role badges,
+    devices, storage, monthly upload, created), search/role filter,
+    sort, pagination, add/edit/delete. Backed by new
+    `GET /api/dealer/users` (customers + sub-users with admin-parity
+    enrichment) and `GET /api/dealer/users/:id`. Customer rows get
+    devices (`/dealer/devices?user=`) and sub-users
+    (`/dealer/users/:id/sub-users`) actions; sub-user rows edit/delete
+    via the existing `/api/dealer/customers/:cid/sub-users` endpoints.
+- **Dealer frontend**: `DealerDevices` rewritten to full admin parity —
+  same table/card UI, search, status/customer filters, sorting,
+  pagination, bulk select/assign/delete, activate/deactivate toggle,
+  add-device form (deviceId + customer assignment required) and a new
+  `DealerDeviceEdit` page (`/dealer/devices/:deviceId/edit`). A usage
+  banner shows `devicesUsed / deviceLimit` and the create button is
+  disabled with a limit message when the cap is reached; backend
+  `deviceLimit` errors surface as toasts. `DealerLayout` now wraps
+  `ToastProvider`. `DealerUsers` gained sub-user management
+  (`DealerSubUsers` page at `/dealer/users/:customerId/sub-users`).
+  Dealer menu = Dashboard, Devices, Media Library, Users, Settings.
+
+## 2026-11-27 — Dealer (sub-admin) accounts + white-label branding
+
+- **New `dealer` role** (`User.ts`, `auth.middleware.ts`): dealers are
+  scoped sub-admins. Their customers are normal `user` accounts with
+  `parentId = dealer`. Dealer scope = `[dealerId, ...customerIds]`, loaded
+  per-request into `req.scopeUserIds` (60s Redis/memory cache via
+  `utils/dealerScope.ts`).
+- **Sub-user detection fixed**: `isSubUser` is now `role === 'sub-user'`
+  only (was `role || parentId`) in `auth.middleware`, `auth.controller`
+  login, `user.controller.isSubUserAccount` and `AdminUsers.tsx`. Dealer
+  customers keep `parentId` but own their data themselves — previously any
+  `parentId` would have collapsed their ownership onto the dealer.
+- **Dealer limits**: `User.deviceLimit` (max devices across the whole
+  customer tree) and `User.userLimit` (max customer accounts), both
+  admin-set, `0` = unlimited. Enforced in `assignDevices`,
+  `updateDevice`, `createDevice` validation and
+  `dealer.controller.createDealerCustomer`.
+- **Dealer API** (`/api/dealer/*`, `dealerOnly` guard): dashboard stats,
+  customer CRUD (`GET/POST/PUT/DELETE /customers`), device assignment
+  (`POST /customers/:id/devices` reuses `assignDevices`), profile update,
+  logo upload/delete. Customer delete reuses the extracted
+  `purgeUserAccount()` so dealer-tree cleanup is identical to admin delete
+  (media files, device configs, schedules, groups, sub-users).
+- **Dealer-scoped existing endpoints**: `getDevices` (list + summary +
+  per-customer `assignedUserId` filter), `getDevice`/`updateConfig`/
+  commands/emergency/media, `getMedia`/`getMediaFolders`/`deleteMedia`/
+  `assignMedia`/`updateMedia`, chunked-upload device check — all accept
+  dealer scope via `canAccessOwnedResource()` / `ownerScopeFilter()`.
+  `processConfigForStorage` and `buildEmergencyAlert` now accept
+  `string | string[]` owner ids so dealers can use any media in their tree.
+- **White-label branding**: `GlobalConfig.logoUrl` (global, admin) +
+  `User.logoUrl` (per-dealer). Endpoints: `POST/DELETE /api/config/logo`
+  (admin), `POST/DELETE /api/dealer/logo` (dealer),
+  `POST/DELETE /api/users/:id/logo` (admin, dealer accounts only),
+  `GET /api/config/branding` (resolved logo for the caller:
+  dealer→own→global, customer→their dealer→global, admin→global),
+  public `GET /api/branding/:key` (S3 signed redirect or local stream).
+  Files stored under `branding/` in the storage backend, images only, 2 MB.
+- **CMS frontend**: new `/dealer/*` section (`DealerLayout` + Dashboard,
+  Devices, Media Library, Users, Settings pages); `BrandLogo` component
+  replaces "Admin CMS"/"User CMS" text in all three layouts; `AdminConfig`
+  gains a Branding card under APK Management; `AdminUsers` supports the
+  dealer role (create/edit with device/customer limits + logo upload,
+  role filter, badge).
+- **Admin user CRUD**: `createUser`/`updateUser` accept `dealer` role with
+  `deviceLimit`/`userLimit`/`logoUrl`; role switches reset the other
+  role's limit fields; legacy `parentId → sub-user` normalization skips
+  dealer customers.
+
 ## 2026-11-26 — Reliability, cost & security batch
 
 - **Media streaming exempt from rate limit** (`rateLimit.middleware.ts`):

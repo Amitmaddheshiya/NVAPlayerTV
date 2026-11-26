@@ -16,6 +16,8 @@ import scheduleRoutes from './routes/schedule.routes';
 import groupRoutes from './routes/group.routes';
 import userRoutes from './routes/user.routes';
 import globalConfigRoutes from './routes/globalConfig.routes';
+import dealerRoutes from './routes/dealer.routes';
+import { serveBranding } from './controllers/branding.controller';
 
 // Express app WITHOUT server listen, socket init or background jobs —
 // index.ts wires those up; tests import this directly with supertest.
@@ -80,6 +82,10 @@ app.use('/api/schedules', scheduleRoutes);
 app.use('/api/groups', groupRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/config', globalConfigRoutes);
+app.use('/api/dealer', dealerRoutes);
+
+// Public branding assets (CMS logos) — no auth so plain <img> tags work.
+app.get('/api/branding/:key', serveBranding);
 
 // Health check
 app.get('/health', (req, res) => {

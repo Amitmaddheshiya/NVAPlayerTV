@@ -1,26 +1,32 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { configAPI } from '../../services/api';
+import { configAPI, brandingAPI } from '../../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/Card';
 import { SkeletonCard } from '../../components/ui/Skeleton';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Alert } from '../../components/ui/Alert';
-import { Save, Package, AlertCircle } from 'lucide-react';
+import { Save, Package, AlertCircle, Image as ImageIcon, Upload, Trash2 } from 'lucide-react';
+import { invalidateBrandingCache } from '../../components/BrandLogo';
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
 
 export const AdminConfig = () => {
   const queryClient = useQueryClient();
   const [saving, setSaving] = useState(false);
+  const [logoUploading, setLogoUploading] = useState(false);
+  const logoInputRef = useRef<HTMLInputElement>(null);
   const [config, setConfig] = useState({
-    monthlyUploadLimitGB: 10,
+    monthlyUploadLimitGB: 2,
     singleUploadLimitMB: 500,
     storageLimitGB: 1,
-    monthlyUploadOpsLimit: 10,
+    monthlyUploadOpsLimit: 100,
     monthlyAssignOpsLimit: 15,
     maxDevicesPerUser: 4,
     archivedMediaRetentionDays: 30,
     apkVersion: '1.0.0',
     apkUrl: '',
+    logoUrl: '',
   });
   const [alertState, setAlertState] = useState<{
     isOpen: boolean;
@@ -71,6 +77,37 @@ export const AdminConfig = () => {
       });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLogoUploading(true);
+    try {
+      await brandingAPI.uploadGlobalLogo(file);
+      invalidateBrandingCache();
+      queryClient.invalidateQueries({ queryKey: ['admin-config'] });
+      setAlertState({ isOpen: true, title: 'Success', message: 'Global logo updated', type: 'success' });
+    } catch (error: any) {
+      setAlertState({ isOpen: true, title: 'Upload Failed', message: error?.response?.data?.error || 'Failed to upload logo', type: 'error' });
+    } finally {
+      setLogoUploading(false);
+      if (logoInputRef.current) logoInputRef.current.value = '';
+    }
+  };
+
+  const handleLogoDelete = async () => {
+    setLogoUploading(true);
+    try {
+      await brandingAPI.deleteGlobalLogo();
+      invalidateBrandingCache();
+      queryClient.invalidateQueries({ queryKey: ['admin-config'] });
+      setAlertState({ isOpen: true, title: 'Success', message: 'Global logo removed', type: 'success' });
+    } catch (error: any) {
+      setAlertState({ isOpen: true, title: 'Failed', message: error?.response?.data?.error || 'Failed to remove logo', type: 'error' });
+    } finally {
+      setLogoUploading(false);
     }
   };
 
@@ -136,6 +173,41 @@ export const AdminConfig = () => {
             </CardContent>
           </Card>
 
+          {/* Branding */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-[10px] sm:text-xs md:text-sm">
+                <ImageIcon className="w-3 h-3 sm:w-4 sm:h-4 md:w-5 md:h-5" />
+                Branding (Global Logo)
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 sm:space-y-3">
+              <p className="text-[10px] sm:text-xs text-gray-500">
+                Shown on Admin/User/Dealer CMS sidebars for accounts without their own dealer logo.
+              </p>
+              {config.logoUrl ? (
+                <div className="p-3 border border-gray-200 rounded-lg inline-block bg-white">
+                  <img src={`${API_URL}/branding/${config.logoUrl}`} alt="Global logo" className="h-14 object-contain" />
+                </div>
+              ) : (
+                <p className="text-xs text-gray-400">No global logo set — "Admin CMS"/"User CMS" text is shown.</p>
+              )}
+              <div className="flex items-center gap-2">
+                <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={handleLogoUpload} />
+                <Button variant="secondary" size="sm" onClick={() => logoInputRef.current?.click()} disabled={logoUploading}>
+                  <Upload className="w-3 h-3 sm:w-4 sm:h-4 mr-1" />
+                  {logoUploading ? 'Uploading...' : config.logoUrl ? 'Replace' : 'Upload Logo'}
+                </Button>
+                {config.logoUrl && (
+                  <Button variant="danger" size="sm" onClick={handleLogoDelete} disabled={logoUploading}>
+                    <Trash2 className="w-3 h-3 sm:w-4 sm:h-4 mr-1" /> Remove
+                  </Button>
+                )}
+              </div>
+              <p className="text-[10px] sm:text-xs text-gray-400">PNG, JPG, WEBP, GIF, SVG or ICO — max 2 MB.</p>
+            </CardContent>
+          </Card>
+
           {/* Global Configuration */}
           <Card>
             <CardHeader>
@@ -145,6 +217,9 @@ export const AdminConfig = () => {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 sm:space-y-3">
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[10px] sm:text-xs text-amber-800">
+                <span className="font-semibold">Recommended defaults (20 users / 40 devices):</span>{' '}Monthly upload 2 GB · Single file 500 MB · Library storage 1 GB · Uploads 100/month · Assignments 15/month · TVs 4/account · Archive retention 30 days. These balance cost (~₹1,500-2,000/mo on AWS) with usability — adjust only if you have a specific plan.
+              </div>
               <div>
                 <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">
                   Monthly Upload Limit (GB)
@@ -155,7 +230,7 @@ export const AdminConfig = () => {
                   onChange={(e) =>
                     setConfig({ ...config, monthlyUploadLimitGB: parseInt(e.target.value) || 0 })
                   }
-                  placeholder="10"
+                  placeholder="2"
                   className="text-xs sm:text-sm"
                 />
                 <p className="text-[10px] sm:text-xs text-gray-500 mt-1">
@@ -210,7 +285,7 @@ export const AdminConfig = () => {
                   onChange={(e) =>
                     setConfig({ ...config, monthlyUploadOpsLimit: parseInt(e.target.value) || 0 })
                   }
-                  placeholder="10"
+                  placeholder="100"
                   className="text-xs sm:text-sm"
                 />
                 <p className="text-[10px] sm:text-xs text-gray-500 mt-1">

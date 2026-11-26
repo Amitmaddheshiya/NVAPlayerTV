@@ -17,6 +17,11 @@ import {
   updateSubUser,
   deleteSubUser,
 } from '../controllers/user.controller';
+import {
+  uploadLogoFile,
+  setUserLogo,
+  deleteUserLogo,
+} from '../controllers/branding.controller';
 
 const router = Router();
 
@@ -34,6 +39,9 @@ router.delete('/me/sub-users/:id', auth, deleteSubUser);
 // Admin-only routes (require auth + admin role)
 router.get('/', auth, adminOnly, getUsers);
 router.get('/:id', auth, adminOnly, getUser);
+// Admin-managed dealer branding logo
+router.post('/:id/logo', auth, adminOnly, uploadLogoFile, setUserLogo);
+router.delete('/:id/logo', auth, adminOnly, deleteUserLogo);
 router.get('/:id/stats', auth, adminOnly, getUserStats);
 router.post('/', auth, adminOnly, createUser);
 router.put('/:id', auth, adminOnly, updateUser);

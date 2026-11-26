@@ -4,6 +4,7 @@ export interface IDevice extends Document {
   deviceId: string;
   name: string;
   assignedUserId?: Types.ObjectId;
+  createdBy?: Types.ObjectId;
   group?: string;
   status: 'online' | 'offline';
   lastSeen: Date;
@@ -82,6 +83,9 @@ const DeviceSchema = new Schema<IDevice>(
     deviceId: { type: String, required: true, unique: true, trim: true },
     name: { type: String, required: true, trim: true },
     assignedUserId: { type: Schema.Types.ObjectId, ref: 'User' },
+    // Who created the device record (admin or dealer). Dealers keep access to
+    // devices they created even while they are not assigned to a customer.
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
     group: { type: String, trim: true },
     status: { type: String, enum: ['online', 'offline'], default: 'offline' },
     lastSeen: { type: Date, default: Date.now },
@@ -146,6 +150,7 @@ const DeviceSchema = new Schema<IDevice>(
 // Index for faster queries (unique fields already have indexes)
 DeviceSchema.index({ status: 1 });
 DeviceSchema.index({ assignedUserId: 1 });
+DeviceSchema.index({ createdBy: 1 });
 DeviceSchema.index({ group: 1 });
 DeviceSchema.index({ lastSeen: -1 }); // For offline detection
 DeviceSchema.index({ status: 1, lastSeen: -1 }); // Compound index for offline detection queries

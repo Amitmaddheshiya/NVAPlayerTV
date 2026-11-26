@@ -246,10 +246,10 @@ export const scheduleAPI = {
 
 // Groups
 export const groupAPI = {
-  getGroups: (params?: { page?: number; limit?: number; search?: string }) => api.get('/groups', { params }),
+  getGroups: (params?: { page?: number; limit?: number; search?: string; ownerId?: string }) => api.get('/groups', { params }),
   getGroup: (id: string) => api.get(`/groups/${id}`),
-  createGroup: (name: string, devices: string[]) =>
-    api.post('/groups', { name, devices }),
+  createGroup: (name: string, devices: string[], ownerId?: string) =>
+    api.post('/groups', { name, devices, ownerId }),
   updateGroup: (id: string, name: string, devices: string[]) =>
     api.put(`/groups/${id}`, { name, devices }),
   deleteGroup: (id: string) => api.delete(`/groups/${id}`),
@@ -286,6 +286,54 @@ export const userAPI = {
 export const configAPI = {
   getConfig: () => api.get('/config/public'),
   updateConfig: (data: any) => api.put('/config', data),
+};
+
+// Branding (white-label logos)
+export const brandingAPI = {
+  getBranding: () => api.get('/config/branding'),
+  getPublicBranding: () => api.get('/config/branding/public'),
+  uploadGlobalLogo: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post('/config/logo', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+  },
+  deleteGlobalLogo: () => api.delete('/config/logo'),
+  uploadDealerLogo: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post('/dealer/logo', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+  },
+  deleteDealerLogo: () => api.delete('/dealer/logo'),
+  uploadUserLogo: (userId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post(`/users/${userId}/logo`, formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+  },
+  deleteUserLogo: (userId: string) => api.delete(`/users/${userId}/logo`),
+};
+
+// Dealer (sub-admin) — customers, scoped devices/media, own profile/logo
+export const dealerAPI = {
+  getDashboard: () => api.get('/dealer/dashboard'),
+  getUsers: (params?: { page?: number; limit?: number; search?: string; role?: string; sortBy?: string; sortOrder?: string }) =>
+    api.get('/dealer/users', { params }),
+  getUser: (id: string) => api.get(`/dealer/users/${id}`),
+  getCustomers: (params?: { page?: number; limit?: number; search?: string }) =>
+    api.get('/dealer/customers', { params }),
+  createCustomer: (data: { email: string; password: string; phone?: string; city?: string; businessName?: string; subUserLimit?: number }) =>
+    api.post('/dealer/customers', data),
+  updateCustomer: (id: string, data: any) => api.put(`/dealer/customers/${id}`, data),
+  deleteCustomer: (id: string) => api.delete(`/dealer/customers/${id}`),
+  assignDevices: (customerId: string, deviceIds: string[]) =>
+    api.post(`/dealer/customers/${customerId}/devices`, { deviceIds }),
+  getCustomerSubUsers: (customerId: string) => api.get(`/dealer/customers/${customerId}/sub-users`),
+  createCustomerSubUser: (customerId: string, data: { email: string; password: string; permissions?: Record<string, boolean>; resourceAccess?: { devices: string[]; groups: string[] } }) =>
+    api.post(`/dealer/customers/${customerId}/sub-users`, data),
+  updateCustomerSubUser: (customerId: string, subUserId: string, data: { email?: string; password?: string; permissions?: Record<string, boolean>; resourceAccess?: { devices: string[]; groups: string[] } }) =>
+    api.put(`/dealer/customers/${customerId}/sub-users/${subUserId}`, data),
+  deleteCustomerSubUser: (customerId: string, subUserId: string) =>
+    api.delete(`/dealer/customers/${customerId}/sub-users/${subUserId}`),
+  updateProfile: (data: { businessName?: string; phone?: string; city?: string }) => api.put('/dealer/profile', data),
 };
 
 export default api;

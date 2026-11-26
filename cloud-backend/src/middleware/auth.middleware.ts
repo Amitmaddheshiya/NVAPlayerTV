@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import env from '../config/env';
 import User from '../models/User';
 import { cacheGet } from '../config/redis';
+import { getDealerScopeUserIds } from '../utils/dealerScope';
 
 export interface AuthRequest extends Request {
   userId?: string;
@@ -20,6 +21,8 @@ export interface AuthRequest extends Request {
     subUsers?: boolean;
   };
   resourceAccess?: { devices: string[]; groups: string[] };
+  /** Dealer-only: [dealerId, ...customerIds] — every account whose resources the dealer may access. */
+  scopeUserIds?: string[];
 }
 
 export const verifyDeviceToken = async (token: string, expectedDeviceId?: string): Promise<string | null> => {
@@ -77,9 +80,14 @@ export const auth = async (req: AuthRequest, res: Response, next: NextFunction):
     }
     req.userId = decoded.userId;
     req.userRole = decoded.role;
-    const isSubUser = user.role === 'sub-user' || !!user.parentId;
+    // Sub-user is an explicit role — dealer customers also carry parentId but
+    // are full 'user' accounts and must own their data themselves.
+    const isSubUser = user.role === 'sub-user';
     req.isSubUser = isSubUser;
     req.effectiveUserId = isSubUser ? String(user.parentId) : decoded.userId;
+    if (user.role === 'dealer') {
+      req.scopeUserIds = await getDealerScopeUserIds(decoded.userId);
+    }
     req.permissions = user.permissions as AuthRequest['permissions'];
     req.resourceAccess = {
       devices: Array.isArray(user.resourceAccess?.devices) ? user.resourceAccess.devices.map(String) : [],
@@ -105,9 +113,51 @@ export const adminOnly = (req: AuthRequest, res: Response, next: NextFunction): 
 };
 
 export const userOrAdmin = (req: AuthRequest, res: Response, next: NextFunction): void => {
-  if (req.userRole !== 'admin' && req.userRole !== 'user' && req.userRole !== 'sub-user') {
+  if (req.userRole !== 'admin' && req.userRole !== 'user' && req.userRole !== 'sub-user' && req.userRole !== 'dealer') {
     res.status(403).json({ error: 'User or admin access required' });
     return;
   }
   next();
+};
+
+export const dealerOnly = (req: AuthRequest, res: Response, next: NextFunction): void => {
+  if (req.userRole !== 'dealer') {
+    res.status(403).json({ error: 'Dealer access required' });
+    return;
+  }
+  next();
+};
+
+/** Admin or dealer — used for device CRUD where the controller applies scope checks. */
+export const adminOrDealer = (req: AuthRequest, res: Response, next: NextFunction): void => {
+  if (req.userRole !== 'admin' && req.userRole !== 'dealer') {
+    res.status(403).json({ error: 'Admin or dealer access required' });
+    return;
+  }
+  next();
+};
+
+/**
+ * Ownership check that understands dealer scope: admins own everything,
+ * normal users/sub-users own their effective account, dealers own every
+ * account in their customer tree.
+ */
+export const canAccessOwnedResource = (req: AuthRequest, ownerId: any): boolean => {
+  if (req.userRole === 'admin') return true;
+  const id = String(ownerId || '');
+  if (!id) return false;
+  if (id === String(req.effectiveUserId || req.userId)) return true;
+  if (req.userRole === 'dealer' && Array.isArray(req.scopeUserIds) && req.scopeUserIds.includes(id)) return true;
+  return false;
+};
+
+/**
+ * Filter value for owner-scoped list queries (assignedUserId / uploadedBy /
+ * ownerId): a single id for normal accounts, an $in set for dealers.
+ */
+export const ownerScopeFilter = (req: AuthRequest): any => {
+  if (req.userRole === 'dealer' && Array.isArray(req.scopeUserIds) && req.scopeUserIds.length) {
+    return { $in: req.scopeUserIds };
+  }
+  return req.effectiveUserId || req.userId;
 };

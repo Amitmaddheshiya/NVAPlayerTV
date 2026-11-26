@@ -5,6 +5,7 @@ import User from '../models/User';
 import jwt from 'jsonwebtoken';
 import env from '../config/env';
 import { getMediaPathFromUrl } from '../utils/mediaUrl';
+import { getDealerScopeUserIds } from '../utils/dealerScope';
 import {
   getCachedMediaAuth,
   setCachedMediaAuth,
@@ -124,17 +125,25 @@ export const fileAccessAuth = async (req: Request, res: Response, next: NextFunc
       return next();
     }
 
-    if (decoded?.role !== 'admin' && decoded?.role !== 'user' && decoded?.role !== 'sub-user') {
+    if (decoded?.role !== 'admin' && decoded?.role !== 'user' && decoded?.role !== 'sub-user' && decoded?.role !== 'dealer') {
       return res.status(401).json({ error: 'Invalid token role' });
     }
     const user = await User.findById(decoded.userId).select('role parentId');
     if (!user || user.role !== decoded.role) return res.status(401).json({ error: 'User session is no longer valid' });
-    const effectiveUserId = user.parentId ? String(user.parentId) : String(user._id);
-    if (decoded.role !== 'admin' && mediaUploadedBy !== effectiveUserId) {
-      return res.status(403).json({ error: 'Access denied - you do not have permission to access this file' });
+    if (decoded.role === 'dealer') {
+      // Dealers may preview media uploaded by any account in their tree.
+      const scope = await getDealerScopeUserIds(String(user._id));
+      if (!mediaUploadedBy || !scope.includes(mediaUploadedBy)) {
+        return res.status(403).json({ error: 'Access denied - you do not have permission to access this file' });
+      }
+    } else {
+      const effectiveUserId = user.parentId ? String(user.parentId) : String(user._id);
+      if (decoded.role !== 'admin' && mediaUploadedBy !== effectiveUserId) {
+        return res.status(403).json({ error: 'Access denied - you do not have permission to access this file' });
+      }
+      (req as any).effectiveUserId = effectiveUserId;
     }
     (req as any).userId = decoded.userId;
-    (req as any).effectiveUserId = effectiveUserId;
     (req as any).userRole = decoded.role;
     next();
   } catch (error) {

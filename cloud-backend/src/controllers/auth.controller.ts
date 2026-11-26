@@ -6,6 +6,7 @@ import User from '../models/User';
 import env from '../config/env';
 import { cacheSet } from '../config/redis';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { resolveAccountType } from './user.controller';
 
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -76,11 +77,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       user: {
         id: user._id,
         email: user.email,
-        role: user.parentId ? 'sub-user' : user.role,
+        role: user.role,
         parentId: user.parentId || null,
-        isSubUser: user.role === 'sub-user' || !!user.parentId,
+        isSubUser: user.role === 'sub-user',
         permissions: user.permissions || null,
         subUserLimit: user.subUserLimit || 0,
+        deviceLimit: user.deviceLimit || 0,
+        userLimit: user.userLimit || 0,
+        logoUrl: user.logoUrl || null,
+        accountType: await resolveAccountType(user),
       },
     });
   } catch (error) {

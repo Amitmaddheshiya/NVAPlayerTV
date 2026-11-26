@@ -3,11 +3,18 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface IUser extends Document {
   email: string;
   password: string;
-  role: 'admin' | 'user' | 'sub-user';
+  role: 'admin' | 'user' | 'sub-user' | 'dealer';
   phone?: string;
+  city?: string;
   businessName?: string;
   assignedDevices: string[];
   subUserLimit: number;
+  /** Dealer-only: max devices across the dealer's whole customer tree. 0 = unlimited. */
+  deviceLimit: number;
+  /** Dealer-only: max customer accounts the dealer may create. 0 = unlimited. */
+  userLimit: number;
+  /** Dealer branding logo filename (served via /api/branding/:file). Admins use GlobalConfig.logoUrl. */
+  logoUrl?: string;
   parentId?: mongoose.Types.ObjectId;
   permissions?: {
     devices?: boolean;
@@ -33,11 +40,15 @@ const UserSchema = new Schema<IUser>(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
-    role: { type: String, enum: ['admin', 'user', 'sub-user'], default: 'user' },
+    role: { type: String, enum: ['admin', 'user', 'sub-user', 'dealer'], default: 'user' },
     phone: { type: String, trim: true },
+    city: { type: String, trim: true },
     businessName: { type: String, trim: true },
     assignedDevices: [{ type: String }],
     subUserLimit: { type: Number, default: 0, min: 0 },
+    deviceLimit: { type: Number, default: 0, min: 0 },
+    userLimit: { type: Number, default: 0, min: 0 },
+    logoUrl: { type: String, trim: true },
     parentId: { type: Schema.Types.ObjectId, ref: 'User' },
     permissions: {
       devices: { type: Boolean, default: true },

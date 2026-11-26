@@ -16,6 +16,7 @@ import { createReadStream } from 'fs';
 import path from 'path';
 import { invalidateMediaAuth } from '../utils/fileAccessCache';
 import { checkUploadQuota, recordUpload, checkAssignQuota, recordAssign } from '../utils/quota';
+import { canAccessOwnedResource, ownerScopeFilter } from '../middleware/auth.middleware';
 
 async function getFileSha256(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -39,7 +40,7 @@ export const uploadMedia = async (req: AuthRequest, res: Response): Promise<void
 
     const ownerId = req.effectiveUserId || req.userId;
     if (deviceId && req.userRole !== 'admin') {
-      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: ownerId }).select('_id');
+      const assignedDevice = await Device.findOne({ deviceId, assignedUserId: ownerScopeFilter(req) }).select('_id');
       if (!assignedDevice) {
         res.status(403).json({ error: 'Media can only be uploaded to a device assigned to your account' });
         return;
@@ -170,7 +171,14 @@ export const getMedia = async (req: AuthRequest, res: Response): Promise<void> =
     // But for the library page, they should see all their media regardless of device assignment
     // Sub-users share the parent account's library.
     if (req.userRole !== 'admin' && req.userId) {
-      filter.uploadedBy = req.effectiveUserId || req.userId;
+      // Dealers may drill into one customer account's library via uploadedBy,
+      // but only when that account is inside their tree.
+      if (req.userRole === 'dealer' && uploadedBy) {
+        const scope = (req.scopeUserIds || []).map(String);
+        filter.uploadedBy = scope.includes(String(uploadedBy)) ? uploadedBy : ownerScopeFilter(req);
+      } else {
+        filter.uploadedBy = ownerScopeFilter(req);
+      }
     } else if (req.userRole === 'admin' && uploadedBy) {
       // Admin-only: view a specific user's library (e.g. admin user media page).
       filter.uploadedBy = uploadedBy;
@@ -243,10 +251,25 @@ export const getMediaFolders = async (req: AuthRequest, res: Response): Promise<
     // NOTE: aggregation pipelines do NOT apply schema casting, so uploadedBy
     // (ObjectId) must be cast manually or the match returns zero documents.
     if (req.userRole !== 'admin' && req.userId) {
-      const ownerId = String(req.effectiveUserId || req.userId);
-      filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
-        ? new mongoose.Types.ObjectId(ownerId)
-        : ownerId;
+      // Dealers may filter folders by a customer inside their tree.
+      if (req.userRole === 'dealer' && uploadedBy) {
+        const scope = (req.scopeUserIds || []).map(String);
+        const ownerId = String(uploadedBy);
+        if (scope.includes(ownerId)) {
+          filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
+            ? new mongoose.Types.ObjectId(ownerId)
+            : ownerId;
+        } else {
+          const scopeFilter = ownerScopeFilter(req);
+          filter.uploadedBy = Array.isArray((scopeFilter as any)?.$in)
+            ? (scopeFilter as any).$in
+            : scopeFilter;
+        }
+      } else {
+        const scope = ownerScopeFilter(req);
+        const toObjectId = (v: any) => mongoose.Types.ObjectId.isValid(String(v)) ? new mongoose.Types.ObjectId(String(v)) : v;
+        filter.uploadedBy = Array.isArray(scope?.$in) ? scope.$in.map(toObjectId) : toObjectId(scope);
+      }
     } else if (req.userRole === 'admin' && uploadedBy) {
       const ownerId = String(uploadedBy);
       filter.uploadedBy = mongoose.Types.ObjectId.isValid(ownerId)
@@ -328,8 +351,8 @@ export const deleteMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Non-admin users can only delete their own media
-    if (req.userRole !== 'admin' && media.uploadedBy?.toString() !== (req.effectiveUserId || req.userId)) {
+    // Non-admin users can only delete their own media (dealers: whole customer tree)
+    if (req.userRole !== 'admin' && !canAccessOwnedResource(req, media.uploadedBy)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -445,8 +468,8 @@ export const assignMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Non-admin users can only assign their own media
-    if (req.userRole !== 'admin' && media.uploadedBy?.toString() !== (req.effectiveUserId || req.userId)) {
+    // Non-admin users can only assign their own media (dealers: whole customer tree)
+    if (req.userRole !== 'admin' && !canAccessOwnedResource(req, media.uploadedBy)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -456,7 +479,7 @@ export const assignMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
     if (req.userRole !== 'admin' && deviceIds.length) {
-      const ownedDevices = await Device.find({ deviceId: { $in: deviceIds }, assignedUserId: req.effectiveUserId || req.userId }).select('deviceId').lean();
+      const ownedDevices = await Device.find({ deviceId: { $in: deviceIds }, assignedUserId: ownerScopeFilter(req) }).select('deviceId').lean();
       if (ownedDevices.length !== new Set(deviceIds.map(String)).size) {
         res.status(403).json({ error: 'Media can only be assigned to devices in your account' });
         return;
@@ -500,8 +523,8 @@ export const updateMedia = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Non-admin users can only update their own media
-    if (req.userRole !== 'admin' && media.uploadedBy?.toString() !== (req.effectiveUserId || req.userId)) {
+    // Non-admin users can only update their own media (dealers: whole customer tree)
+    if (req.userRole !== 'admin' && !canAccessOwnedResource(req, media.uploadedBy)) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }

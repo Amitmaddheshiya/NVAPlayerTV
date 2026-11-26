@@ -18,7 +18,7 @@ export interface ProcessedConfigResult {
  */
 export const processConfigForStorage = async (
   submittedConfig: any,
-  ownerId?: string
+  ownerId?: string | string[]
 ): Promise<ProcessedConfigResult> => {
   const config = JSON.parse(JSON.stringify(submittedConfig || {}));
 
@@ -33,7 +33,8 @@ export const processConfigForStorage = async (
   if (mediaDocs.length !== uniqueMediaPaths.length) {
     return { mediaDocs: [], mediaPaths: uniqueMediaPaths, error: 'Configuration contains a media file that no longer exists', status: 400 };
   }
-  if (ownerId && mediaDocs.some((media: any) => media.uploadedBy?.toString() !== String(ownerId))) {
+  const ownerIds = Array.isArray(ownerId) ? ownerId.map(String) : (ownerId ? [String(ownerId)] : []);
+  if (ownerIds.length && mediaDocs.some((media: any) => !ownerIds.includes(String(media.uploadedBy || '')))) {
     return { mediaDocs: [], mediaPaths: uniqueMediaPaths, error: 'Configuration can only use media uploaded to your account', status: 403 };
   }
   const mediaByPath = new Map(mediaDocs.map((media: any) => [String(media.path), media]));
