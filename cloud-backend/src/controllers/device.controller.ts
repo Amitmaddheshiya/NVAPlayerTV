@@ -486,21 +486,20 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     const deviceId = req.params.id;  // Route uses :id, not :deviceId
     const { config } = req.body;
 
-    console.log(`=== CONFIG UPDATE: Starting for device ${deviceId} ===`);
-    console.log(`=== CONFIG UPDATE: Request config ===`, JSON.stringify(config, null, 2));
+    console.log(`Config update requested for device ${deviceId}`);
 
     const device = await Device.findOne({ deviceId });
     if (!device) {
-      console.log(`=== CONFIG UPDATE: Device ${deviceId} NOT FOUND ===`);
+      console.log(`Config update: device ${deviceId} not found`);
       res.status(404).json({ error: 'Device not found' });
       return;
     }
 
-    console.log(`=== CONFIG UPDATE: Device found: ${device.name} ===`);
+    console.log(`Config update: device ${deviceId} (${device.name})`);
 
     // Non-admin users can only update their assigned devices
     if (req.userRole !== 'admin' && (!device.assignedUserId || device.assignedUserId.toString() !== (req.effectiveUserId || req.userId) || !hasDeviceScope(req, device.deviceId))) {
-      console.log(`=== CONFIG UPDATE: Access denied for user ${req.userId} ===`);
+      console.log(`Config update: access denied for user ${req.userId} on device ${deviceId}`);
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -595,20 +594,11 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     device.cacheInfo.cachedMedia = cachedMediaArray;
     device.cacheInfo.totalCacheSize = totalCacheSize;
 
-    console.log(`=== CONFIG UPDATE: Saving config to database ===`);
-    console.log(`Update config for device ${deviceId}:`, {
-      layout: device.config.layout,
-      grid2Layout: device.config.grid2Layout,
-      grid3Layout: device.config.grid3Layout,
-      sections: device.config.sections,
-      mediaUrls: device.config.mediaUrls,
-      ticker: device.config.ticker,
-      cacheVersion: device.cacheInfo.configVersion,
-    });
+    console.log(`Config update for device ${deviceId}: layout=${device.config.layout}, sections=${Array.isArray(device.config.sections) ? device.config.sections.length : 0}, configVersion=${device.cacheInfo.configVersion}`);
 
     await device.save();
     await invalidateDevicePaths(deviceId);
-    console.log(`=== CONFIG UPDATE: Config saved to database ===`);
+    console.log(`Config saved for device ${deviceId} (version ${device.cacheInfo.configVersion})`);
 
     if (req.userRole !== 'admin' && assignOwnerId) {
       await recordAssign(assignOwnerId);
@@ -619,9 +609,8 @@ export const updateConfig = async (req: AuthRequest, res: Response): Promise<voi
     const io = getSocketInstance();
     const room = io.sockets.adapter.rooms.get(`device:${deviceId}`);
     const roomSize = room ? room.size : 0;
-    console.log(`=== CONFIG UPDATE: Room ${deviceId} has ${roomSize} clients ===`);
     io.to(`device:${deviceId}`).emit('config:update', { config: device.config, configVersion: device.cacheInfo.configVersion });
-    console.log(`=== CONFIG UPDATE: Config pushed via socket to device ${deviceId} ===`);
+    console.log(`Config pushed via socket to device ${deviceId} (${roomSize} client(s) in room)`);
 
     res.json({ success: true, config: device.config, cacheVersion: device.cacheInfo.configVersion });
 
@@ -900,7 +889,15 @@ export const updateDevice = async (req: AuthRequest, res: Response): Promise<voi
       // Per-account device limit (plan-based) — skip when the assignment is
       // unchanged (device already counted toward this user's quota).
       const targetUserId = String(updates.assignedUserId);
-      if (String(device.assignedUserId || '') !== targetUserId) {
+      // A device already assigned to another account must be unassigned
+      // first — prevents accidental reassignment that wipes its config,
+      // schedules and media assignments.
+      const currentAssignee = device.assignedUserId ? String(device.assignedUserId) : '';
+      if (currentAssignee && currentAssignee !== targetUserId) {
+        res.status(400).json({ error: 'Device is already assigned to another user. Unassign it first.' });
+        return;
+      }
+      if (currentAssignee !== targetUserId) {
         const deviceLimit = await checkDeviceLimit(targetUserId, 1);
         if (!deviceLimit.ok) {
           res.status(400).json({ error: deviceLimit.error });

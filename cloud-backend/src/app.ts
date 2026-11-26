@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import path from 'path';
 import compression from 'compression';
 import env from './config/env';
@@ -20,8 +21,20 @@ import globalConfigRoutes from './routes/globalConfig.routes';
 // index.ts wires those up; tests import this directly with supertest.
 const app = express();
 
+// Security headers. CSP and CORP are disabled: this is a JSON API + media
+// redirect service — the SPA is served separately and media responses must
+// stay embeddable/redirectable for the TV app and CDN signed URLs.
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
+
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:5174', 'http://127.0.0.1:5174', 'http://127.0.0.1:52844', 'http://127.0.0.1:54608', env.FRONTEND_URL],
+  origin: [...new Set([
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174',
+    env.FRONTEND_URL,
+    ...env.CORS_ORIGINS,
+  ])],
   credentials: true,
 }));
 app.use(compression({ threshold: 1024 }));

@@ -2,6 +2,67 @@
 
 Important code changes, bug fixes and features. Newest first.
 
+## 2026-11-26 — Reliability, cost & security batch
+
+- **Media streaming exempt from rate limit** (`rateLimit.middleware.ts`):
+  `/api/media/file/*` skipped — Range requests are legitimate playback and
+  multiple TVs behind one NAT share the IP counter; a quota would 429
+  mid-playback. Route stays protected by `fileAccessAuth`.
+- **In-memory cache + Redis optional** (`redis.ts` rewritten): cacheGet/Set/
+  Del/DelPattern now use a bounded in-memory layer (5000 entries, TTL-aware
+  eviction) with Redis as a shared second layer when reachable. App works
+  fully without Redis; circuit breaker (30s cooldown) stops reconnect storms
+  when Redis is down. ElastiCache can be dropped on single-instance deploys.
+- **Duplicate mongoose index removed** (`Schedule.ts`): `ownerId` had both
+  `index: true` and `schema.index()` — startup warning gone, less write
+  overhead.
+- **Config-update log spam cut** (`device.controller.ts`): full config JSON
+  dumps replaced with one-line summaries — less CloudWatch ingestion.
+- **aws-sdk v2 → v3 migration**: `storage.ts` (S3Storage) and
+  `scripts/backup-mongo.js` now use `@aws-sdk/client-s3` +
+  `@aws-sdk/lib-storage` + `@aws-sdk/s3-request-presigner`. Unused `uuid`
+  dep removed; `aws-sdk` uninstalled. npm audit: 21 → 19 moderate (all
+  remaining are dev-only jest/nodemon transitive deps).
+
+## 2026-11-26 — Security & ops hardening
+
+- **Dev admin password moved to env** (`testAdmin.ts`): hardcoded
+  `TEST_ADMIN_PASSWORD` removed — now reads `DEV_ADMIN_PASSWORD`, skips
+  bootstrap with a warning when unset, still disabled in production.
+- **JWT logout revocation**: new `POST /api/auth/logout` blacklists the
+  presented token (sha256 → Redis `revoked:<hash>`, TTL = remaining token
+  life); `auth` middleware rejects revoked tokens. Fails open when Redis is
+  down. CMS logout buttons (admin/user layouts + dashboard) now call it.
+- **helmet** added to backend (`contentSecurityPolicy`/`crossOriginResourcePolicy`
+  off — JSON API + media redirects must stay embeddable).
+- **CORS env-driven**: new `CORS_ORIGINS` (comma-separated); random dev ports
+  removed from the allowlist.
+- **PII log cleanup**: login no longer prints emails/password attempts.
+- **DB backup script** (`scripts/backup-mongo.js`, `npm run backup:db`):
+  mongodump --gzip → tar → S3 `db-backups/` with `BACKUP_RETENTION_DAYS`
+  cleanup — covers Atlas M0's missing backups. Cron documented in runbook.
+
+## 2026-11-26 — Assignment & group integrity fixes
+
+- **Device reassignment blocked** (`device.controller.ts` `updateDevice`):
+  assigning a device already owned by another user now returns 400 —
+  unassign first. Prevents accidental reassignment wiping config,
+  schedules and media assignments.
+- **Admin device-assignment UI** (`AdminUserDevices.tsx`): available-devices
+  list still shows devices assigned to other users, but with an
+  "Assigned to <email>" badge and no Assign button; `handleAssign` guards too.
+- **One device = one group enforced server-side** (`group.controller.ts`):
+  `createGroup`/`updateGroup` reject devices already in another group with a
+  400 naming the conflicting group (update excludes the group being edited).
+- **Group form UX** (`UserGroups.tsx`): edit button now passes the full group
+  object so name + selected devices prefill; devices in other groups are
+  disabled with an "In group: <name>" label, checked against an unpaginated
+  groups list.
+- **Bulk assign error reasons** (`AdminDevices.tsx`): toast now shows the
+  first failure reasons instead of a bare count.
+- **Reassign warning** (`AdminDeviceEdit.tsx`): amber hint when the selected
+  assignee differs from the device's current owner.
+
 ## 2026-11-26 — S3/CloudFront media delivery, APK hash-first cache verify
 
 - **S3 storage backend implemented** (`cloud-backend/src/config/storage.ts`):

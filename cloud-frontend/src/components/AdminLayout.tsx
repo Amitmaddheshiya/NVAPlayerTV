@@ -2,6 +2,7 @@ import { type ReactNode, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Layout, LayoutDashboard, Library, Monitor, Users, LogOut, Cog, Menu, X } from 'lucide-react';
 import { ToastProvider } from './ui/Toast';
+import { authAPI } from '../services/api';
 
 interface AdminLayoutProps {
   children: ReactNode;
@@ -21,6 +22,7 @@ export const AdminLayout = ({ children }: AdminLayoutProps) => {
   ];
 
   const handleLogout = () => {
+    authAPI.logout().catch(() => {});
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     navigate('/login');

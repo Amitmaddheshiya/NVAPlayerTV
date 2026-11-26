@@ -1,7 +1,9 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import env from '../config/env';
 import User from '../models/User';
+import { cacheGet } from '../config/redis';
 
 export interface AuthRequest extends Request {
   userId?: string;
@@ -59,6 +61,15 @@ export const auth = async (req: AuthRequest, res: Response, next: NextFunction):
     }
 
     const decoded = jwt.verify(token, env.JWT_SECRET) as { userId: string; role: string };
+
+    // Reject tokens blacklisted by /auth/logout. Fails open when Redis is
+    // unavailable (cacheGet returns null) so auth never breaks without it.
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    if (await cacheGet(`revoked:${tokenHash}`)) {
+      res.status(401).json({ error: 'Session has been logged out' });
+      return;
+    }
+
     const user = await User.findById(decoded.userId).select('role parentId permissions resourceAccess');
     if (!user || user.role !== decoded.role) {
       res.status(401).json({ error: 'User session is no longer valid' });

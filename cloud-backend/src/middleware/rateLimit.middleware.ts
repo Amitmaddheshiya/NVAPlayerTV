@@ -20,6 +20,13 @@ export const rateLimit = (windowMs: number = env.RATE_LIMIT_WINDOW_MS, maxReques
     if (/^\/devices\/[^/]+\/heartbeat$/.test(pathname) || pathname === '/media/media-list') {
       return next();
     }
+    // Media file streaming: players issue many sequential Range requests per
+    // video, and multiple TVs behind one NAT share the IP counter — a fixed
+    // quota would 429 mid-playback. The route is already protected by
+    // fileAccessAuth (device/user token), so abuse is still gated.
+    if (pathname.startsWith('/media/file/')) {
+      return next();
+    }
     const activationMatch = pathname.match(/^\/devices\/([^/]+)\/activation$/);
     const healthMatch = pathname.match(/^\/devices\/([^/]+)\/health$/);
     const identity = activationMatch || healthMatch

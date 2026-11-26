@@ -137,6 +137,17 @@ export const createGroup = async (req: AuthRequest, res: Response): Promise<void
       }
     }
 
+    // One device can belong to only one group — the UI disables conflicting
+    // devices, but the API must enforce it too.
+    if (Array.isArray(devices) && devices.length) {
+      const conflict = await Group.findOne({ devices: { $in: devices } }).select('name devices').lean();
+      if (conflict) {
+        const conflictIds = devices.filter((id: string) => (conflict.devices || []).includes(id));
+        res.status(400).json({ error: `Device(s) already belong to group "${conflict.name}": ${conflictIds.join(', ')}. Remove them from that group first.` });
+        return;
+      }
+    }
+
     const group = new Group({
       name: name.trim(),
       devices: devices || [],
@@ -194,6 +205,18 @@ export const updateGroup = async (req: AuthRequest, res: Response): Promise<void
       }
       group.ownerId = new mongoose.Types.ObjectId(ownerId);
     }
+
+    // One device can belong to only one group — exclude this group itself
+    // so re-saving its existing membership is allowed.
+    if (devices !== undefined && Array.isArray(devices) && devices.length) {
+      const conflict = await Group.findOne({ _id: { $ne: group._id }, devices: { $in: devices } }).select('name devices').lean();
+      if (conflict) {
+        const conflictIds = devices.filter((id: string) => (conflict.devices || []).includes(id));
+        res.status(400).json({ error: `Device(s) already belong to group "${conflict.name}": ${conflictIds.join(', ')}. Remove them from that group first.` });
+        return;
+      }
+    }
+
     const previousName = group.name;
     if (name !== undefined) group.name = String(name).trim();
     const previousDevices = devices !== undefined ? [...(group.devices || [])] : null;

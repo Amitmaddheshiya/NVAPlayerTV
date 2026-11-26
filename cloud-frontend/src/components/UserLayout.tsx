@@ -1,6 +1,7 @@
 import { type ReactNode, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Layout, LayoutDashboard, Monitor, Layers, Library, Settings, LogOut, Menu, X, Users } from 'lucide-react';
+import { authAPI } from '../services/api';
 
 interface UserLayoutProps {
   children: ReactNode;
@@ -29,6 +30,7 @@ export const UserLayout = ({ children }: UserLayoutProps) => {
   });
 
   const handleLogout = () => {
+    authAPI.logout().catch(() => {});
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     navigate('/login');

@@ -1,8 +1,11 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import User from '../models/User';
 import env from '../config/env';
+import { cacheSet } from '../config/redis';
+import { AuthRequest } from '../middleware/auth.middleware';
 
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -43,33 +46,24 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
 
-    console.log('Login attempt for email:', email);
-
     if (!email || !password) {
-      console.log('Missing email or password');
       res.status(400).json({ error: 'Email and password are required' });
       return;
     }
 
     // Lowercase email to match schema lowercase requirement
-    const normalizedEmail = email.toLowerCase();
+    const normalizedEmail = String(email).toLowerCase();
     const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
-      console.log('User not found for email:', normalizedEmail);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
-
-    console.log('User found:', user.email, 'Role:', user.role);
 
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
-      console.log('Invalid password for email:', normalizedEmail);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
-
-    console.log('Password valid, generating token for:', user.email);
 
     const token = jwt.sign(
       { userId: user._id.toString(), role: user.role },
@@ -92,5 +86,25 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
+  }
+};
+
+// Blacklist the presented token until its natural expiry so logout actually
+// invalidates the session server-side (JWTs are otherwise valid until exp).
+export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (token) {
+      const decoded = jwt.decode(token) as { exp?: number } | null;
+      const ttlSeconds = decoded?.exp
+        ? Math.max(1, decoded.exp - Math.floor(Date.now() / 1000))
+        : 7 * 24 * 3600;
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      await cacheSet(`revoked:${tokenHash}`, '1', ttlSeconds);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: 'Logout failed' });
   }
 };

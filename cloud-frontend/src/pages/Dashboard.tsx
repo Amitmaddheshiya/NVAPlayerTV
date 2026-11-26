@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { deviceAPI } from '../services/api';
+import { deviceAPI, authAPI } from '../services/api';
 import { subscribeToDeviceUpdates, unsubscribeFromDeviceUpdates } from '../services/socket';
 import type { Device } from '../types';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/Card';
@@ -50,6 +50,7 @@ export const Dashboard = () => {
   const usedStorage = devices.reduce((acc, d) => acc + d.storage.used, 0);
 
   const handleLogout = () => {
+    authAPI.logout().catch(() => {});
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     navigate('/login');

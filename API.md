@@ -19,6 +19,7 @@ Base URL: `SERVER_URL` (e.g. `http://192.168.1.3:3000`). All routes under
 |---|---|---|---|
 | POST | `/register` | rate-limited | Create account (cannot self-grant admin) |
 | POST | `/login` | rate-limited | Login → JWT |
+| POST | `/logout` | user JWT | Blacklist the presented token in Redis until its natural expiry — the session is invalidated server-side |
 
 ### Devices — `/api/devices`
 | Method | Path | Auth | Description |

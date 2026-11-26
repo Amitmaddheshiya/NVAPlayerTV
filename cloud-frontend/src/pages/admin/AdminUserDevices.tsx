@@ -65,6 +65,15 @@ export const AdminUserDevices = () => {
     enabled: !!userId,
   });
 
+  // All users — used to label devices that are already assigned to another account
+  const usersQuery = useQuery({
+    queryKey: ['admin-all-users'],
+    queryFn: async () => {
+      const response = await userAPI.getUsers({ limit: 1000 });
+      return response.data;
+    },
+  });
+
   const user = userQuery.data || null;
   const assignedDevices = assignedQuery.data?.data || [];
   const availableDevices = availableQuery.data?.data || [];
@@ -75,6 +84,17 @@ export const AdminUserDevices = () => {
   const loading = assignedQuery.isLoading || userQuery.isLoading;
   const isSubUser = !!user && (user.role === 'sub-user' || !!user.parentId);
   const canAssignDevices = !!user && !isSubUser;
+
+  const userEmailById = new Map<string, string>();
+  const usersList = usersQuery.data?.data || usersQuery.data || [];
+  (Array.isArray(usersList) ? usersList : []).forEach((u: any) => {
+    if (u?._id) userEmailById.set(String(u._id), u.email || '');
+  });
+  const assigneeLabel = (device: any): string | null => {
+    const assigneeId = device?.assignedUserId ? String(device.assignedUserId) : '';
+    if (!assigneeId || assigneeId === String(userId)) return null;
+    return userEmailById.get(assigneeId) || 'another user';
+  };
 
   const reloadBoth = () => {
     queryClient.invalidateQueries({ queryKey: ['admin-user-devices-assigned', userId] });
@@ -101,6 +121,12 @@ export const AdminUserDevices = () => {
   const handleAssign = async (deviceId: string) => {
     if (!canAssignDevices) {
       toastError('Devices can only be assigned to the parent account, not a sub-user.');
+      return;
+    }
+    const device = availableDevices.find((d: any) => d.deviceId === deviceId);
+    const assignee = device ? assigneeLabel(device) : null;
+    if (assignee) {
+      toastError(`This device is already assigned to ${assignee}. Unassign it from that user first.`);
       return;
     }
     try {
@@ -254,10 +280,12 @@ export const AdminUserDevices = () => {
             ) : (
               <>
                 <div className="space-y-2 max-h-[500px] overflow-y-auto">
-                  {availableDevices.map((device) => (
+                  {availableDevices.map((device) => {
+                    const assignee = assigneeLabel(device);
+                    return (
                     <div
                       key={device.deviceId}
-                      className="flex items-center justify-between p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition"
+                      className={`flex items-center justify-between p-3 rounded-lg transition ${assignee ? 'bg-gray-100' : 'bg-gray-50 hover:bg-gray-100'}`}
                     >
                       <div className="flex-1 min-w-0">
                         <div className="font-medium text-sm text-gray-900 truncate">{device.name}</div>
@@ -265,9 +293,14 @@ export const AdminUserDevices = () => {
                         <div className="flex items-center gap-2 mt-1 flex-wrap">
                           {renderStatusBadge(device)}
                           <span className="text-[10px] text-gray-500 truncate">{device.location || '-'}</span>
+                          {assignee && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">
+                              Assigned to {assignee}
+                            </span>
+                          )}
                         </div>
                       </div>
-                      {canAssignDevices && (
+                      {canAssignDevices && !assignee && (
                         <Button
                           size="sm"
                           variant="primary"
@@ -279,7 +312,8 @@ export const AdminUserDevices = () => {
                         </Button>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 {/* Pagination for Available Devices */}

@@ -32,7 +32,7 @@ const ScheduleTemplateSchema = new Schema<IScheduleTemplate>(
     name: { type: String, required: true, trim: true },
     targetType: { type: String, enum: ['device', 'group'], required: true },
     targetId: { type: String, required: true, trim: true },
-    ownerId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+    ownerId: { type: Schema.Types.ObjectId, ref: 'User' },
     config: { type: Schema.Types.Mixed, required: true },
     schedule: {
     // Keep fullDay for legacy records; API validation prevents new ones.

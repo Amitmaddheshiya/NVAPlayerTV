@@ -194,14 +194,15 @@ export const AdminDevices = () => {
     if (selectedIds.size === 0 || !bulkAssignUser) return;
     setBulkBusy(true);
     let ok = 0;
-    let fail = 0;
+    const failures: string[] = [];
     await Promise.all(
       Array.from(selectedIds).map(async (id) => {
         try {
           await deviceAPI.updateDevice(id, { assignedUserId: bulkAssignUser });
           ok++;
-        } catch {
-          fail++;
+        } catch (error: any) {
+          const reason = error?.response?.data?.error || 'failed';
+          failures.push(`${id}: ${reason}`);
         }
       })
     );
@@ -209,8 +210,8 @@ export const AdminDevices = () => {
     setBulkAssignUser('');
     setSelectedIds(new Set());
     loadDevices();
-    if (fail === 0) success(`${ok} device(s) assigned`);
-    else toastError(`Assigned ${ok}, failed ${fail}`);
+    if (failures.length === 0) success(`${ok} device(s) assigned`);
+    else toastError(`Assigned ${ok}, failed ${failures.length}. ${failures.slice(0, 3).join(' | ')}`);
   };
 
   const handleDelete = async () => {

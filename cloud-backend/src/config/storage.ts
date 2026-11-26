@@ -1,5 +1,7 @@
 import env from './env';
-import AWS from 'aws-sdk';
+import { S3Client, DeleteObjectCommand, CopyObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import crypto from 'crypto';
 import fs from 'fs';
 
@@ -92,7 +94,7 @@ function buildCloudFrontSignedUrl(resourceUrl: string, keyPairId: string, privat
 }
 
 export class S3Storage implements StorageService {
-  private s3: AWS.S3;
+  private s3: S3Client;
   private bucket: string;
 
   constructor() {
@@ -100,24 +102,27 @@ export class S3Storage implements StorageService {
       throw new Error('S3_BUCKET_NAME is required when STORAGE_TYPE=s3');
     }
     this.bucket = env.S3_BUCKET_NAME;
-    this.s3 = new AWS.S3({
-      accessKeyId: env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+    this.s3 = new S3Client({
       region: env.AWS_REGION || 'ap-south-1',
-      signatureVersion: 'v4',
+      credentials: env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
+        ? { accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY }
+        : undefined, // fall back to the default provider chain (IAM role etc.)
     });
   }
 
   async upload(file: Express.Multer.File, path: string): Promise<string> {
     const fsp = fs.promises;
-    // Stream the temp file — aws-sdk v2 auto-switches to multipart upload for
-    // large bodies, so multi-GB media never sits in memory.
-    await this.s3.upload({
-      Bucket: this.bucket,
-      Key: path,
-      Body: fs.createReadStream(file.path),
-      ContentType: file.mimetype || 'application/octet-stream',
-    }).promise();
+    // lib-storage Upload auto-switches to multipart for large bodies, so
+    // multi-GB media streams from disk and never sits in memory.
+    await new Upload({
+      client: this.s3,
+      params: {
+        Bucket: this.bucket,
+        Key: path,
+        Body: fs.createReadStream(file.path),
+        ContentType: file.mimetype || 'application/octet-stream',
+      },
+    }).done();
     // S3 has the bytes now — remove the local temp copy so disk doesn't fill.
     await fsp.unlink(file.path).catch(() => undefined);
     return path;
@@ -125,19 +130,19 @@ export class S3Storage implements StorageService {
 
   async delete(path: string): Promise<void> {
     try {
-      await this.s3.deleteObject({ Bucket: this.bucket, Key: path }).promise();
+      await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: path }));
     } catch (error) {
       console.error(`Error deleting S3 object ${path}:`, error);
     }
   }
 
   async move(fromPath: string, toPath: string): Promise<void> {
-    await this.s3.copyObject({
+    await this.s3.send(new CopyObjectCommand({
       Bucket: this.bucket,
       CopySource: `${this.bucket}/${fromPath}`,
       Key: toPath,
-    }).promise();
-    await this.s3.deleteObject({ Bucket: this.bucket, Key: fromPath }).promise();
+    }));
+    await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: fromPath }));
   }
 
   getUrl(path: string): string {
@@ -159,11 +164,7 @@ export class S3Storage implements StorageService {
 
     // Fallback: S3 presigned GET — still offloads bytes from EC2 to S3,
     // just without edge caching. Range requests are supported natively.
-    return this.s3.getSignedUrlPromise('getObject', {
-      Bucket: this.bucket,
-      Key: path,
-      Expires: ttl,
-    });
+    return getSignedUrl(this.s3, new GetObjectCommand({ Bucket: this.bucket, Key: path }), { expiresIn: ttl });
   }
 }
 

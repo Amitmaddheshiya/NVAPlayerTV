@@ -228,6 +228,11 @@ export const AdminDeviceEdit = () => {
                 value={formData.assignedUserId}
                 onChange={(e) => setFormData({ ...formData, assignedUserId: e.target.value })}
               />
+              {device?.assignedUserId && formData.assignedUserId && String(device.assignedUserId) !== String(formData.assignedUserId) && (
+                <p className="mt-2 text-xs text-amber-700">
+                  This device is currently assigned to another user. It must be unassigned first before assigning to a different user.
+                </p>
+              )}
             </div>
           </div>
           <div className="flex justify-end mt-3 sm:mt-4">

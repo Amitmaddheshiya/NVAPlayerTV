@@ -18,6 +18,7 @@ AWS Secrets Manager / Parameter Store in production. **Never commit `.env`.**
 | `PORT` | `3000` | HTTP port |
 | `NODE_ENV` | `development` | `production` enables JWT_SECRET check + rate limiting |
 | `FRONTEND_URL` | `http://localhost:5173` | Added to CORS allowlist (in addition to built-in dev origins) |
+| `CORS_ORIGINS` | — | Comma-separated extra CORS origins (e.g. `https://cms.example.com,https://admin.example.com`) |
 | `SERVER_URL` | `http://localhost:3000` | Public backend URL (used in generated links) |
 | `RATE_LIMIT_WINDOW_MS` | `900000` (15 min) | Rate-limit window |
 | `RATE_LIMIT_MAX_REQUESTS` | `100` | Max requests per window per IP |
@@ -37,18 +38,27 @@ AWS Secrets Manager / Parameter Store in production. **Never commit `.env`.**
 | `CLOUDFRONT_PRIVATE_KEY` | — | RSA private key PEM (matching the CloudFront public key). Keep in Secrets Manager — never commit. |
 | `MEDIA_URL_EXPIRES_IN` | `3600` | Seconds a signed delivery URL stays valid. Each range request gets a fresh redirect, so this only bounds a single transfer. |
 
-## Redis (optional but recommended)
+## Redis (optional)
 
 | Variable | Default | Description |
 |---|---|---|
-| `REDIS_URL` | `redis://localhost:6379` | Redis/ElastiCache endpoint. App degrades gracefully without it (caches disabled). |
+| `REDIS_URL` | `redis://localhost:6379` | Redis/ElastiCache endpoint. **Optional** — the app runs fully on an in-memory cache layer when Redis is absent or down (circuit breaker prevents reconnect storms). Set it only for multi-instance deployments where cache must be shared. |
 
 ## Test admin (development only — do NOT set in production)
 
 | Variable | Description |
 |---|---|
-| `TEST_ADMIN_EMAIL` | Email for auto-provisioned admin (`src/config/testAdmin.ts`) |
-| `TEST_ADMIN_PASSWORD` | Password for that admin |
+| `DEV_ADMIN_PASSWORD` | Password for the auto-provisioned dev admin (`src/config/testAdmin.ts`, email `nextviewsignage@gmail.com`). If unset, bootstrap is skipped with a warning. Never set in production — `ensureTestAdmin` returns early when `NODE_ENV=production`. |
+
+## DB backup (`scripts/backup-mongo.js`, run via cron — not the server)
+
+| Variable | Default | Description |
+|---|---|---|
+| `BACKUP_PREFIX` | `db-backups/` | S3 key prefix for backup archives |
+| `BACKUP_RETENTION_DAYS` | `14` | Delete backup objects older than this many days |
+
+Requires `mongodump` on PATH (`mongodb-database-tools`) and the same
+`MONGODB_URI`/`S3_BUCKET_NAME`/`AWS_*` vars as the backend.
 
 ## CMS frontend (`cloud-frontend/.env`)
 
@@ -67,9 +77,11 @@ AWS Secrets Manager / Parameter Store in production. **Never commit `.env`.**
 - [ ] `JWT_SECRET` set to a strong random value (not `dev-secret-key`)
 - [ ] `NODE_ENV=production`
 - [ ] `MONGODB_URI` points to Atlas prod cluster
-- [ ] `REDIS_URL` points to ElastiCache/Redis
+- [ ] `REDIS_URL` — only needed for multi-instance; single EC2 can skip (in-memory cache)
 - [ ] `FRONTEND_URL` = real CMS domain (e.g. `https://cms.example.com`)
+- [ ] `CORS_ORIGINS` set if the CMS is served from additional domains
 - [ ] `SERVER_URL` = real API domain
 - [ ] `STORAGE_TYPE`/`S3_*` set only when S3 migration is done
-- [ ] `TEST_ADMIN_*` **unset**
+- [ ] `DEV_ADMIN_PASSWORD` **unset** (and `NODE_ENV=production` so bootstrap is skipped anyway)
+- [ ] Daily `npm run backup:db` cron configured (Atlas M0 has no backups)
 - [ ] No `.env` file committed; secrets in Secrets Manager

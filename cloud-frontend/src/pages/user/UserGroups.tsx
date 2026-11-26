@@ -37,13 +37,27 @@ export const UserGroups = () => {
     staleTime: 5 * 60 * 1000,
   });
 
+  // All groups (unpaginated) — needed to know which group each device belongs
+  // to when creating/editing, since the table only loads one page at a time.
+  const allGroupsQuery = useQuery({
+    queryKey: ['user-groups-all'],
+    queryFn: async () => {
+      const response = await groupAPI.getGroups({ page: 1, limit: 1000 });
+      return response.data?.data || response.data || [];
+    },
+    staleTime: 30 * 1000,
+  });
+
   const groups = groupsQuery.data?.data || [];
   const filteredGroups = groups;
   const devices = devicesQuery.data || [];
   const loading = groupsQuery.isLoading;
   const totalGroups = groupsQuery.data?.total || 0;
   const totalPages = groupsQuery.data?.totalPages || 0;
-  const loadGroups = () => queryClient.invalidateQueries({ queryKey: ['user-groups'] });
+  const loadGroups = () => {
+    queryClient.invalidateQueries({ queryKey: ['user-groups'] });
+    queryClient.invalidateQueries({ queryKey: ['user-groups-all'] });
+  };
 
   const [alertState, setAlertState] = useState<{
     isOpen: boolean;
@@ -139,24 +153,31 @@ export const UserGroups = () => {
     });
   };
 
-  const toggleDevice = (deviceId: string) => {
-    // Check if device is already in another group
-    const deviceInOtherGroup = groups.some((group) => 
-      group._id !== editingGroup?._id && 
-      group.devices && 
-      group.devices.includes(deviceId)
+  const allGroups = allGroupsQuery.data || [];
+
+  // Returns the name of the OTHER group a device belongs to (null if free or
+  // already in the group being edited).
+  const otherGroupNameFor = (deviceId: string): string | null => {
+    const g = allGroups.find((grp: any) =>
+      grp._id !== editingGroup?._id &&
+      Array.isArray(grp.devices) &&
+      grp.devices.includes(deviceId)
     );
-    
-    if (deviceInOtherGroup && !formData.devices.includes(deviceId)) {
+    return g ? g.name : null;
+  };
+
+  const toggleDevice = (deviceId: string) => {
+    // Device already in another group — cannot be selected here
+    if (otherGroupNameFor(deviceId) && !formData.devices.includes(deviceId)) {
       setAlertState({
         isOpen: true,
         title: 'Device Already Assigned',
-        message: 'This device is already assigned to another group. Please remove it from that group first.',
+        message: `This device is already assigned to group "${otherGroupNameFor(deviceId)}". Remove it from that group first.`,
         type: 'warning',
       });
       return;
     }
-    
+
     setFormData((prev) => {
       if (prev.devices.includes(deviceId)) {
         return { ...prev, devices: prev.devices.filter((id) => id !== deviceId) };
@@ -270,12 +291,20 @@ export const UserGroups = () => {
                     />
                   </div>
                   <div className="space-y-1.5 sm:space-y-2 max-h-40 sm:max-h-48 md:max-h-64 overflow-y-auto">
-                    {visibleDevices.map((device) => (
+                    {visibleDevices.map((device) => {
+                      const otherGroup = otherGroupNameFor(device.deviceId);
+                      const isSelected = formData.devices.includes(device.deviceId);
+                      const disabled = !!otherGroup && !isSelected;
+                      return (
                       <div
                         key={device.deviceId}
-                        onClick={() => toggleDevice(device.deviceId)}
-                        className={`flex items-center justify-between p-1.5 sm:p-2 md:p-3 rounded-lg cursor-pointer transition-colors ${
-                          formData.devices.includes(device.deviceId) ? 'bg-blue-50 border border-blue-500' : 'bg-gray-50 hover:bg-gray-100'
+                        onClick={() => !disabled && toggleDevice(device.deviceId)}
+                        className={`flex items-center justify-between p-1.5 sm:p-2 md:p-3 rounded-lg transition-colors ${
+                          disabled
+                            ? 'bg-gray-100 opacity-60 cursor-not-allowed'
+                            : isSelected
+                              ? 'bg-blue-50 border border-blue-500 cursor-pointer'
+                              : 'bg-gray-50 hover:bg-gray-100 cursor-pointer'
                         }`}
                       >
                         <div className="flex items-center gap-1.5 sm:gap-2 md:gap-3">
@@ -283,17 +312,24 @@ export const UserGroups = () => {
                           <div>
                             <div className="text-[10px] sm:text-xs md:text-sm font-medium">{device.name}</div>
                             <div className="text-[9px] sm:text-[10px] md:text-xs text-gray-600">{device.deviceId}</div>
+                            {otherGroup && (
+                              <div className="text-[9px] sm:text-[10px] md:text-xs text-amber-700 font-medium">
+                                In group: {otherGroup}
+                              </div>
+                            )}
                           </div>
                         </div>
                         <input
                           type="checkbox"
-                          checked={formData.devices.includes(device.deviceId)}
+                          checked={isSelected}
+                          disabled={disabled}
                           onChange={() => {}}
                           onClick={(e) => e.stopPropagation()}
                           className="w-3 h-3 sm:w-4 sm:h-4"
                         />
                       </div>
-                    ))}
+                      );
+                    })}
                     {hasMoreDevices && (
                       <Button
                         type="button"
@@ -371,7 +407,7 @@ export const UserGroups = () => {
                             <span className="hidden sm:inline">Configure</span>
                             <span className="sm:hidden">Config</span>
                           </Button>
-                          <Button size="sm" variant="secondary" onClick={() => handleEdit(group._id)}>
+                          <Button size="sm" variant="secondary" onClick={() => handleEdit(group)}>
                             <Edit className="w-2 h-2 sm:w-2.5 sm:h-2.5" />
                           </Button>
                           <Button size="sm" variant="danger" onClick={() => handleDelete(group._id)}>

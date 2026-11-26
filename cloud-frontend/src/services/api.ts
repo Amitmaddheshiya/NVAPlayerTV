@@ -54,6 +54,7 @@ export const authAPI = {
     api.post('/auth/register', { email, password, role }),
   login: (email: string, password: string) =>
     api.post('/auth/login', { email, password }),
+  logout: () => api.post('/auth/logout'),
 };
 
 // Devices

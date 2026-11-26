@@ -18,6 +18,7 @@ interface Env {
   CLOUDFRONT_PRIVATE_KEY?: string;
   MEDIA_URL_EXPIRES_IN: number;
   FRONTEND_URL: string;
+  CORS_ORIGINS: string[];
   SERVER_URL: string;
   RATE_LIMIT_WINDOW_MS: number;
   RATE_LIMIT_MAX_REQUESTS: number;
@@ -39,6 +40,12 @@ const env: Env = {
   CLOUDFRONT_PRIVATE_KEY: process.env.CLOUDFRONT_PRIVATE_KEY,
   MEDIA_URL_EXPIRES_IN: parseInt(process.env.MEDIA_URL_EXPIRES_IN || '3600', 10),
   FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:5173',
+  // Comma-separated extra origins (e.g. production domain). Dev defaults are
+  // always included so local Vite ports keep working.
+  CORS_ORIGINS: (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
   SERVER_URL: process.env.SERVER_URL || 'http://localhost:3000',
   RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10), // 15 minutes default
   RATE_LIMIT_MAX_REQUESTS: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10), // 100 requests per window
